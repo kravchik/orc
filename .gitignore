@@ -1,0 +1,15 @@
+*.DS_Store
+.idea/
+__pycache__/
+*.pyc
+logs/real-smoke/
+logs/orchestrator-real-smoke/
+logs/orchestrator-approval-smoke/
+logs/approval-smoke/
+logs/telegram-smoke*.jsonl
+logs/telegram-agent*.jsonl
+logs/*.jsonl
+state/
+tokens.txt
+tokens.telegram.txt
+tokens.slack.txt

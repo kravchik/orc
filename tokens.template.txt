@@ -1,0 +1,20 @@
+# Local secrets template (do not commit real tokens)
+#
+# Copy this file to a local env file such as `tokens.txt`,
+# `tokens.telegram.txt`, or `tokens.slack.txt` and fill values locally.
+
+# Telegram bot token
+# Get it from BotFather when you create or manage your Telegram bot.
+TELEGRAM_BOT_TOKEN=1234567890:ABCDEabcdeABCDEabcdeABCDEabcdeABCDEabcde
+# Telegram Allowed chat ids, comma-separated numeric values
+# Private chats are usually positive, groups are negative, and supergroups/channels usually start with -100
+# For channels and groups, you can read the numeric id from the Web Telegram URL.
+# Topic ids cannot be allowlisted separately; allowing a supergroup allows all topics in that supergroup.
+TELEGRAM_ALLOWED_CHAT_IDS=123456789,-123456789,-1001234567890
+
+# Slack bot token
+# Slack App -> OAuth & Permissions -> Bot User OAuth Token
+SLACK_BOT_TOKEN=xoxb-1234********
+# Slack app token
+# Slack App -> Basic Information -> App-Level Tokens, with Socket Mode enabled
+SLACK_APP_TOKEN=xapp-1-A123********
