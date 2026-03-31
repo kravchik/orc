@@ -1,5 +1,9 @@
 # orc Steward Runtimes
 
+<p align="center">
+  <img src="orc-symbol.svg" alt="orc symbol" width="100">
+</p>
+
 orc Steward is a chat-facing runtime that sits between a user and a local backend Codex agent process.
 
 The backend agent is OpenAI Codex.
