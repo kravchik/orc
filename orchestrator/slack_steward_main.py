@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import shlex
 from pathlib import Path
 from typing import Sequence
@@ -119,5 +120,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
 
+def _run_cli(argv: Sequence[str] | None = None) -> int:
+    try:
+        return main(argv)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_run_cli())

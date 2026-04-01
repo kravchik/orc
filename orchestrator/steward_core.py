@@ -177,6 +177,47 @@ class StewardCore:
             ),
         )
 
+    def _emit_internal_action_notes(
+        self,
+        *,
+        access_point: AccessPointKey,
+        action_results: list[dict[str, Any]],
+    ) -> None:
+        # Temporary UX fix for steward control-plane: make hidden internal
+        # actions visible between the two steward turns they currently split.
+        for item in action_results:
+            if not bool(item.get("ok")):
+                continue
+            action_type = str(item.get("type") or "").strip().upper()
+            if action_type == "LIST_RESUMABLE":
+                cwd = str(item.get("cwd") or "").strip()
+                count = int(item.get("count") or 0)
+                suffix = f" in {cwd}" if cwd else ""
+                text = f"🧑‍✈️ Completed LIST_RESUMABLE{suffix}: {count} found"
+            elif action_type == "START_AGENT":
+                agent_id = str(item.get("agent_id") or "").strip()
+                cwd = str(item.get("cwd") or "").strip()
+                text = "🧑‍✈️ Completed START_AGENT"
+                if agent_id:
+                    text += f": {agent_id}"
+                if cwd:
+                    text += f" in {cwd}"
+            elif action_type == "RESUME_AGENT":
+                thread_id = str(item.get("thread_id") or "").strip()
+                cwd = str(item.get("cwd") or "").strip()
+                text = "🧑‍✈️ Completed RESUME_AGENT"
+                if thread_id:
+                    text += f": [{thread_id}]"
+                if cwd:
+                    text += f" in {cwd}"
+            else:
+                continue
+            self._access_point_adapter.send_outbound_note(
+                access_point=access_point,
+                source="steward",
+                text=text,
+            )
+
     @property
     def pending_approval(self) -> Any | None:
         if len(self._pending_approvals) == 1:
@@ -202,15 +243,18 @@ class StewardCore:
     def enqueue_inbound(self, inbound: StewardInboundText) -> None:
         self._pending_text_updates.append(inbound)
 
-    def build_startup_restore_notice(self, access_point: AccessPointKey) -> str | None:
+    def _load_restore_sessions(
+        self,
+        access_point: AccessPointKey,
+    ) -> tuple[str, str, list[Any], Any | None, list[Any]]:
         restored = self._persisted_state_by_access_point.get(access_point)
         if restored is None:
-            return None
+            return "", "", [], None, []
         agent = restored.agent if isinstance(restored.agent, dict) else {}
         thread_id = str(agent.get("thread_id") or "")
         cwd = str(restored.project_cwd or agent.get("cwd") or "").strip()
         if not cwd:
-            return None
+            return "", "", [], None, []
         sessions = list_codex_cli_sessions(
             project_cwd=cwd,
             sessions_root=self._sessions_root,
@@ -218,14 +262,20 @@ class StewardCore:
         )
         current = next((item for item in sessions if item.session_id == thread_id), None) if thread_id else None
         others = [item for item in sessions if item.session_id != thread_id][:5]
+        return cwd, thread_id, sessions, current, others
+
+    def build_startup_restore_notice(self, access_point: AccessPointKey) -> str | None:
+        cwd, thread_id, _sessions, current, others = self._load_restore_sessions(access_point)
+        if not cwd:
+            return None
         lines = [
             "Context restored after restart.",
             f"Folder: {cwd}",
-            f"Current session: {_format_restore_session_label(current, fallback_session_id=thread_id)}",
+            f"Current session: {_format_restore_session_label_with_id(current, fallback_session_id=thread_id)}",
             "Other recent sessions in this folder:",
         ]
         if others:
-            lines.extend(f"- {_format_restore_session_label(item)}" for item in others)
+            lines.extend(f"- {_format_restore_session_label_with_id(item)}" for item in others)
         else:
             lines.append("- none")
         lines.append(
@@ -483,6 +533,10 @@ class StewardCore:
         ):
             self._clear_status_runtimes(access_point, False)
             self._persist_registry("start_agent_action", access_point)
+        self._emit_internal_action_notes(
+            access_point=access_point,
+            action_results=action_results,
+        )
         operation.phase = "followup"
         operation.fallback_reply = reply
         self._runtime.submit_request(access_point, build_action_result_prompt(action_results))
@@ -883,6 +937,19 @@ def _format_restore_session_label(item: Any | None, *, fallback_session_id: str 
     if timestamp:
         return f"{label} — {timestamp}"
     return label
+
+
+def _format_restore_session_label_with_id(item: Any | None, *, fallback_session_id: str = "") -> str:
+    label = _format_restore_session_label(item, fallback_session_id=fallback_session_id)
+    if label == "not selected":
+        return label
+    if item is None:
+        session_id = fallback_session_id.strip()
+    else:
+        session_id = str(getattr(item, "session_id", "") or "").strip()
+    if not session_id:
+        return label
+    return f"{label} [{session_id}]"
 
 
 def extract_fallback_command(raw_text: str) -> str | None:
