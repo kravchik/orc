@@ -84,7 +84,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     file_env = load_env_file(args.env_file)
     token = resolve_env(args.telegram_token, "TELEGRAM_BOT_TOKEN", file_env)
     if not token:
-        raise ValueError("--telegram-token is required (CLI, env, or --env-file)")
+        env_file = Path(args.env_file)
+        if env_file.exists():
+            raise ValueError(
+                f"missing required Telegram setting TELEGRAM_BOT_TOKEN in {args.env_file} "
+                f"(or pass --telegram-token / set TELEGRAM_BOT_TOKEN)"
+            )
+        raise ValueError(
+            f"missing required Telegram setting TELEGRAM_BOT_TOKEN; env file not found: {args.env_file} "
+            f"(or pass --telegram-token / set TELEGRAM_BOT_TOKEN)"
+        )
     allowed_raw = resolve_env(args.telegram_allowed_chat_ids, "TELEGRAM_ALLOWED_CHAT_IDS", file_env)
     allowed_chat_ids = _parse_allowed_chat_ids(allowed_raw)
     poll_timeout_str = resolve_env(
