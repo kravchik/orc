@@ -1,10 +1,10 @@
-# orc Steward Runtimes
+# Orc Keeper
 
 <p align="center">
-  <img src="orc-symbol.svg" alt="orc symbol" width="100">
+  <img src="friendly-orc-warden-with-lantern.png" alt="friendly orc keeper" width="180">
 </p>
 
-orc Steward is a chat-facing runtime that sits between a user and a local backend Codex agent process.
+orc Keeper is a chat-facing runtime that sits between a user and a local backend Codex agent process.
 
 The backend agent is OpenAI Codex.
 
@@ -22,11 +22,11 @@ It provides two transport variants:
   - final replies;
   - approval requests;
   - regex-based auto-approval where configured;
-- keeps steward state on disk so the runtime can be restarted cleanly.
+- keeps runtime state on disk so the runtime can be restarted cleanly.
 
 ## Agents
 The runtime uses two agent roles:
-- steward agent
+- keeper agent
   - starts and stops worker agents;
   - manages directory bindings and session context;
   - maps a specific directory to a specific channel;
@@ -36,7 +36,7 @@ The runtime uses two agent roles:
 
 ## Security And Network Model
 
-The steward runtime itself:
+The keeper runtime itself:
 - does not open public listening ports;
 - does not require inbound webhooks;
 - does not depend on external services other than Telegram or Slack for transport.
