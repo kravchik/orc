@@ -1,10 +1,10 @@
-# Orc Keeper
+# Orc Master
 
 <p align="center">
-  <img src="friendly-orc-warden-with-lantern.png" alt="friendly orc keeper" width="180">
+  <img src="friendly-orc-warden-with-lantern.png" alt="friendly orc master" width="180">
 </p>
 
-orc Keeper is a chat-facing runtime that sits between a user and a local backend Codex agent process.
+orc Master is a chat-facing runtime that sits between a user and a local backend Codex agent process.
 
 The backend agent is OpenAI Codex.
 
@@ -26,7 +26,7 @@ It provides two transport variants:
 
 ## Agents
 The runtime uses two agent roles:
-- keeper agent
+- master agent
   - starts and stops worker agents;
   - manages directory bindings and session context;
   - maps a specific directory to a specific channel;
@@ -36,7 +36,7 @@ The runtime uses two agent roles:
 
 ## Security And Network Model
 
-The keeper runtime itself:
+The master runtime itself:
 - does not open public listening ports;
 - does not require inbound webhooks;
 - does not depend on external services other than Telegram or Slack for transport.
