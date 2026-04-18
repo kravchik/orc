@@ -99,15 +99,58 @@ def _approval_source_icon(request: ApprovalRequest) -> str:
     return "🚀"
 
 
-def _format_approval_prompt(*, request: ApprovalRequest, allow_always: bool) -> str:
+def _approval_prompt_details(request: ApprovalRequest) -> list[str]:
     params = request.params
     command = params.get("command")
     cwd = params.get("cwd")
-    lines = [f"{_approval_source_icon(request)} approval needed"]
+    lines: list[str] = []
     if isinstance(command, str) and command.strip():
         lines.append(f"command: {command}")
     if isinstance(cwd, str) and cwd.strip():
         lines.append(f"cwd: {cwd}")
+    if lines:
+        return lines
+    preferred_keys = ("reason", "tool", "path", "targetPath", "oldPath", "newPath", "itemId", "grantRoot")
+    emitted: set[str] = set()
+    for key in preferred_keys:
+        value = params.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                continue
+            rendered = stripped
+        elif isinstance(value, (int, float, bool)):
+            rendered = str(value)
+        else:
+            continue
+        lines.append(f"{key}: {rendered}")
+        emitted.add(key)
+    if lines:
+        return lines
+    for key in sorted(params.keys()):
+        if key in emitted or key in {"threadId", "turnId", "command", "cwd"}:
+            continue
+        value = params.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                continue
+            rendered = stripped
+        elif isinstance(value, (int, float, bool)):
+            rendered = str(value)
+        else:
+            continue
+        lines.append(f"{key}: {rendered}")
+    return lines
+
+
+def _format_approval_prompt(*, request: ApprovalRequest, allow_always: bool) -> str:
+    lines = [f"{_approval_source_icon(request)} approval needed"]
+    lines.extend(_approval_prompt_details(request))
     options = "accept/decline/details"
     if allow_always:
         options += "/always_allow"
