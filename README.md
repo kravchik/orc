@@ -4,25 +4,20 @@
   <img src="friendly-orc-warden-with-lantern.png" alt="friendly orc master" width="180">
 </p>
 
-orc Master is a chat-facing runtime that sits between a user and a local backend Codex agent process.
+Telegram/Slack interface for local Codex agent sessions.
 
-The backend agent is OpenAI Codex.
-
-It provides two transport variants:
-- `Telegram`
-- `Slack`
+I am using it instead of CLI even on desktop.
 
 ## What It Does
-- provides a chat control plane for directories and Codex agents;
-- accepts user messages from Telegram or Slack;
-- starts and manages a local backend agent command;
-- forwards user requests to that backend;
-- streams back:
-  - reasoning statuses;
-  - final replies;
-  - approval requests;
-  - regex-based auto-approval where configured;
-- keeps runtime state on disk so the runtime can be restarted cleanly.
+- Telegram/Slack interface for locally running Codex agents;
+- almost the same functions as the CLI;
+  - messaging to and from
+  - thinking statuses
+  - approval requests
+  - regex-based auto-approval
+- selecting directories, running/stopping agents;
+- connects multiple channels and DMs, directories and sessions
+- keeps channel-session mappings between restarts  
 
 ## Agents
 The runtime uses two agent roles:
