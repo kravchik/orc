@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from orchestrator import clock
+from orchestrator.steward_restore_notice_rendering import render_restore_notice_html
 from orchestrator.telegram_status import TelegramStatusClearPlan, TelegramStatusConfig, TelegramStatusWindow
 
 
@@ -552,9 +553,13 @@ class TelegramOutputRuntime:
 
 
 def _prepare_outgoing_message(*, text: str, kind: str, parse_mode: str | None) -> tuple[str, str | None]:
-    if kind != TelegramKind.APPROVAL_PROMPT:
-        return text, parse_mode
-    return _render_expandable_block_message(title="Approval needed", body_text=text), "HTML"
+    if kind == TelegramKind.APPROVAL_PROMPT:
+        return _render_expandable_block_message(title="Approval needed", body_text=text), "HTML"
+    if kind == TelegramKind.RESTORE:
+        rendered = render_restore_notice_html(text)
+        if rendered != text:
+            return rendered, "HTML"
+    return text, parse_mode
 
 
 def _send_message_kwargs_for_kind(kind: str) -> dict[str, object]:

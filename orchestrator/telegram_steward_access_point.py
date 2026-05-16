@@ -339,6 +339,7 @@ class TelegramStewardAccessPointAdapter:
             "/help - show this help.",
             "/where - show current access point routing key.",
             "/status - show current runtime state and bound agent details.",
+            "/interrupt - interrupt the current in-flight turn for this access point.",
             "/stop - stop runtime agent for this access point (keeps binding; Steward stays active).",
             "/start - start runtime agent for existing binding (Steward stays active).",
             "/reset - clear binding and reset local runtime state for this access point.",
@@ -522,6 +523,8 @@ class TelegramStewardAccessPointAdapter:
         if pending is None:
             return True
         raw = inbound.text.strip().lower()
+        if raw == "/interrupt" or raw.startswith("/interrupt@"):
+            return False
         if raw in ("accept", "decline", "always_allow"):
             return handle_approval_action(
                 StewardApprovalDecision(access_point=inbound.access_point, decision=raw, via="text")
@@ -613,6 +616,51 @@ class TelegramStewardAccessPointAdapter:
             kind=kind,
             chat_id=access_point.chat_id,
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
+            on_success=lambda _result: on_sent(),
+            on_failure=on_failed,
+        )
+
+    def queue_text_reply_with_result(
+        self,
+        *,
+        access_point: AccessPointKey,
+        text: str,
+        source: str,
+        kind: TelegramKind,
+        on_sent: Callable[[int | None], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None:
+        output_runtime, _status_store = self.status_runtime_for(
+            access_point=access_point,
+            source="agent" if source == "agent" else "steward",
+        )
+        self._enqueue_send_text(
+            output_runtime=output_runtime,
+            text=self._decorate_reply(text=text, source=source),
+            kind=kind,
+            chat_id=access_point.chat_id,
+            priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
+            on_success=lambda result: on_sent(result.first_message_id),
+            on_failure=on_failed,
+        )
+
+    def queue_text_reply_edit(
+        self,
+        *,
+        access_point: AccessPointKey,
+        message_id: int,
+        text: str,
+        source: str,
+        kind: TelegramKind,
+        on_sent: Callable[[], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None:
+        decorated = self._decorate_reply(text=text, source=source)
+        self._enqueue_edit_text(
+            chat_id=int(access_point.chat_id),
+            message_id=int(message_id),
+            text=decorated,
+            priority=ACCESS_POINT_OUTBOUND_CLASS_EDIT,
             on_success=lambda _result: on_sent(),
             on_failure=on_failed,
         )
@@ -787,6 +835,43 @@ class TelegramStewardAccessPointAdapter:
             on_success=on_success,
             on_failure=on_failure,
         )
+
+    def _enqueue_edit_text(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        priority: int = ACCESS_POINT_OUTBOUND_CLASS_EDIT,
+        on_success: Callable[[_TelegramOutboundExecutionResult], None] | None = None,
+        on_failure: Callable[[Exception], None] | None = None,
+    ) -> int:
+        return self._enqueue_outbound(
+            op_kind="edit_text",
+            priority=priority,
+            coalesce_key=("edit_text", int(chat_id), int(message_id)),
+            execute=lambda cid=chat_id, mid=message_id, body=text: self._execute_edit_text(
+                chat_id=cid,
+                message_id=mid,
+                text=body,
+            ),
+            on_success=on_success,
+            on_failure=on_failure,
+        )
+
+    def _execute_edit_text(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+    ) -> _TelegramOutboundExecutionResult:
+        self._client.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+        )
+        return _TelegramOutboundExecutionResult(sent=True)
 
     def _execute_edit_reply_markup(
         self,

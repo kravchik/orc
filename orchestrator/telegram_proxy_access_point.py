@@ -26,6 +26,7 @@ if TYPE_CHECKING:
         TelegramAgentCore,
         _TelegramAgentResult,
         _TelegramApprovalPromptEvent,
+        _TelegramInterruptResult,
         _TelegramModelApplyResult,
         _TelegramOutboundNote,
         _TelegramStatusEvent,
@@ -50,6 +51,7 @@ class TelegramAccessPointAdapter:
         self._next_outbound_sequence = 1
         self._queued_keys: set[tuple[Any, ...]] = set()
         self._receipts: dict[int, AccessPointDeliveryReceipt] = {}
+        self._pending_interrupt: dict[str, Any] | None = None
 
     def send_result(self, result: "_TelegramAgentResult") -> None:
         self._enqueue_send_text(
@@ -95,6 +97,31 @@ class TelegramAccessPointAdapter:
             text=text,
             kind=TelegramKind.COMMAND,
         )
+
+    def record_interrupt_result(self, result: "_TelegramInterruptResult") -> None:
+        pending = self._pending_interrupt
+        if pending is None:
+            return
+        if (pending["chat_id"], pending["thread_id"]) != (result.chat_id, result.thread_id):
+            return
+        approval_pending = self._core.pending_approval
+        if isinstance(approval_pending, dict) and (
+            approval_pending.get("chat_id"),
+            approval_pending.get("thread_id"),
+        ) == (result.chat_id, result.thread_id):
+            self._cancel_pending_approval_prompt_if_needed(approval_pending)
+            prompt_message_id = approval_pending.get("prompt_message_id")
+            if isinstance(prompt_message_id, int):
+                self._enqueue_edit_reply_markup(
+                    chat_id=result.chat_id,
+                    message_id=prompt_message_id,
+                    reply_markup={"inline_keyboard": []},
+                    priority=ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_CLEANUP,
+                )
+            self._core.clear_pending_approval()
+        self._core.set_awaiting(True)
+        pending["final_text"] = "interrupted."
+        self._maybe_finish_pending_interrupt()
 
     def send_approval_prompt(self, event: "_TelegramApprovalPromptEvent") -> dict[str, Any]:
         allow_always = build_accept_settings(params=event.request.params) is not None
@@ -172,9 +199,11 @@ class TelegramAccessPointAdapter:
         if approval_action is not None:
             return approval_action
         cmd = _normalize_command(update.text)
+        if cmd == "/interrupt":
+            return self._handle_interrupt_command(chat_id=update.chat_id, thread_id=update.thread_id)
         if cmd in ("/start", "/status", "/stop", "/quit"):
             if cmd == "/start":
-                reply = "ORC1 telegram-agent ready. Send text to proxy to local agent. Commands: /start /status /compact /model /stop"
+                reply = "ORC1 telegram-agent ready. Send text to proxy to local agent. Commands: /start /status /compact /model /interrupt /stop"
             elif cmd == "/status":
                 current_model = self._core._driver.get_actual_thread_model().strip()
                 if current_model:
@@ -336,6 +365,8 @@ class TelegramAccessPointAdapter:
         if pending["thread_id"] is not None and update.thread_id != pending["thread_id"]:
             return None
         raw = update.text.strip().lower()
+        if raw == "/interrupt" or raw.startswith("/interrupt@"):
+            return None
         if raw not in ("accept", "decline"):
             self._enqueue_send_text(
                 chat_id=update.chat_id,
@@ -494,6 +525,79 @@ class TelegramAccessPointAdapter:
     def _command_runtime(self, chat_id: int, thread_id: int | None) -> TelegramOutputRuntime:
         return self._core._command_runtime(chat_id, thread_id)
 
+    def _handle_interrupt_command(
+        self,
+        *,
+        chat_id: int,
+        thread_id: int | None,
+    ) -> None:
+        if not self._core._driver.has_active_turn():
+            self._enqueue_send_text(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                text="no active turn to interrupt.",
+                kind=TelegramKind.COMMAND,
+            )
+            return None
+        pending = {
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "ack_receipt_id": None,
+            "ack_message_id": None,
+            "final_text": None,
+        }
+        self._pending_interrupt = pending
+        pending["ack_receipt_id"] = self._enqueue_send_text(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            text="interrupt requested.",
+            kind=TelegramKind.COMMAND,
+            on_success=lambda result, holder=pending: self._on_interrupt_notice_sent(holder=holder, send_result=result),
+            on_failure=lambda exc, holder=pending: self._on_interrupt_notice_failed(holder=holder, exc=exc),
+        )
+        try:
+            self._core._driver.interrupt_active_turn()
+        except Exception:
+            pending["final_text"] = "interrupt failed: turn already finished or request was rejected."
+            self._maybe_finish_pending_interrupt()
+        return None
+
+    def _on_interrupt_notice_sent(
+        self,
+        *,
+        holder: dict[str, Any],
+        send_result: _TelegramProxyOutboundResult,
+    ) -> None:
+        holder["ack_receipt_id"] = None
+        holder["ack_message_id"] = send_result.first_message_id
+        self._maybe_finish_pending_interrupt()
+
+    def _on_interrupt_notice_failed(self, *, holder: dict[str, Any], exc: Exception) -> None:
+        _ = exc
+        if self._pending_interrupt is holder:
+            self._pending_interrupt = None
+
+    def _maybe_finish_pending_interrupt(self) -> None:
+        pending = self._pending_interrupt
+        if pending is None:
+            return
+        message_id = pending.get("ack_message_id")
+        final_text = pending.get("final_text")
+        if not isinstance(message_id, int) or not isinstance(final_text, str) or not final_text:
+            return
+        self._enqueue_edit_text(
+            chat_id=int(pending["chat_id"]),
+            message_id=message_id,
+            text=final_text,
+            priority=ACCESS_POINT_OUTBOUND_CLASS_EDIT,
+            on_success=lambda holder=pending: self._finish_pending_interrupt(holder),
+            on_failure=lambda _exc, holder=pending: self._finish_pending_interrupt(holder),
+        )
+
+    def _finish_pending_interrupt(self, holder: dict[str, Any]) -> None:
+        if self._pending_interrupt is holder:
+            self._pending_interrupt = None
+
     def _enqueue_send_text(
         self,
         *,
@@ -568,6 +672,39 @@ class TelegramAccessPointAdapter:
             on_success=on_success,
             on_failure=on_failure,
         )
+
+    def _enqueue_edit_text(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        priority: int = ACCESS_POINT_OUTBOUND_CLASS_EDIT,
+        on_success: Any = None,
+        on_failure: Any = None,
+    ) -> int:
+        return self._enqueue_outbound(
+            operation="edit_text",
+            priority=priority,
+            coalesce_key=("edit_text", int(chat_id), int(message_id)),
+            execute=lambda cid=chat_id, mid=message_id, body=text: self._execute_edit_text(
+                chat_id=cid,
+                message_id=mid,
+                text=body,
+            ),
+            on_success=on_success,
+            on_failure=on_failure,
+        )
+
+    def _execute_edit_text(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+    ) -> _TelegramProxyOutboundResult:
+        self._core._client.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+        return _TelegramProxyOutboundResult(sent=True)
 
     def _execute_edit_reply_markup(
         self,

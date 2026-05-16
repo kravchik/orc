@@ -27,6 +27,7 @@ from orchestrator.steward_runtime_support import (
 from orchestrator.telegram_agent import (
     _TelegramAgentResult,
     _TelegramApprovalPromptEvent,
+    _TelegramInterruptResult,
     _TelegramOutboundNote,
     _TelegramStatusEvent,
 )
@@ -78,6 +79,27 @@ class StewardAccessPointAdapter(Protocol):
         on_sent: Callable[[], None],
         on_failed: Callable[[Exception], None],
     ) -> None: ...
+    def queue_text_reply_with_result(
+        self,
+        *,
+        access_point: AccessPointKey,
+        text: str,
+        source: str,
+        kind: Any,
+        on_sent: Callable[[int | None], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None: ...
+    def queue_text_reply_edit(
+        self,
+        *,
+        access_point: AccessPointKey,
+        message_id: int,
+        text: str,
+        source: str,
+        kind: Any,
+        on_sent: Callable[[], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None: ...
     def send_outbound_note(
         self,
         *,
@@ -110,6 +132,14 @@ class StewardCoreHooks:
     on_pre_approval_decision: Callable[[Any], None] | None = None
     on_fallback_command: Callable[[AccessPointKey, str, bool], None] | None = None
     on_bound_route: Callable[[AccessPointKey, str], None] | None = None
+
+
+@dataclass
+class PendingInterruptRequest:
+    access_point: AccessPointKey
+    source: str
+    ack_message_id: int | None = None
+    final_text: str | None = None
 
 
 class StewardCore:
@@ -151,6 +181,7 @@ class StewardCore:
         self._active_operations: dict[AccessPointKey, PendingStewardOperation] = {}
         self._pending_approvals: dict[AccessPointKey, Any] = {}
         self._pending_startup_notice_context: dict[AccessPointKey, str] = {}
+        self._pending_interrupts: dict[AccessPointKey, PendingInterruptRequest] = {}
 
     def _queue_local_reply(
         self,
@@ -175,6 +206,42 @@ class StewardCore:
                 error_type=type(exc).__name__,
                 http_code=extract_telegram_http_code(exc),
             ),
+        )
+
+    def _queue_interrupt_reply(
+        self,
+        *,
+        access_point: AccessPointKey,
+        text: str,
+        on_sent: Callable[[int | None], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None:
+        self._access_point_adapter.queue_text_reply_with_result(
+            access_point=access_point,
+            text=text,
+            source="steward",
+            kind=self._kinds.command,
+            on_sent=on_sent,
+            on_failed=on_failed,
+        )
+
+    def _queue_interrupt_reply_edit(
+        self,
+        *,
+        access_point: AccessPointKey,
+        message_id: int,
+        text: str,
+        on_sent: Callable[[], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None:
+        self._access_point_adapter.queue_text_reply_edit(
+            access_point=access_point,
+            message_id=message_id,
+            text=text,
+            source="steward",
+            kind=self._kinds.command,
+            on_sent=on_sent,
+            on_failed=on_failed,
         )
 
     def _emit_internal_action_notes(
@@ -356,6 +423,101 @@ class StewardCore:
         self._access_point_adapter.send_invalid_approval_reply(pending)
         return True
 
+    def _drop_pending_inputs_for_access_point(self, access_point: AccessPointKey) -> int:
+        before = len(self._pending_text_updates)
+        self._pending_text_updates = [
+            inbound for inbound in self._pending_text_updates if inbound.access_point != access_point
+        ]
+        return before - len(self._pending_text_updates)
+
+    def _interrupt_final_text(self, *, success: bool) -> str:
+        if success:
+            return "interrupted."
+        return "interrupt failed: turn already finished or request was rejected."
+
+    def _maybe_finish_pending_interrupt_notice(self, access_point: AccessPointKey) -> None:
+        pending = self._pending_interrupts.get(access_point)
+        if pending is None:
+            return
+        if pending.ack_message_id is None or pending.final_text is None:
+            return
+        message_id = int(pending.ack_message_id)
+        final_text = str(pending.final_text)
+        self._queue_interrupt_reply_edit(
+            access_point=access_point,
+            message_id=message_id,
+            text=final_text,
+            on_sent=lambda ap=access_point: self._finalize_pending_interrupt(ap),
+            on_failed=lambda exc, ap=access_point: self._fail_pending_interrupt_edit(ap, exc),
+        )
+
+    def _finalize_pending_interrupt(self, access_point: AccessPointKey) -> None:
+        self._pending_interrupts.pop(access_point, None)
+
+    def _fail_pending_interrupt_edit(self, access_point: AccessPointKey, exc: Exception) -> None:
+        self._logger.event(
+            "steward_interrupt_edit_failed",
+            **self._hooks.access_point_fields(access_point),
+            error=str(exc),
+            error_type=type(exc).__name__,
+            http_code=extract_telegram_http_code(exc),
+        )
+        self._pending_interrupts.pop(access_point, None)
+
+    def _handle_interrupt_command(self, access_point: AccessPointKey) -> bool:
+        target_source: str | None = None
+        interrupt_lane: StewardDeliveryLane | AgentDeliveryLane | None = None
+        if self._agent_runtime.has_active_turn(access_point):
+            target_source = "agent"
+            interrupt_lane = self._agent_runtime
+        elif self._runtime.has_active_turn(access_point):
+            target_source = "steward"
+            interrupt_lane = self._runtime
+        if target_source is None or interrupt_lane is None:
+            self._queue_local_reply(
+                access_point=access_point,
+                text="no active turn to interrupt.",
+                source="steward",
+                kind=self._kinds.command,
+            )
+            return True
+        dropped = self._drop_pending_inputs_for_access_point(access_point)
+        if dropped > 0:
+            self._logger.event(
+                "steward_interrupt_pending_inputs_dropped",
+                **self._hooks.access_point_fields(access_point),
+                dropped=dropped,
+                route_target=target_source,
+            )
+        pending = PendingInterruptRequest(access_point=access_point, source=target_source)
+        self._pending_interrupts[access_point] = pending
+        self._queue_interrupt_reply(
+            access_point=access_point,
+            text="interrupt requested.",
+            on_sent=lambda message_id, ap=access_point: self._on_interrupt_notice_sent(ap, message_id),
+            on_failed=lambda exc, ap=access_point: self._fail_pending_interrupt_edit(ap, exc),
+        )
+        try:
+            interrupt_lane.interrupt_active_turn(access_point)
+        except Exception as exc:
+            self._logger.event(
+                "steward_interrupt_request_failed",
+                **self._hooks.access_point_fields(access_point),
+                route_target=target_source,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            pending.final_text = self._interrupt_final_text(success=False)
+            self._maybe_finish_pending_interrupt_notice(access_point)
+        return True
+
+    def _on_interrupt_notice_sent(self, access_point: AccessPointKey, message_id: int | None) -> None:
+        pending = self._pending_interrupts.get(access_point)
+        if pending is None:
+            return
+        pending.ack_message_id = int(message_id) if isinstance(message_id, int) else None
+        self._maybe_finish_pending_interrupt_notice(access_point)
+
     def drain_pending_inputs(
         self,
         *,
@@ -368,7 +530,9 @@ class StewardCore:
             access_point = inbound.access_point
             pending = self._pending_approvals.get(access_point)
             active = self._active_operations.get(access_point)
-            if active is not None and pending is None:
+            fallback_cmd = extract_fallback_command(inbound.text)
+            bypass_active = fallback_cmd == "interrupt"
+            if active is not None and pending is None and not bypass_active:
                 idx += 1
                 continue
             self._pending_text_updates.pop(idx)
@@ -377,7 +541,7 @@ class StewardCore:
                 continue
             pending = self._pending_approvals.get(access_point)
             active = self._active_operations.get(access_point)
-            if pending is not None and active is not None:
+            if pending is not None and active is not None and fallback_cmd != "interrupt":
                 self._pending_text_updates.insert(idx, inbound)
                 idx += 1
                 continue
@@ -589,7 +753,30 @@ class StewardCore:
                 text=payload.text,
             )
             return
+        if isinstance(payload, _TelegramInterruptResult):
+            pending_interrupt = self._pending_interrupts.get(event.access_point)
+            if pending_interrupt is not None and pending_interrupt.source == event.source:
+                pending_interrupt.final_text = self._interrupt_final_text(success=True)
+                self._maybe_finish_pending_interrupt_notice(event.access_point)
+            pending_approval = self._pending_approvals.pop(event.access_point, None)
+            if pending_approval is not None and getattr(pending_approval, "source", None) == event.source:
+                self._access_point_adapter.clear_approval_markup(pending_approval)
+            self._active_operations.pop(event.access_point, None)
+            return
         if isinstance(payload, _TelegramAgentResult):
+            pending_interrupt = self._pending_interrupts.get(event.access_point)
+            if pending_interrupt is not None and pending_interrupt.source == event.source:
+                self._logger.event(
+                    "steward_interrupt_reply_suppressed",
+                    **self._hooks.access_point_fields(event.access_point),
+                    route_target=event.source,
+                    reply_preview=payload.reply.strip()[:200],
+                )
+                if pending_interrupt.final_text is None:
+                    pending_interrupt.final_text = self._interrupt_final_text(success=False)
+                    self._maybe_finish_pending_interrupt_notice(event.access_point)
+                self._active_operations.pop(event.access_point, None)
+                return
             self._logger.event(
                 "steward_driver_result_received",
                 **self._hooks.access_point_fields(event.access_point),
@@ -741,6 +928,11 @@ class StewardCore:
                 kind=self._kinds.command,
             )
             return
+        if fallback_cmd == "interrupt":
+            if self._hooks.on_fallback_command is not None:
+                self._hooks.on_fallback_command(access_point, fallback_cmd, is_bound)
+            if self._handle_interrupt_command(access_point):
+                return
         if fallback_cmd == "bind":
             if is_running_bound:
                 reply = "runtime agent is already running for this access point."
@@ -751,7 +943,6 @@ class StewardCore:
                     access_point,
                     {
                         "cwd": str(Path.cwd().resolve()),
-                        "model": "gpt-5-codex",
                         "mode": "proxy",
                     },
                 )
@@ -969,6 +1160,8 @@ def extract_fallback_command(raw_text: str) -> str | None:
         return "start"
     if head == "/stop" or head.startswith("/stop@"):
         return "stop"
+    if head == "/interrupt" or head.startswith("/interrupt@"):
+        return "interrupt"
     if head == "/reset" or head.startswith("/reset@"):
         return "reset"
     return None

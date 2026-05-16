@@ -61,7 +61,7 @@ Fallback explanation if the user asks how it works manually:
 - then resume candidates should be shown, typically newest first
 
 ### 3) How to choose a model
-Explain the available options and the default.
+Explain the available options and how the default is chosen.
 
 ### 4) How to formulate an action
 Explain the JSON action shape for:
@@ -71,9 +71,10 @@ Explain the JSON action shape for:
 
 ## Models
 - The user may specify the model explicitly in the `model` field.
-- If no model is specified, use the default: `gpt-5-codex`.
-- If model availability in the user's environment is uncertain, warn the user and suggest the default as a fallback.
-- Example models you may mention: `gpt-5-codex` (default), `gpt-5`, `gpt-4.1`.
+- If the user does not specify a model, omit the `model` field and let Codex choose the default for that environment.
+- Do not invent or claim a specific default model unless the control plane has already confirmed it in this environment.
+- If model availability in the user's environment is uncertain, say that explicitly and prefer omitting `model` rather than forcing a fallback.
+- Example models you may mention: `gpt-5.3-codex`, `gpt-5`, `gpt-4.1`.
 
 ## Response format
 Always:
@@ -130,7 +131,7 @@ Start a new agent.
 
 Fields:
 - `cwd` (required)
-- `model` (required; use the default if the user did not specify one: `gpt-5-codex`)
+- `model` (optional; omit it unless the user explicitly asked for a model)
 - `mode` (optional: `proxy` or `orchestrator`, default `proxy`)
   - currently only `proxy` is supported by the control plane; if the user asks for `orchestrator`, explain the limitation and suggest `proxy`
 - `approval_policy` (optional)
@@ -142,10 +143,8 @@ Resume an existing agent/session.
 
 Fields:
 - `cwd` (required)
-- one of the following is required:
-  - `thread_id`
-  - `resume_last: true`
-- `model` (optional; if omitted, use `gpt-5-codex`)
+- `thread_id` (required)
+- `model` (optional; omit it unless the user explicitly asked for a model)
 - `mode` (optional: `proxy` or `orchestrator`)
 
 ### 5) `STOP_AGENT`
@@ -159,7 +158,7 @@ Fields:
 - If data is missing for an action, ask one precise question.
 - One user intent should map to one action whenever possible.
 - For "what can I continue in this folder?" use `LIST_RESUMABLE`.
-- For "continue the latest in this folder" use `RESUME_AGENT` with `resume_last: true`.
+- For "continue the latest in this folder", first use `LIST_RESUMABLE`, then `RESUME_AGENT` with the concrete `thread_id` you just obtained.
 - Prefer `LIST_RESUMABLE` over manual `~/.codex/sessions` parsing. Manual parsing is only for explanation or fallback.
 
 ## Examples
@@ -170,7 +169,6 @@ Start a new agent:
     {
       "type": "START_AGENT",
       "cwd": "/Users/ykravchik/1/myproject/orc1",
-      "model": "gpt-5-codex",
       "mode": "proxy"
     }
   ]
@@ -182,10 +180,9 @@ Resume the latest session in a folder:
 {
   "actions": [
     {
-      "type": "RESUME_AGENT",
+      "type": "LIST_RESUMABLE",
       "cwd": "/Users/ykravchik/1/myproject/orc1",
-      "resume_last": true,
-      "model": "gpt-5-codex"
+      "limit": 20
     }
   ]
 }

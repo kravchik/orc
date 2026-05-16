@@ -116,6 +116,14 @@ class _TelegramModelApplyResult:
     error: str
 
 
+@dataclass
+class _TelegramInterruptResult:
+    chat_id: int
+    thread_id: int | None
+    result: str
+    error: str = ""
+
+
 class TelegramAgentDriver(Protocol):
     def start(self) -> None: ...
 
@@ -126,6 +134,10 @@ class TelegramAgentDriver(Protocol):
     def submit_approval_decision(self, decision: str) -> None: ...
 
     def submit_model_selection(self, selection: ProxyModelSelection[tuple[int, int | None]]) -> None: ...
+
+    def has_active_turn(self) -> bool: ...
+
+    def interrupt_active_turn(self) -> None: ...
 
     def poll_once(self) -> list[Any]: ...
 
@@ -201,6 +213,8 @@ class TelegramInteractiveCodexDriver:
         self._active_request: ProxySubmitPrompt[tuple[int, int | None]] | None = None
         self._active_turn: InteractiveTurnState | None = None
         self._model_apply_selection: ProxyModelSelection[tuple[int, int | None]] | None = None
+        self._status_access_point_fallback: tuple[int, int | None] | None = None
+        self._interrupt_in_flight = False
 
         self._session.set_protocol_item_callback(self._on_protocol_item)
         self._session.set_protocol_status_callback(self._on_protocol_status)
@@ -222,6 +236,23 @@ class TelegramInteractiveCodexDriver:
     def submit_model_selection(self, selection: ProxyModelSelection[tuple[int, int | None]]) -> None:
         self._pending_model_selections.append(selection)
 
+    def has_active_turn(self) -> bool:
+        return self._active_request is not None and self._active_turn is not None
+
+    def interrupt_active_turn(self) -> None:
+        if self._active_turn is None or self._active_request is None:
+            raise RuntimeError("no active turn to interrupt")
+        self._logger.event(
+            "interactive_driver_interrupt_requested",
+            chat_id=self._active_request.access_point[0],
+            thread_id=self._active_request.access_point[1],
+            turn_id=self._active_turn.turn_id,
+        )
+        self._session.submit_interactive_turn_interrupt(self._active_turn)
+        self._active_turn.pending_approval = None
+        self._active_turn.pending_approval_emitted = False
+        self._interrupt_in_flight = True
+
     def poll_once(self) -> list[Any]:
         if not self._startup_ready:
             self._maybe_finish_startup()
@@ -230,8 +261,14 @@ class TelegramInteractiveCodexDriver:
         elif self._pending_model_selections:
             self._maybe_begin_model_apply()
         elif self._active_request is None or self._active_turn is None:
-            self._maybe_begin_turn()
-        elif self._active_turn.pending_approval is not None:
+            drained_late = False
+            if not self._pending_requests and self._status_access_point_fallback is not None:
+                drained_late = self._session.poll_background_protocol_message(timeout_sec=0.0)
+            if drained_late:
+                pass
+            else:
+                self._maybe_begin_turn()
+        elif self._active_turn.pending_approval is not None and not self._interrupt_in_flight:
             self._maybe_submit_approval_decision()
         else:
             self._maybe_poll_turn()
@@ -351,6 +388,8 @@ class TelegramInteractiveCodexDriver:
             return
         request = self._pending_requests.pop(0)
         self._active_request = request
+        self._status_access_point_fallback = request.access_point
+        self._interrupt_in_flight = False
         chat_id, thread_id = request.access_point
         self._logger.event(
             "interactive_driver_begin_turn",
@@ -381,6 +420,7 @@ class TelegramInteractiveCodexDriver:
             )
             self._active_request = None
             self._active_turn = None
+            self._interrupt_in_flight = False
 
     def _maybe_submit_approval_decision(self) -> None:
         if self._active_turn is None or self._active_request is None or not self._pending_decisions:
@@ -407,6 +447,7 @@ class TelegramInteractiveCodexDriver:
             )
             self._active_request = None
             self._active_turn = None
+            self._interrupt_in_flight = False
 
     def _maybe_poll_turn(self) -> None:
         if self._active_turn is None or self._active_request is None:
@@ -426,6 +467,7 @@ class TelegramInteractiveCodexDriver:
             )
             self._active_request = None
             self._active_turn = None
+            self._interrupt_in_flight = False
             return
         self._logger.event(
             "interactive_driver_turn_progress",
@@ -436,6 +478,7 @@ class TelegramInteractiveCodexDriver:
         )
         if progress.kind == "approval_required" and progress.approval_request is not None:
             chat_id, thread_id = self._active_request.access_point
+            self._active_turn.pending_approval_emitted = True
             self._event_queue.append(
                 _TelegramApprovalPromptEvent(
                     chat_id=chat_id,
@@ -463,12 +506,34 @@ class TelegramInteractiveCodexDriver:
             )
             self._active_request = None
             self._active_turn = None
+            self._interrupt_in_flight = False
+            return
+        if progress.kind == "interrupted":
+            chat_id, thread_id = self._active_request.access_point
+            self._logger.event(
+                "interactive_driver_turn_interrupted",
+                chat_id=chat_id,
+                thread_id=thread_id,
+                turn_id=self._active_turn.turn_id,
+            )
+            self._event_queue.append(
+                _TelegramInterruptResult(
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    result="interrupted",
+                )
+            )
+            self._active_request = None
+            self._active_turn = None
+            self._interrupt_in_flight = False
+            return
 
     def _on_protocol_item(self, _role: str, changed_item_id: str) -> None:
         request = self._active_request
-        if request is None:
+        access_point = request.access_point if request is not None else self._status_access_point_fallback
+        if access_point is None:
             return
-        chat_id, thread_id = request.access_point
+        chat_id, thread_id = access_point
         self._queue_event(
             _TelegramStatusEvent(
                 chat_id=chat_id,
@@ -482,9 +547,10 @@ class TelegramInteractiveCodexDriver:
 
     def _on_protocol_status(self, _role: str, method: str, params: dict) -> None:
         request = self._active_request
-        if request is None:
+        access_point = request.access_point if request is not None else self._status_access_point_fallback
+        if access_point is None:
             return
-        chat_id, thread_id = request.access_point
+        chat_id, thread_id = access_point
         self._queue_event(
             _TelegramStatusEvent(
                 chat_id=chat_id,
@@ -710,6 +776,9 @@ def run_telegram_agent(
     def _handle_backend_event(event: object) -> None:
         if isinstance(event, _TelegramAgentResult):
             core.record_result(event)
+            return
+        if isinstance(event, _TelegramInterruptResult):
+            access_point.record_interrupt_result(event)
             return
         if isinstance(event, _TelegramModelApplyResult):
             core.record_model_apply_result(event)

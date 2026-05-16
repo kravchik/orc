@@ -113,6 +113,7 @@ class InteractiveTurnProgress:
     kind: str
     text: str | None = None
     approval_request: ApprovalRequest | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -888,6 +889,48 @@ class CodexJsonRpcSession:
         state.pending_approval = None
         state.pending_approval_emitted = False
 
+    def submit_interactive_turn_interrupt(self, state: InteractiveTurnState) -> None:
+        if self._thread_id is None:
+            raise RuntimeError("thread not initialized")
+        if not isinstance(state.turn_id, str) or not state.turn_id.strip():
+            raise RuntimeError("interactive turn has no active turn id")
+        req_id = self._send_request(
+            method="turn/interrupt",
+            params={
+                "threadId": self._thread_id,
+                "turnId": state.turn_id.strip(),
+            },
+        )
+        self._wait_for_response(req_id=req_id)
+
+    def poll_background_protocol_message(self, *, timeout_sec: float = 0.0) -> bool:
+        if self._pending_messages:
+            msg = self._pending_messages.pop(0)
+        else:
+            msg = self._read_message(
+                timeout_sec=max(0.0, min(0.05, float(timeout_sec))) if timeout_sec > 0 else 0.0
+            )
+        if msg is None:
+            return False
+        if isinstance(msg.get("id"), int) and ("result" in msg or "error" in msg):
+            self._pending_messages.insert(0, msg)
+            return False
+        approval_started_at = clock.monotonic()
+        if self._maybe_handle_server_request(msg):
+            _ = approval_started_at
+            return True
+        method = msg.get("method")
+        params = msg.get("params", {})
+        if isinstance(method, str) and isinstance(params, dict):
+            self._emit_protocol_status(method=method, params=params)
+            self._logger.event(
+                "protocol_background_consumed",
+                role=self._role,
+                method=method,
+            )
+            return True
+        return False
+
     def _initialize(self) -> None:
         req_id = self._send_request(
             method="initialize",
@@ -997,6 +1040,9 @@ class CodexJsonRpcSession:
             if status == "failed":
                 error_payload = params.get("turn", {}).get("error")
                 raise RuntimeError(f"turn failed: {error_payload}")
+            if status == "interrupted":
+                self._logger.event(f"{self._role}_interrupted", turn_id=state.turn_id)
+                return InteractiveTurnProgress(kind="interrupted")
             self._logger.event(f"{self._role}_output", response=text, turn_id=state.turn_id)
             return InteractiveTurnProgress(kind="completed", text=text)
         if method == "error" and str(params.get("turnId")) == state.turn_id:
@@ -1268,6 +1314,9 @@ class CodexJsonRpcSession:
                     error_payload = params.get("turn", {}).get("error")
                     self._pending_messages = deferred + self._pending_messages
                     raise RuntimeError(f"turn failed: {error_payload}")
+                if status == "interrupted":
+                    self._pending_messages = deferred + self._pending_messages
+                    return ""
                 self._pending_messages = deferred + self._pending_messages
                 return text
             if method == "error" and str(params.get("turnId")) == turn_id_str:

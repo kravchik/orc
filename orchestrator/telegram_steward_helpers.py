@@ -844,18 +844,6 @@ def _default_agent_backend_factory(
     default_thread_sandbox: str,
     client_factory: Callable[..., Any] | None = None,
 ) -> AgentBackendFactory:
-    def _has_model_reasoning_effort_override(command: list[str]) -> bool:
-        for idx, token in enumerate(command):
-            if token in ("-c", "--config"):
-                if idx + 1 < len(command):
-                    if str(command[idx + 1]).strip().startswith("model_reasoning_effort"):
-                        return True
-                continue
-            if token.startswith("--config="):
-                if token.split("=", 1)[1].strip().startswith("model_reasoning_effort"):
-                    return True
-        return False
-
     def _factory(access_point: AccessPointKey, spec: dict[str, Any], logger: LifecycleLogger) -> StewardBackend:
         _ = access_point
         command = list(agent_command)
@@ -863,16 +851,6 @@ def _default_agent_backend_factory(
         if isinstance(raw_args, list):
             command.extend(str(item) for item in raw_args)
         model = str(spec.get("model") or "").strip()
-        if model == "gpt-5-codex" and not _has_model_reasoning_effort_override(command):
-            command.extend(["-c", 'model_reasoning_effort="high"'])
-            logger.event(
-                "runtime_agent_command_amended",
-                access_point_type=access_point.type,
-                chat_id=access_point.chat_id,
-                thread_id=access_point.thread_id,
-                amendment='model_reasoning_effort="high"',
-                model=model,
-            )
         thread_approval_policy = str(spec.get("approval_policy") or default_thread_approval_policy)
         thread_sandbox = str(spec.get("sandbox") or default_thread_sandbox)
         return CodexSingleAgentBackend(

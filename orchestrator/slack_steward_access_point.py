@@ -20,6 +20,7 @@ from orchestrator.processes import LifecycleLogger
 from orchestrator.slack_api_thread_driver import SlackApiThreadDriver
 from orchestrator.slack_interactivity import SlackInteractivityAction
 from orchestrator.slack_output_runtime import SlackOutputRuntime
+from orchestrator.steward_restore_notice_rendering import render_restore_notice_slack
 from orchestrator.steward_inbound import (
     StewardApprovalDecision,
     StewardApprovalDetailsRequest,
@@ -316,6 +317,9 @@ class SlackStewardAccessPointAdapter:
         pending = pending_approval
         if pending is None or inbound.access_point != pending.access_point:
             return False
+        raw = inbound.text.strip().lower()
+        if raw == "/interrupt" or raw.startswith("/interrupt@"):
+            return False
         approval_action = self.approval_action_from_text(
             inbound=inbound,
             pending_approval=pending,
@@ -457,6 +461,9 @@ class SlackStewardAccessPointAdapter:
             ),
         )
 
+    def clear_approval_markup(self, pending_approval: PendingSlackStewardApproval) -> None:
+        self.clear_approval_blocks(pending_approval)
+
     def build_help_text(self, *, state: str) -> str:
         lines = [
             f"access point state: {state}",
@@ -467,6 +474,7 @@ class SlackStewardAccessPointAdapter:
             "/status - show current runtime state and bound agent details.",
             "/stop - stop runtime agent for this access point (keeps binding; Steward stays active).",
             "/start - start runtime agent for existing binding (Steward stays active).",
+            "/interrupt - interrupt the current in-flight turn for this access point.",
             "/reset - clear binding and reset local runtime state for this access point.",
             "/steward <message> - send one message to steward (available when state is BOUND).",
         ]
@@ -711,6 +719,83 @@ class SlackStewardAccessPointAdapter:
             on_failure=on_failed if callable(on_failed) else None,
         )
 
+    def queue_text_reply_with_result(
+        self,
+        *,
+        access_point: AccessPointKey,
+        text: str,
+        source: str,
+        kind: Any = None,
+        on_sent: Any = None,
+        on_failed: Any = None,
+    ) -> None:
+        _ = kind
+        reply_text = self.decorate_reply(text=text, source=source)
+        receipt_id = self._enqueue_outbound(
+            priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
+            operation="post_message",
+            telemetry={
+                "kind": "reply",
+                "channel_id": str(access_point.chat_id),
+                "thread_ts": self._thread_ts(access_point),
+                "source": source,
+                "text_len": len(reply_text),
+                "has_blocks": False,
+            },
+            execute=lambda ap=access_point, body=reply_text: self._client.post_message(
+                channel_id=str(ap.chat_id),
+                thread_ts=self._thread_ts(ap),
+                text=body,
+            ),
+            on_success=(lambda _result, rid=0: on_sent(rid)) if callable(on_sent) else None,
+            on_failure=on_failed if callable(on_failed) else None,
+        )
+        if callable(on_sent):
+            item = self._outbound_queue[-1]
+            item.on_success = lambda _result, rid=receipt_id: on_sent(rid)
+
+    def queue_text_reply_edit(
+        self,
+        *,
+        access_point: AccessPointKey,
+        message_id: int,
+        text: str,
+        source: str,
+        kind: Any = None,
+        on_sent: Any = None,
+        on_failed: Any = None,
+    ) -> None:
+        _ = kind
+        reply_text = self.decorate_reply(text=text, source=source)
+        receipt = self._receipts.get(int(message_id))
+        ts = receipt.message_ts if receipt is not None else None
+        if not isinstance(ts, str) or not ts.strip():
+            if callable(on_failed):
+                on_failed(RuntimeError(f"slack message ts is unavailable for receipt {message_id}"))
+            return
+        self._enqueue_outbound(
+            priority=ACCESS_POINT_OUTBOUND_CLASS_EDIT,
+            operation="update_message",
+            telemetry={
+                "kind": "reply_edit",
+                "channel_id": str(access_point.chat_id),
+                "thread_ts": self._thread_ts(access_point),
+                "message_ts": ts,
+                "source": source,
+                "text_len": len(reply_text),
+                "has_blocks": False,
+            },
+            coalesce_key=("edit_reply", access_point, ts),
+            execute=lambda ap=access_point, body=reply_text, message_ts=ts: self._client.update_message(
+                channel_id=str(ap.chat_id),
+                ts=message_ts,
+                text=body,
+                blocks=None,
+            ),
+            on_success=(lambda _result: on_sent()) if callable(on_sent) else None,
+            on_failure=on_failed if callable(on_failed) else None,
+        )
+
     def send_outbound_note(
         self,
         *,
@@ -720,7 +805,7 @@ class SlackStewardAccessPointAdapter:
         kind: Any | None = None,
     ) -> None:
         _ = source
-        _ = kind
+        rendered_text = render_restore_notice_slack(text) if kind == "restore" else text
         self._enqueue_outbound(
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
             operation="post_message",
@@ -728,10 +813,10 @@ class SlackStewardAccessPointAdapter:
                 "kind": "outbound_note",
                 "channel_id": str(access_point.chat_id),
                 "thread_ts": self._thread_ts(access_point),
-                "text_len": len(text),
+                "text_len": len(rendered_text),
                 "has_blocks": False,
             },
-            execute=lambda ap=access_point, body=text: self._client.post_message(
+            execute=lambda ap=access_point, body=rendered_text: self._client.post_message(
                 channel_id=str(ap.chat_id),
                 thread_ts=self._thread_ts(ap),
                 text=body,

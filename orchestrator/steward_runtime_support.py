@@ -181,6 +181,8 @@ class StewardDeliveryLane(Protocol):
     def get_item_status_snapshot(self, access_point: AccessPointKey) -> list[dict[str, str]]: ...
     def get_item_status_snapshot_for_turn(self, access_point: AccessPointKey, turn_id: str) -> list[dict[str, str]]: ...
     def get_last_item_apply_info(self, access_point: AccessPointKey) -> dict | None: ...
+    def has_active_turn(self, access_point: AccessPointKey) -> bool: ...
+    def interrupt_active_turn(self, access_point: AccessPointKey) -> None: ...
     def reset(self, access_point: AccessPointKey) -> bool: ...
     def close(self) -> None: ...
 
@@ -319,6 +321,18 @@ class InteractiveStewardRuntime:
         if handle is None:
             return None
         return handle.driver.get_last_item_apply_info()
+
+    def has_active_turn(self, access_point: AccessPointKey) -> bool:
+        handle = self._handles.get(access_point)
+        if handle is None:
+            return False
+        return bool(handle.driver.has_active_turn())
+
+    def interrupt_active_turn(self, access_point: AccessPointKey) -> None:
+        handle = self._handles.get(access_point)
+        if handle is None:
+            raise RuntimeError("no running steward node for this access point")
+        handle.driver.interrupt_active_turn()
 
     def submit_approval_decision(self, access_point: AccessPointKey, decision: str) -> None:
         handle = self._handles.get(access_point)
@@ -723,6 +737,18 @@ class InteractiveAgentRuntime:
             return None
         return binding.driver.get_last_item_apply_info()
 
+    def has_active_turn(self, access_point: AccessPointKey) -> bool:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None:
+            return False
+        return bool(binding.driver.has_active_turn())
+
+    def interrupt_active_turn(self, access_point: AccessPointKey) -> None:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None:
+            raise RuntimeError("no running agent is bound to this access point")
+        binding.driver.interrupt_active_turn()
+
     def close(self) -> None:
         bindings = list(self._binding_by_access_point.values())
         self._binding_by_access_point.clear()
@@ -734,33 +760,11 @@ class InteractiveAgentRuntime:
         if self._driver_factory is not None:
             return self._driver_factory(access_point, spec, self._logger)
 
-        def _has_model_reasoning_effort_override(command: list[str]) -> bool:
-            for idx, token in enumerate(command):
-                if token in ("-c", "--config"):
-                    if idx + 1 < len(command):
-                        if str(command[idx + 1]).strip().startswith("model_reasoning_effort"):
-                            return True
-                    continue
-                if token.startswith("--config="):
-                    if token.split("=", 1)[1].strip().startswith("model_reasoning_effort"):
-                        return True
-            return False
-
         command = list(self._agent_command)
         raw_args = spec.get("args") or []
         if isinstance(raw_args, list):
             command.extend(str(item) for item in raw_args)
         model = str(spec.get("model") or "").strip()
-        if model == "gpt-5-codex" and not _has_model_reasoning_effort_override(command):
-            command.extend(["-c", 'model_reasoning_effort="high"'])
-            self._logger.event(
-                "runtime_agent_command_amended",
-                access_point_type=access_point.type,
-                chat_id=access_point.chat_id,
-                thread_id=access_point.thread_id,
-                amendment='model_reasoning_effort="high"',
-                model=model,
-            )
         thread_approval_policy = str(spec.get("approval_policy") or self._default_thread_approval_policy)
         thread_sandbox = str(spec.get("sandbox") or self._default_thread_sandbox)
         return TelegramInteractiveCodexDriver(

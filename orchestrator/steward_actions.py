@@ -369,6 +369,8 @@ def _run_start_agent(
     }
     if isinstance(provider_result, dict):
         result.update(provider_result)
+    if not str(result.get("model") or "").strip():
+        result.pop("model", None)
     if isinstance(access_point, dict):
         result["access_point"] = dict(access_point)
     return result
@@ -491,6 +493,8 @@ def _run_resume_agent(
     }
     if isinstance(provider_result, dict):
         result.update(provider_result)
+    if not str(result.get("model") or "").strip():
+        result.pop("model", None)
     if isinstance(access_point, dict):
         result["access_point"] = dict(access_point)
     return result

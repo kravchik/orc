@@ -106,11 +106,16 @@ def build_steward_registry_context(
             if not isinstance(agent_payload, dict):
                 continue
             spec_payload = agent_payload.get("spec")
-            spec = dict(spec_payload) if isinstance(spec_payload, dict) else {
-                "cwd": str(agent_payload.get("cwd") or state.project_cwd or ""),
-                "model": str(agent_payload.get("model") or "gpt-5-codex"),
-                "mode": str(agent_payload.get("mode") or "proxy"),
-            }
+            if isinstance(spec_payload, dict):
+                spec = dict(spec_payload)
+            else:
+                spec = {
+                    "cwd": str(agent_payload.get("cwd") or state.project_cwd or ""),
+                    "mode": str(agent_payload.get("mode") or "proxy"),
+                }
+                model = str(agent_payload.get("model") or "").strip()
+                if model:
+                    spec["model"] = model
             if not str(spec.get("cwd") or "").strip():
                 continue
             try:
