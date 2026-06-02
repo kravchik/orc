@@ -22,7 +22,7 @@ from orchestrator.telegram_steward_helpers import (
 
 
 Writer = Callable[[str], None]
-STEWARD_IDLE_SLEEP_SEC = 0.01
+STEWARD_IDLE_SLEEP_SEC = 0.1
 STEWARD_SLOW_TICK_WARNING_SEC = 0.1
 
 

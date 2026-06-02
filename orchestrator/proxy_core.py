@@ -94,6 +94,11 @@ class ProxyCore(
         return self._pending_approval
 
     def record_result(self, result: ResultT) -> None:
+        reply_value = getattr(result, "reply", None)
+        is_error = bool(getattr(result, "is_error", False))
+        if isinstance(reply_value, str) and not reply_value.strip() and not is_error:
+            self.set_awaiting(True)
+            return
         self.set_awaiting(True)
         self._send_result(result)
         self._after_record_result(result)

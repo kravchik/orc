@@ -16,7 +16,14 @@ from orchestrator.access_point_common import (
     access_point_outbound_sort_key,
 )
 from orchestrator.approval import build_accept_settings
-from orchestrator.proxy_access_point import ProxyApprovalDecision, ProxyModelSelection, ProxySubmitPrompt
+from orchestrator.proxy_access_point import (
+    ProxyApprovalDecision,
+    ProxyModelSelection,
+    ProxySubmitPrompt,
+    build_proxy_inspect_text,
+    extract_proxy_pending_approval_command,
+    extract_proxy_pending_approval_cwd,
+)
 from orchestrator.telegram_approval_helper import _format_approval_details, _format_approval_prompt
 from orchestrator.telegram_output_runtime import TelegramKind, TelegramOutputRuntime
 from orchestrator.turn_status_store import TurnStatusStore
@@ -201,9 +208,36 @@ class TelegramAccessPointAdapter:
         cmd = _normalize_command(update.text)
         if cmd == "/interrupt":
             return self._handle_interrupt_command(chat_id=update.chat_id, thread_id=update.thread_id)
+        if cmd == "/inspect":
+            reply = build_proxy_inspect_text(
+                mode="telegram-agent",
+                thread_metadata=(
+                    self._core._driver.get_thread_metadata()
+                    if callable(getattr(self._core._driver, "get_thread_metadata", None))
+                    else {}
+                ),
+                thread_id=self._core._driver.get_thread_id(),
+                model=self._core._driver.get_actual_thread_model().strip(),
+                has_active_turn=self._core._driver.has_active_turn(),
+                last_apply_info=self._core._driver.get_last_item_apply_info(),
+                pending_approval=self._core.pending_approval,
+                approval_command=extract_proxy_pending_approval_command(self._core.pending_approval),
+                approval_cwd=extract_proxy_pending_approval_cwd(self._core.pending_approval),
+                rows=self._core._driver.get_item_status_snapshot(),
+            )
+            self._enqueue_send_text(
+                chat_id=update.chat_id,
+                thread_id=update.thread_id,
+                text=reply,
+                kind=TelegramKind.COMMAND,
+            )
+            self._core._writer(
+                f"chat_id={update.chat_id} thread_id={update.thread_id} in={update.text!r} out={reply!r}"
+            )
+            return None
         if cmd in ("/start", "/status", "/stop", "/quit"):
             if cmd == "/start":
-                reply = "ORC1 telegram-agent ready. Send text to proxy to local agent. Commands: /start /status /compact /model /interrupt /stop"
+                reply = "ORC1 telegram-agent ready. Send text to proxy to local agent. Commands: /start /status /inspect /compact /model /interrupt /stop"
             elif cmd == "/status":
                 current_model = self._core._driver.get_actual_thread_model().strip()
                 if current_model:
@@ -241,7 +275,8 @@ class TelegramAccessPointAdapter:
             )
             return None
 
-        if not self._core.is_awaiting():
+        awaiting_before = self._core.is_awaiting()
+        if not awaiting_before and cmd is not None:
             warning = _format_not_waiting_warning(text=update.text)
             self._enqueue_send_text(
                 chat_id=update.chat_id,
@@ -293,6 +328,7 @@ class TelegramAccessPointAdapter:
             chat_id=update.chat_id,
             thread_id=update.thread_id,
             text=update.text,
+            steer_candidate=not awaiting_before,
         )
         return ProxySubmitPrompt(access_point=(update.chat_id, update.thread_id), text=update.text)
 
@@ -365,7 +401,7 @@ class TelegramAccessPointAdapter:
         if pending["thread_id"] is not None and update.thread_id != pending["thread_id"]:
             return None
         raw = update.text.strip().lower()
-        if raw == "/interrupt" or raw.startswith("/interrupt@"):
+        if raw == "/inspect" or raw.startswith("/inspect@") or raw == "/interrupt" or raw.startswith("/interrupt@"):
             return None
         if raw not in ("accept", "decline"):
             self._enqueue_send_text(

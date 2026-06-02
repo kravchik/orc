@@ -158,6 +158,7 @@ class PendingStewardOperation:
     output_kind: Any
     phase: str = "initial"
     fallback_reply: str = ""
+    allow_steer: bool = False
 
 
 @dataclass
@@ -183,6 +184,7 @@ class StewardDeliveryLane(Protocol):
     def get_last_item_apply_info(self, access_point: AccessPointKey) -> dict | None: ...
     def has_active_turn(self, access_point: AccessPointKey) -> bool: ...
     def interrupt_active_turn(self, access_point: AccessPointKey) -> None: ...
+    def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]: ...
     def reset(self, access_point: AccessPointKey) -> bool: ...
     def close(self) -> None: ...
 
@@ -193,6 +195,7 @@ class AgentDeliveryLane(StewardDeliveryLane, Protocol):
     def has_binding(self, access_point: AccessPointKey) -> bool: ...
     def runtime_state(self, access_point: AccessPointKey) -> str: ...
     def get_binding_info(self, access_point: AccessPointKey) -> dict[str, str] | None: ...
+    def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]: ...
     def stop_agent(self, access_point: AccessPointKey) -> bool: ...
     def start_bound_agent(self, access_point: AccessPointKey) -> dict[str, Any]: ...
     def restore_binding(
@@ -333,6 +336,16 @@ class InteractiveStewardRuntime:
         if handle is None:
             raise RuntimeError("no running steward node for this access point")
         handle.driver.interrupt_active_turn()
+
+    def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]:
+        handle = self._handles.get(access_point)
+        if handle is None:
+            return {}
+        getter = getattr(handle.driver, "get_thread_metadata", None)
+        if not callable(getter):
+            return {}
+        raw = getter()
+        return dict(raw) if isinstance(raw, dict) else {}
 
     def submit_approval_decision(self, access_point: AccessPointKey, decision: str) -> None:
         handle = self._handles.get(access_point)
@@ -748,6 +761,16 @@ class InteractiveAgentRuntime:
         if binding is None or binding.driver is None:
             raise RuntimeError("no running agent is bound to this access point")
         binding.driver.interrupt_active_turn()
+
+    def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None:
+            return {}
+        getter = getattr(binding.driver, "get_thread_metadata", None)
+        if not callable(getter):
+            return {}
+        raw = getter()
+        return dict(raw) if isinstance(raw, dict) else {}
 
     def close(self) -> None:
         bindings = list(self._binding_by_access_point.values())

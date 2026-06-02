@@ -479,6 +479,7 @@ class CodexJsonRpcSession:
         )
         self._thread_id: Optional[str] = None
         self._thread_model: Optional[str] = None
+        self._thread_metadata: dict[str, Any] = {}
         self._pending_messages: list[dict] = []
         self._always_allow_commands: set[str] = set()
         self._item_tracker = ProtocolItemTracker()
@@ -518,6 +519,26 @@ class CodexJsonRpcSession:
 
     def get_last_item_apply_info(self) -> dict | None:
         return self._item_tracker.last_apply_info()
+
+    def request(self, method: str, params: dict) -> dict:
+        req_id = self._send_request(method=method, params=params)
+        return self._wait_for_response(req_id=req_id)
+
+    def get_thread_metadata(self) -> dict[str, Any]:
+        thread_id = str(self._thread_id or "").strip()
+        if not thread_id:
+            return {}
+        metadata: dict[str, Any] = dict(self._thread_metadata)
+        read_payload = self._request_thread_read(thread_id)
+        if read_payload:
+            metadata.update(read_payload)
+        if "loaded" not in metadata:
+            loaded = self._request_loaded_state(thread_id)
+            if loaded is not None:
+                metadata["loaded"] = loaded
+        if "model" not in metadata and isinstance(self._thread_model, str) and self._thread_model.strip():
+            metadata["model"] = self._thread_model.strip()
+        return metadata
 
     def start(
         self,
@@ -625,6 +646,7 @@ class CodexJsonRpcSession:
         self._item_tracker.clear()
         self._thread_id = None
         self._thread_model = None
+        self._thread_metadata = {}
         self._client.start()
         self._logger.event(
             "process_started",
@@ -701,6 +723,10 @@ class CodexJsonRpcSession:
                         raise RuntimeError(f"{state.active_start_method} response did not contain model")
                     self._thread_id = thread_id
                     self._thread_model = model
+                    thread_payload = result.get("thread")
+                    self._thread_metadata = dict(thread_payload) if isinstance(thread_payload, dict) else {}
+                    self._thread_metadata.setdefault("id", thread_id)
+                    self._thread_metadata.setdefault("model", model)
                     state.started = True
                     if state.active_start_method == "thread/resume":
                         self._logger.event(
@@ -770,11 +796,12 @@ class CodexJsonRpcSession:
             else:
                 msg = self._read_message(timeout_sec=max(0.0, min(0.05, wait_timeout)) if timeout_sec > 0 else 0.0)
             if msg is None:
-                self._logger.event(
-                    "interactive_turn_poll_no_message",
-                    role=self._role,
-                    turn_id=state.turn_id,
-                )
+                if timeout_sec > 0:
+                    self._logger.event(
+                        "interactive_turn_poll_no_message",
+                        role=self._role,
+                        turn_id=state.turn_id,
+                    )
                 return InteractiveTurnProgress(kind="idle")
             progress = self._consume_interactive_turn_message(state=state, msg=msg)
             if progress is not None:
@@ -800,11 +827,12 @@ class CodexJsonRpcSession:
             else:
                 msg = self._read_message(timeout_sec=max(0.0, min(0.05, wait_timeout)) if timeout_sec > 0 else 0.0)
             if msg is None:
-                self._logger.event(
-                    "interactive_turn_start_poll_no_message",
-                    role=self._role,
-                    start_req_id=state.start_req_id,
-                )
+                if timeout_sec > 0:
+                    self._logger.event(
+                        "interactive_turn_start_poll_no_message",
+                        role=self._role,
+                        start_req_id=state.start_req_id,
+                    )
                 state.deferred_pre_start_messages = deferred
                 return False
             if msg.get("id") == state.start_req_id and "result" in msg:
@@ -903,6 +931,30 @@ class CodexJsonRpcSession:
         )
         self._wait_for_response(req_id=req_id)
 
+    def submit_interactive_turn_steer(self, state: InteractiveTurnState, text: str) -> None:
+        if self._thread_id is None:
+            raise RuntimeError("thread not initialized")
+        if not isinstance(state.turn_id, str) or not state.turn_id.strip():
+            raise RuntimeError("interactive turn has no active turn id")
+        steer_text = str(text)
+        req_id = self._send_request(
+            method="turn/steer",
+            params={
+                "threadId": self._thread_id,
+                "expectedTurnId": state.turn_id.strip(),
+                "input": [{"type": "text", "text": steer_text, "text_elements": []}],
+            },
+        )
+        self._logger.event(
+            "interactive_turn_steer_requested",
+            role=self._role,
+            req_id=req_id,
+            thread_id=self._thread_id,
+            turn_id=state.turn_id.strip(),
+            prompt_preview=steer_text.strip()[:200],
+        )
+        self._wait_for_response(req_id=req_id)
+
     def poll_background_protocol_message(self, *, timeout_sec: float = 0.0) -> bool:
         if self._pending_messages:
             msg = self._pending_messages.pop(0)
@@ -961,6 +1013,10 @@ class CodexJsonRpcSession:
                 raise RuntimeError("thread/start response did not contain model")
             self._thread_id = str(thread_id)
             self._thread_model = thread_model
+            thread_payload = result.get("thread")
+            self._thread_metadata = dict(thread_payload) if isinstance(thread_payload, dict) else {}
+            self._thread_metadata.setdefault("id", self._thread_id)
+            self._thread_metadata.setdefault("model", self._thread_model)
             return
 
         def _request_fn(method: str, req_params: dict) -> dict:
@@ -976,6 +1032,62 @@ class CodexJsonRpcSession:
         )
         self._thread_id = start_result.thread_id
         self._thread_model = start_result.model
+        self._thread_metadata = {"id": self._thread_id, "model": self._thread_model}
+
+    def _request_thread_read(self, thread_id: str) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for params in ({"threadId": thread_id}, {"id": thread_id}):
+            try:
+                response = self.request("thread/read", params)
+            except Exception as exc:
+                last_error = exc
+                continue
+            result = response.get("result") if isinstance(response.get("result"), dict) else {}
+            thread_payload = result.get("thread")
+            if isinstance(thread_payload, dict):
+                return dict(thread_payload)
+            if isinstance(result, dict) and any(key in result for key in ("id", "status", "preview", "ephemeral")):
+                return dict(result)
+        if last_error is not None:
+            self._logger.event(
+                "protocol_thread_read_failed",
+                role=self._role,
+                thread_id=thread_id,
+                error=str(last_error),
+                error_type=type(last_error).__name__,
+            )
+        return {}
+
+    def _request_loaded_state(self, thread_id: str) -> bool | None:
+        try:
+            response = self.request("thread/loaded/list", {})
+        except Exception as exc:
+            self._logger.event(
+                "protocol_thread_loaded_list_failed",
+                role=self._role,
+                thread_id=thread_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return None
+        result = response.get("result") if isinstance(response.get("result"), dict) else {}
+        raw_items = None
+        if isinstance(result.get("data"), list):
+            raw_items = result.get("data")
+        elif isinstance(result.get("threads"), list):
+            raw_items = result.get("threads")
+        elif isinstance(result.get("threadIds"), list):
+            raw_items = result.get("threadIds")
+        if not isinstance(raw_items, list):
+            return None
+        for item in raw_items:
+            if isinstance(item, str) and item.strip() == thread_id:
+                return True
+            if isinstance(item, dict):
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id.strip() == thread_id:
+                    return True
+        return False
 
     def _consume_interactive_turn_message(
         self,

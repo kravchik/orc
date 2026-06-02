@@ -15,6 +15,7 @@ from orchestrator.access_point_common import (
     QueuedAccessPointOutbound,
     access_point_outbound_sort_key,
 )
+from orchestrator.approval_details_formatter import build_approval_details_lines
 from orchestrator.approval import ApprovalRequest, build_accept_settings
 from orchestrator.processes import LifecycleLogger
 from orchestrator.slack_api_thread_driver import SlackApiThreadDriver
@@ -160,17 +161,13 @@ def _format_approval_prompt(*, request: ApprovalRequest, allow_always: bool) -> 
 
 
 def _format_approval_details(request: ApprovalRequest) -> str:
-    params = request.params
-    lines = [
-        f"{_approval_source_icon(request)} approval details",
-        f"method={request.method}",
-        f"role={getattr(request, 'role', '')}",
-    ]
-    for key in ("command", "cwd", "reason"):
-        value = params.get(key)
-        if value is not None:
-            lines.append(f"{key}={value}")
-    return "\n".join(lines)
+    return "\n".join(
+        build_approval_details_lines(
+            request,
+            header=f"{_approval_source_icon(request)} approval details",
+            include_role=True,
+        )
+    )
 
 
 class SlackStewardAccessPointAdapter:
@@ -472,6 +469,7 @@ class SlackStewardAccessPointAdapter:
             "/help - show this help.",
             "/where - show current access point routing key.",
             "/status - show current runtime state and bound agent details.",
+            "/inspect - show current API-backed session summary and tracked active work.",
             "/stop - stop runtime agent for this access point (keeps binding; Steward stays active).",
             "/start - start runtime agent for existing binding (Steward stays active).",
             "/interrupt - interrupt the current in-flight turn for this access point.",

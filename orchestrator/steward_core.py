@@ -6,6 +6,7 @@ from typing import Any, Callable, Protocol
 
 from orchestrator.approval import ApprovalRequest
 from orchestrator.codex_sessions import list_codex_cli_sessions
+from orchestrator.inspect_text import append_active_work_lines, format_thread_metadata_lines
 from orchestrator.processes import LifecycleLogger
 from orchestrator.routing_profile_control import InMemoryRoutingProfileControl
 from orchestrator.steward_actions import (
@@ -531,23 +532,76 @@ class StewardCore:
             pending = self._pending_approvals.get(access_point)
             active = self._active_operations.get(access_point)
             fallback_cmd = extract_fallback_command(inbound.text)
-            bypass_active = fallback_cmd == "interrupt"
+            bypass_active = fallback_cmd in {"help", "where", "status", "interrupt", "inspect"}
+            is_slash_command = str(inbound.text or "").strip().startswith("/")
+            has_earlier_same_access_point = any(
+                pending_inbound.access_point == access_point
+                for pending_inbound in self._pending_text_updates[:idx]
+            )
+            has_later_interrupt_same_access_point = any(
+                pending_inbound.access_point == access_point
+                and extract_fallback_command(pending_inbound.text) == "interrupt"
+                for pending_inbound in self._pending_text_updates[idx + 1 :]
+            )
             if active is not None and pending is None and not bypass_active:
+                if (
+                    fallback_cmd is None
+                    and not is_slash_command
+                    and not has_earlier_same_access_point
+                    and not has_later_interrupt_same_access_point
+                    and self._submit_busy_followup_to_active_lane(inbound, active)
+                ):
+                    self._pending_text_updates.pop(idx)
+                    progressed = True
+                    continue
                 idx += 1
                 continue
             self._pending_text_updates.pop(idx)
-            if preprocess_inbound(inbound):
+            if fallback_cmd != "inspect" and preprocess_inbound(inbound):
                 progressed = True
                 continue
             pending = self._pending_approvals.get(access_point)
             active = self._active_operations.get(access_point)
-            if pending is not None and active is not None and fallback_cmd != "interrupt":
+            if pending is not None and active is not None and fallback_cmd not in {"interrupt", "inspect"}:
                 self._pending_text_updates.insert(idx, inbound)
                 idx += 1
                 continue
             self.handle_text_update(inbound)
             progressed = True
         return progressed
+
+    def _submit_busy_followup_to_active_lane(
+        self,
+        inbound: StewardInboundText,
+        active: PendingStewardOperation,
+    ) -> bool:
+        access_point = inbound.access_point
+        try:
+            if active.phase != "initial" or not active.allow_steer:
+                return False
+            if active.source == "agent":
+                self._agent_runtime.submit_request(access_point, inbound.text)
+            elif active.source == "steward":
+                self._runtime.submit_request(access_point, inbound.text)
+            else:
+                return False
+        except Exception as exc:
+            self._logger.event(
+                "steward_busy_followup_submit_failed",
+                **self._hooks.access_point_fields(access_point),
+                route_target=active.source,
+                text_preview=inbound.text.strip()[:200],
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return False
+        self._logger.event(
+            "steward_busy_followup_submitted",
+            **self._hooks.access_point_fields(access_point),
+            route_target=active.source,
+            text_preview=inbound.text.strip()[:200],
+        )
+        return True
 
     def build_status_text(self, *, access_point: AccessPointKey, state: str) -> str:
         steward_rows = self._runtime.show_running(access_point)
@@ -560,6 +614,69 @@ class StewardCore:
             agent_rows=agent_rows,
             binding=binding,
         )
+
+    def _build_inspect_text(self, *, access_point: AccessPointKey, state: str) -> str:
+        binding = self._agent_runtime.get_binding_info(access_point)
+        pending = self._pending_approvals.get(access_point)
+        rows: list[dict[str, str]]
+        last_apply_info: dict | None
+        has_active_turn: bool
+        thread_metadata: dict[str, Any]
+        if binding is not None:
+            rows = self._agent_runtime.get_item_status_snapshot(access_point)
+            last_apply_info = self._agent_runtime.get_last_item_apply_info(access_point)
+            has_active_turn = self._agent_runtime.has_active_turn(access_point)
+            getter = getattr(self._agent_runtime, "get_thread_metadata", None)
+            thread_metadata = getter(access_point) if callable(getter) else {}
+        else:
+            rows = self._runtime.get_item_status_snapshot(access_point)
+            last_apply_info = self._runtime.get_last_item_apply_info(access_point)
+            has_active_turn = self._runtime.has_active_turn(access_point)
+            getter = getattr(self._runtime, "get_thread_metadata", None)
+            thread_metadata = getter(access_point) if callable(getter) else {}
+
+        active_turn_id = "none"
+        if pending is not None:
+            raw_turn_id = pending.request.params.get("turnId")
+            if isinstance(raw_turn_id, str) and raw_turn_id.strip():
+                active_turn_id = raw_turn_id.strip()
+        elif has_active_turn and isinstance(last_apply_info, dict):
+            raw_turn_id = last_apply_info.get("turn_id")
+            if isinstance(raw_turn_id, str) and raw_turn_id.strip():
+                active_turn_id = raw_turn_id.strip()
+
+        lines = [
+            "inspect",
+            f"access point state: {state}",
+        ]
+        if binding is None:
+            lines.append("binding: none")
+        else:
+            lines.extend(
+                [
+                    f"agent_id: {binding.get('agent_id', '')}",
+                    f"cwd: {binding.get('cwd', '')}",
+                    f"mode: {binding.get('mode', '')}",
+                ]
+            )
+            lines.extend(
+                format_thread_metadata_lines(
+                    thread_metadata,
+                    thread_id_fallback=str(binding.get("thread_id", "") or "").strip(),
+                    model_fallback=str(binding.get("model", "") or "").strip(),
+                )
+            )
+        lines.append(f"active turn: {active_turn_id}")
+        lines.append(f"pending approval: {'yes' if pending is not None else 'no'}")
+        if pending is not None:
+            command = pending.request.params.get("command")
+            cwd = pending.request.params.get("cwd")
+            if isinstance(command, str) and command.strip():
+                lines.append(f"approval command: {command.strip()}")
+            if isinstance(cwd, str) and cwd.strip():
+                lines.append(f"approval cwd: {cwd.strip()}")
+        append_active_work_lines(lines, rows)
+        return "\n".join(lines)
 
     def register_approval(self, event: StewardDriverEvent, request: ApprovalRequest) -> None:
         self._pending_approvals[event.access_point] = self._access_point_adapter.register_approval(
@@ -764,13 +881,15 @@ class StewardCore:
             self._active_operations.pop(event.access_point, None)
             return
         if isinstance(payload, _TelegramAgentResult):
+            reply_text = str(payload.reply or "")
+            reply_preview = reply_text.strip()[:200]
             pending_interrupt = self._pending_interrupts.get(event.access_point)
             if pending_interrupt is not None and pending_interrupt.source == event.source:
                 self._logger.event(
                     "steward_interrupt_reply_suppressed",
                     **self._hooks.access_point_fields(event.access_point),
                     route_target=event.source,
-                    reply_preview=payload.reply.strip()[:200],
+                    reply_preview=reply_preview,
                 )
                 if pending_interrupt.final_text is None:
                     pending_interrupt.final_text = self._interrupt_final_text(success=False)
@@ -781,26 +900,29 @@ class StewardCore:
                 "steward_driver_result_received",
                 **self._hooks.access_point_fields(event.access_point),
                 route_target=event.source,
-                reply_preview=payload.reply.strip()[:200],
+                reply_preview=reply_preview,
             )
             if event.source == "agent":
                 operation = self._active_operations.get(event.access_point)
                 if operation is not None and operation.source == "agent":
-                    if payload.reply.startswith("agent error: "):
+                    if reply_text.startswith("agent error: "):
                         self._logger.event(
                             self._hooks.turn_error_event,
                             **self._hooks.access_point_fields(event.access_point),
                             route_target="agent",
-                            error=payload.reply[len("agent error: "):],
+                            error=reply_text[len("agent error: "):],
                             error_type="RuntimeError",
                         )
+                    if not reply_preview:
+                        self._active_operations.pop(event.access_point, None)
+                        return
                     operation.phase = "waiting_reply_delivery"
                     self._access_point_adapter.queue_text_reply(
                         access_point=event.access_point,
-                        text=payload.reply,
+                        text=reply_text,
                         source="agent",
                         kind=operation.output_kind,
-                        on_sent=lambda ap=event.access_point, body=payload.reply: self._complete_reply_delivery(
+                        on_sent=lambda ap=event.access_point, body=reply_text: self._complete_reply_delivery(
                             access_point=ap,
                             source="agent",
                             text=body,
@@ -924,6 +1046,16 @@ class StewardCore:
             self._queue_local_reply(
                 access_point=access_point,
                 text=self.build_status_text(access_point=access_point, state=agent_state),
+                source="steward",
+                kind=self._kinds.command,
+            )
+            return
+        if fallback_cmd == "inspect":
+            if self._hooks.on_fallback_command is not None:
+                self._hooks.on_fallback_command(access_point, fallback_cmd, is_bound)
+            self._queue_local_reply(
+                access_point=access_point,
+                text=self._build_inspect_text(access_point=access_point, state=agent_state),
                 source="steward",
                 kind=self._kinds.command,
             )
@@ -1064,6 +1196,7 @@ class StewardCore:
                     access_point=access_point,
                     source="steward",
                     output_kind=self._kinds.reply,
+                    allow_steer=False,
                 )
                 return
             if is_running_bound:
@@ -1079,6 +1212,7 @@ class StewardCore:
                     access_point=access_point,
                     source="agent",
                     output_kind=self._kinds.reply,
+                    allow_steer=True,
                 )
                 return
             if self._hooks.on_bound_route is not None:
@@ -1103,6 +1237,7 @@ class StewardCore:
             access_point=access_point,
             source="steward",
             output_kind=self._kinds.reply,
+            allow_steer=is_bound,
         )
 
 
@@ -1154,6 +1289,8 @@ def extract_fallback_command(raw_text: str) -> str | None:
         return "where"
     if head == "/status" or head.startswith("/status@"):
         return "status"
+    if head == "/inspect" or head.startswith("/inspect@"):
+        return "inspect"
     if head == "/bind" or head.startswith("/bind@"):
         return "bind"
     if head == "/start" or head.startswith("/start@"):

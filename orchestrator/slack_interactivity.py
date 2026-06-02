@@ -14,7 +14,10 @@ from queue import Empty, Queue
 from typing import Any, Protocol
 from urllib.parse import parse_qs
 
-import websocket
+try:
+    import websocket  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - exercised via runtime fallback
+    websocket = None
 
 from orchestrator.processes import LifecycleLogger
 
@@ -243,12 +246,16 @@ class SlackSocketModeSource(SlackInboundSource):
         self._action_queue: Queue[SlackInteractivityAction] = Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._ws: websocket.WebSocket | None = None
+        self._ws: Any | None = None
         self._started = False
 
     def start(self) -> None:
         if self._started:
             return
+        if websocket is None:
+            raise RuntimeError(
+                "Slack Socket Mode requires the optional 'websocket-client' dependency"
+            )
         self._started = True
         self._stop.clear()
         self._event("slack_socket_mode_starting")
@@ -415,7 +422,7 @@ def _drain_queue(queue: Queue[Any], *, limit: int) -> list[Any]:
     return out
 
 
-def _ack_socket_envelope(ws: websocket.WebSocket, envelope_id: str) -> None:
+def _ack_socket_envelope(ws: Any, envelope_id: str) -> None:
     ws.send(json.dumps({"envelope_id": envelope_id}, ensure_ascii=True))
 
 

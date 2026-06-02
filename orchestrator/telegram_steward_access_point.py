@@ -17,6 +17,7 @@ from orchestrator.access_point_common import (
     QueuedAccessPointOutbound,
     access_point_outbound_sort_key,
 )
+from orchestrator.approval_details_formatter import build_approval_details_lines
 from orchestrator.approval import ApprovalRequest, build_accept_settings
 from orchestrator.processes import LifecycleLogger
 from orchestrator.steward_inbound import (
@@ -131,25 +132,13 @@ def _format_steward_approval_prompt(request: ApprovalRequest) -> str:
 
 
 def _format_steward_approval_details(request: ApprovalRequest) -> str:
-    params = request.params
-    command = params.get("command")
-    cwd = params.get("cwd")
-    reason = params.get("reason")
-    actions = params.get("commandActions")
-    lines = [
-        f"{_approval_source_icon(request)} approval details",
-        f"method={request.method}",
-        f"role={getattr(request, 'role', '')}",
-    ]
-    if isinstance(command, str):
-        lines.append(f"command={command}")
-    if isinstance(cwd, str):
-        lines.append(f"cwd={cwd}")
-    if reason is not None:
-        lines.append(f"reason={reason}")
-    if actions is not None:
-        lines.append(f"actions={actions}")
-    return "\n".join(lines)
+    return "\n".join(
+        build_approval_details_lines(
+            request,
+            header=f"{_approval_source_icon(request)} approval details",
+            include_role=True,
+        )
+    )
 
 
 class TelegramStewardAccessPointAdapter:
@@ -339,6 +328,7 @@ class TelegramStewardAccessPointAdapter:
             "/help - show this help.",
             "/where - show current access point routing key.",
             "/status - show current runtime state and bound agent details.",
+            "/inspect - show current API-backed session summary and tracked active work.",
             "/interrupt - interrupt the current in-flight turn for this access point.",
             "/stop - stop runtime agent for this access point (keeps binding; Steward stays active).",
             "/start - start runtime agent for existing binding (Steward stays active).",

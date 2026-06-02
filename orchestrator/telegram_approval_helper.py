@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
+from orchestrator.approval_details_formatter import build_approval_details_lines
 from orchestrator.access_point_common import (
     ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_CLEANUP,
     AccessPointDeliveryState,
@@ -45,25 +46,13 @@ def _format_approval_prompt(request: ApprovalRequest) -> str:
 
 
 def _format_approval_details(request: ApprovalRequest) -> str:
-    params = request.params
-    command = params.get("command")
-    cwd = params.get("cwd")
-    reason = params.get("reason")
-    actions = params.get("commandActions")
-    lines = [
-        f"[{_approval_source_tag(request)}->HUMAN] approval details",
-        f"method={request.method}",
-        f"role={getattr(request, 'role', '')}",
-    ]
-    if isinstance(command, str):
-        lines.append(f"command={command}")
-    if isinstance(cwd, str):
-        lines.append(f"cwd={cwd}")
-    if reason is not None:
-        lines.append(f"reason={reason}")
-    if actions is not None:
-        lines.append(f"actions={actions}")
-    return "\n".join(lines)
+    return "\n".join(
+        build_approval_details_lines(
+            request,
+            header=f"[{_approval_source_tag(request)}->HUMAN] approval details",
+            include_role=True,
+        )
+    )
 
 
 class TelegramApprovalDecisionProvider(ApprovalDecisionProvider):
