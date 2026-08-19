@@ -64,6 +64,8 @@ class ProxyActionDriver(Protocol[AccessPointKeyT]):
 
     def has_active_turn(self) -> bool: ...
 
+    def get_active_turn_id(self) -> str: ...
+
     def get_item_status_snapshot(self) -> list[dict[str, str]]: ...
 
     def get_last_item_apply_info(self) -> dict | None: ...
@@ -144,21 +146,15 @@ def build_proxy_inspect_text(
     thread_metadata: dict[str, object] | None,
     thread_id: str,
     model: str,
-    has_active_turn: bool,
-    last_apply_info: dict | None,
+    active_turn_id: str,
     pending_approval: object | None,
     approval_command: str | None,
     approval_cwd: str | None,
     rows: list[dict[str, str]],
 ) -> str:
-    active_turn_id = "none"
-    pending_turn_id = _approval_turn_id(pending_approval)
-    if pending_turn_id:
-        active_turn_id = pending_turn_id
-    elif has_active_turn and isinstance(last_apply_info, dict):
-        raw_turn_id = last_apply_info.get("turn_id")
-        if isinstance(raw_turn_id, str) and raw_turn_id.strip():
-            active_turn_id = raw_turn_id.strip()
+    resolved_active_turn_id = str(active_turn_id or "").strip()
+    if not resolved_active_turn_id:
+        resolved_active_turn_id = _approval_turn_id(pending_approval) or "none"
 
     lines = [
         "inspect",
@@ -171,7 +167,7 @@ def build_proxy_inspect_text(
             model_fallback=str(model or "").strip(),
         )
     )
-    lines.append(f"active turn: {active_turn_id}")
+    lines.append(f"active turn: {resolved_active_turn_id}")
     lines.append(f"pending approval: {'yes' if pending_approval is not None else 'no'}")
     if approval_command:
         lines.append(f"approval command: {approval_command}")

@@ -11,8 +11,20 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Callable, Generic, Hashable, Protocol, TypeVar
 
-
 AccessPointKeyT = TypeVar("AccessPointKeyT", bound=Hashable)
+AccessPointId = int | str
+
+
+@dataclass(frozen=True)
+class AccessPointKey:
+    type: str
+    chat_id: AccessPointId
+    thread_id: AccessPointId | None
+
+
+def access_point_sort_key(access_point: AccessPointKey) -> tuple[str, str, str]:
+    thread_id = "main" if access_point.thread_id is None else str(access_point.thread_id)
+    return (access_point.type, str(access_point.chat_id), thread_id)
 
 
 @dataclass(frozen=True)
@@ -85,6 +97,7 @@ DeliveryResultT = TypeVar("DeliveryResultT")
 
 ACCESS_POINT_OUTBOUND_CLASS_CALLBACK_ACK = -20
 ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_CLEANUP = -10
+ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_NOTICE = -5
 ACCESS_POINT_OUTBOUND_CLASS_SEND = 0
 ACCESS_POINT_OUTBOUND_CLASS_EDIT = 10
 
@@ -101,6 +114,7 @@ class QueuedAccessPointOutbound(Generic[DeliveryResultT]):
     on_success: Callable[[DeliveryResultT], None] | None
     on_failure: Callable[[Exception], None] | None
     telemetry: dict[str, Any] | None = None
+    ordering_key: Hashable | None = None
 
 
 def access_point_outbound_sort_key(item: QueuedAccessPointOutbound[Any]) -> tuple[int, int]:

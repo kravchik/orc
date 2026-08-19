@@ -13,6 +13,13 @@ from orchestrator.protocol_status import (
 from orchestrator.status_output_runtime import StatusOutputRuntime
 
 
+def should_suppress_status_apply_info(info: dict[str, Any]) -> bool:
+    return _is_ignored_forgotten_turn_event(info=info) or _is_frozen_late_update(
+        info=info,
+        editable_turn_window=5,
+    )
+
+
 class TurnStatusStore:
     """Routes status updates to turn-bound or auxiliary status windows."""
 

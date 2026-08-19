@@ -2,19 +2,11 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any
 
+from orchestrator.serialized_call_lane import SerializedCallLane
 from orchestrator.telegram_smoke import TelegramApi
-
-
-@dataclass
-class _TelegramApiCommand:
-    method: str
-    args: tuple[Any, ...]
-    kwargs: dict[str, Any]
-    response_queue: Queue[tuple[bool, Any]] | None
 
 
 class TelegramApiThreadDriver:
@@ -22,17 +14,9 @@ class TelegramApiThreadDriver:
 
     def __init__(self, client: TelegramApi) -> None:
         self._client = client
-        self._poll_queue: Queue[_TelegramApiCommand | None] = Queue()
-        self._ops_queue: Queue[_TelegramApiCommand | None] = Queue()
-        self._poll_thread = threading.Thread(
-            target=lambda: self._run(self._poll_queue),
-            name="telegram-api-poll-thread",
-            daemon=True,
-        )
-        self._ops_thread = threading.Thread(
-            target=lambda: self._run(self._ops_queue),
-            name="telegram-api-ops-thread",
-            daemon=True,
+        self._ops_lane = SerializedCallLane(
+            client,
+            thread_name="telegram-api-ops-thread",
         )
         self._updates: Queue[list[dict[str, Any]]] = Queue()
         self._poll_loop_thread: threading.Thread | None = None
@@ -48,22 +32,14 @@ class TelegramApiThreadDriver:
         if self._started:
             return
         self._started = True
-        self._poll_thread.start()
-        self._ops_thread.start()
+        self._ops_lane.start()
 
     def stop(self) -> None:
         if not self._started:
             return
-        self._poll_queue.put(None)
-        self._ops_queue.put(None)
-        self._poll_thread.join(timeout=2.0)
-        self._ops_thread.join(timeout=2.0)
         self.stop_polling()
+        self._ops_lane.stop()
         self._started = False
-
-    def get_updates(self, offset: int | None, timeout_sec: int) -> list[dict]:
-        result = self._call("get_updates", offset, timeout_sec=timeout_sec, poll=True)
-        return result if isinstance(result, list) else []
 
     def send_message(self, chat_id: int, text: str, **kwargs: Any) -> dict:
         result = self._call("send_message", chat_id, text, **kwargs)
@@ -127,6 +103,8 @@ class TelegramApiThreadDriver:
             return
         self._poll_loop_stop.set()
         thread.join(timeout=2.0)
+        if thread.is_alive():
+            raise RuntimeError("telegram-api-longpoll-thread did not stop within 2.00s")
         self._poll_loop_thread = None
 
     def drain_updates(self) -> list[dict[str, Any]]:
@@ -146,37 +124,8 @@ class TelegramApiThreadDriver:
     def has_pending_transport_events(self) -> bool:
         return (not self._updates.empty()) or (not self._poll_errors.empty())
 
-    def _call(self, method: str, *args: Any, poll: bool = False, **kwargs: Any) -> Any:
-        response_queue: Queue[tuple[bool, Any]] = Queue(maxsize=1)
-        target_queue = self._poll_queue if poll else self._ops_queue
-        target_queue.put(
-            _TelegramApiCommand(
-                method=method,
-                args=tuple(args),
-                kwargs=dict(kwargs),
-                response_queue=response_queue,
-            )
-        )
-        ok, payload = response_queue.get()
-        if ok:
-            return payload
-        raise payload
-
-    def _run(self, queue: Queue[_TelegramApiCommand | None]) -> None:
-        while True:
-            command = queue.get()
-            if command is None:
-                return
-            response_queue = command.response_queue
-            try:
-                method = getattr(self._client, command.method)
-                result = method(*command.args, **command.kwargs)
-            except BaseException as exc:
-                if response_queue is not None:
-                    response_queue.put((False, exc))
-                continue
-            if response_queue is not None:
-                response_queue.put((True, result))
+    def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        return self._ops_lane.call(method, *args, **kwargs)
 
     def _poll_loop(self) -> None:
         timeout_sec = min(self._poll_timeout_sec, 1)
@@ -193,8 +142,13 @@ class TelegramApiThreadDriver:
                 continue
             if not updates:
                 continue
+            fresh_updates: list[dict[str, Any]] = []
             for upd in updates:
                 upd_id = upd.get("update_id")
                 if isinstance(upd_id, int):
+                    if self._offset is not None and upd_id < self._offset:
+                        continue
                     self._offset = upd_id + 1
-            self._updates.put(list(updates))
+                fresh_updates.append(upd)
+            if fresh_updates:
+                self._updates.put(fresh_updates)

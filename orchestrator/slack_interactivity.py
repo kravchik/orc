@@ -208,14 +208,16 @@ class SlackInteractivityHttpServer(SlackInteractivitySource):
     def stop(self) -> None:
         httpd = self._httpd
         thread = self._thread
-        self._httpd = None
-        self._thread = None
         if httpd is None:
             return
         httpd.shutdown()
         httpd.server_close()
         if thread is not None:
             thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RuntimeError("slack-interactivity-http did not stop within 2.00s")
+        self._httpd = None
+        self._thread = None
 
     def receives_messages(self) -> bool:
         return self._ingress.receives_messages()
@@ -265,7 +267,6 @@ class SlackSocketModeSource(SlackInboundSource):
     def stop(self) -> None:
         if not self._started:
             return
-        self._started = False
         self._stop.set()
         self._event("slack_socket_mode_stopping")
         ws = self._ws
@@ -277,7 +278,10 @@ class SlackSocketModeSource(SlackInboundSource):
                 pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                raise RuntimeError("slack-socket-mode did not stop within 2.00s")
         self._thread = None
+        self._started = False
         self._event("slack_socket_mode_stopped")
 
     def receives_messages(self) -> bool:

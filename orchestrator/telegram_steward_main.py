@@ -43,6 +43,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--telegram-poll-timeout-sec", "--poll-timeout-sec", dest="telegram_poll_timeout_sec", type=int, default=0)
     parser.add_argument("--request-timeout-sec", type=float, default=0.0)
+    parser.add_argument("--startup-timeout-sec", type=float, default=120.0)
     parser.add_argument("--rpc-timeout-sec", type=float, default=5.0)
     parser.add_argument("--rpc-retries", type=int, default=3)
     parser.add_argument("--steward-command", default="codex app-server")
@@ -127,6 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         telegram_api_base_url=(api_base_url.strip() or None),
         agent_command=command,
         request_timeout_sec=float(args.request_timeout_sec),
+        startup_timeout_sec=float(args.startup_timeout_sec),
         rpc_timeout_sec=float(args.rpc_timeout_sec),
         rpc_retries=int(args.rpc_retries),
         approval_policy=ApprovalPolicy.from_csv(

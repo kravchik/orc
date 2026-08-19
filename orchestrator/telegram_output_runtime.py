@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from orchestrator import clock
-from orchestrator.steward_restore_notice_rendering import render_restore_notice_html
+from orchestrator.steward_restore_notice_rendering import render_session_references_html
 from orchestrator.telegram_status import TelegramStatusClearPlan, TelegramStatusConfig, TelegramStatusWindow
 
 
@@ -119,6 +119,7 @@ class TelegramKind:
     NOTIFY = "notify"
     PROMPT = "prompt"
     RESTORE = "restore"
+    SESSION = "session"
     ERROR = "error"
 
 
@@ -555,8 +556,8 @@ class TelegramOutputRuntime:
 def _prepare_outgoing_message(*, text: str, kind: str, parse_mode: str | None) -> tuple[str, str | None]:
     if kind == TelegramKind.APPROVAL_PROMPT:
         return _render_expandable_block_message(title="Approval needed", body_text=text), "HTML"
-    if kind == TelegramKind.RESTORE:
-        rendered = render_restore_notice_html(text)
+    if kind in {TelegramKind.COMMAND, TelegramKind.RESTORE, TelegramKind.SESSION}:
+        rendered = render_session_references_html(text)
         if rendered != text:
             return rendered, "HTML"
     return text, parse_mode

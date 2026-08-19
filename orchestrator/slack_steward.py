@@ -6,9 +6,10 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from orchestrator.access_point_common import AccessPointKey, access_point_sort_key
 from orchestrator.approval import ApprovalPolicy
+from orchestrator.interactive_driver_events import RuntimeDriverFactory, StewardDriverFactory
 from orchestrator.processes import LifecycleLogger
-from orchestrator.routing_profile_control import InMemoryRoutingProfileControl
 from orchestrator.slack_api_thread_driver import SlackApiThreadDriver
 from orchestrator.slack_interactivity import SlackInboundSource, SlackInteractivityAction
 from orchestrator.slack_smoke import SlackApi
@@ -29,17 +30,10 @@ from orchestrator.steward_runtime_support import (
 )
 from orchestrator.steward_runner import (
     StewardTransportAdapter,
-    build_steward_registry_context,
     run_steward_runtime,
 )
+from orchestrator.steward_state import build_steward_registry_context
 from orchestrator.telegram_status import TelegramStatusConfig
-from orchestrator.telegram_steward_helpers import (
-    AccessPointKey,
-    RuntimeDriverFactory,
-    StewardDriverFactory,
-    _PersistedAccessPointState,
-    access_point_sort_key,
-)
 
 Writer = Callable[[str], None]
 
@@ -211,6 +205,7 @@ def run_slack_steward(
     agent_command: list[str],
     poll_interval_sec: float = 2.0,
     request_timeout_sec: float = 0.0,
+    startup_timeout_sec: float = 120.0,
     rpc_timeout_sec: float = 5.0,
     rpc_retries: int = 3,
     api: Optional[SlackApi] = None,
@@ -228,6 +223,9 @@ def run_slack_steward(
     sessions_root: str | Path | None = None,
     slack_status_config: TelegramStatusConfig | None = None,
     interactivity_source: SlackInboundSource | None = None,
+    consume_control_events: Callable[[], bool] | None = None,
+    idle_sleep_fn: Callable[[float], None] = time.sleep,
+    routing_queue_capacity: int = StewardCore._DEFAULT_ROUTING_QUEUE_CAPACITY,
 ) -> int:
     logger = LifecycleLogger(Path(log_path))
     raw_client = api if api is not None else SlackApi(token, api_base_url=slack_api_base_url)
@@ -261,8 +259,8 @@ def run_slack_steward(
         client_factory=runtime_client_factory,
         driver_factory=runtime_driver_factory,
         edge_thread_name="slack-runtime-jsonrpc-client-thread",
+        startup_timeout_sec=startup_timeout_sec,
     )
-    routing_profile_control = InMemoryRoutingProfileControl()
     registry = build_steward_registry_context(
         logger=logger,
         agent_runtime=agent_runtime,
@@ -309,7 +307,6 @@ def run_slack_steward(
         runtime=runtime,
         agent_runtime=agent_runtime,
         access_point_adapter=access_point_adapter,
-        routing_profile_control=routing_profile_control,
         sessions_root=sessions_root,
         persisted_state_by_access_point=registry.persisted_state_by_access_point,
         pending_restore_greeting=registry.pending_restore_greeting,
@@ -323,6 +320,7 @@ def run_slack_steward(
         kinds=StewardCoreKinds(
             reply="reply",
             command="command",
+            session="session",
             warning="warning",
             restore="restore",
             steward_status_source="steward",
@@ -344,6 +342,7 @@ def run_slack_steward(
             ),
             on_pre_approval_decision=access_point_adapter.clear_approval_blocks,
         ),
+        routing_queue_capacity=routing_queue_capacity,
     )
     core.emit_startup_restore_notices()
 
@@ -408,10 +407,13 @@ def run_slack_steward(
     loop = StewardTickLoop(
         request_timeout_sec=request_timeout_sec,
         drain_driver_events=core.drain_driver_events,
+        drain_routing_queue=core.drain_routing_queue,
         flush_due_status_runtimes=_flush_due_status_runtimes,
         consume_transport=transport.consume_transport,
         drain_pending_inputs=_drain_pending_inputs,
         is_idle=lambda: core.is_idle() and not access_point_adapter.has_pending_outbound(),
+        consume_control_events=consume_control_events,
+        sleep_fn=idle_sleep_fn,
     )
 
     loop.drain_until_idle(consume_transport=False)
@@ -423,4 +425,5 @@ def run_slack_steward(
         transport=transport,
         writer=writer,
         logger=logger,
+        sleep_fn=idle_sleep_fn,
     )

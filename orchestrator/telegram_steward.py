@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from orchestrator.access_point_common import AccessPointKey, access_point_sort_key
 from orchestrator.approval import ApprovalPolicy
+from orchestrator.interactive_driver_events import RuntimeDriverFactory, StewardDriverFactory
 from orchestrator.processes import LifecycleLogger
-from orchestrator.routing_profile_control import InMemoryRoutingProfileControl
 from orchestrator.steward_core import (
     StewardCore,
     StewardCoreHooks,
@@ -26,27 +28,13 @@ from orchestrator.steward_runtime_support import (
 )
 from orchestrator.steward_runner import (
     StewardTransportAdapter,
-    build_steward_registry_context,
     run_steward_runtime,
 )
+from orchestrator.steward_state import build_steward_registry_context
 from orchestrator.telegram_output_runtime import TelegramKind
 from orchestrator.telegram_status import TelegramStatusConfig
 from orchestrator.telegram_steward_access_point import (
     TelegramStewardAccessPointAdapter,
-)
-from orchestrator.telegram_steward_helpers import (
-    AccessPointAgentRuntime,
-    AccessPointKey,
-    AccessPointStewardRuntime,
-    AgentBackendFactory,
-    AgentNodeFactory,
-    RuntimeDriverFactory,
-    StewardBackendFactory,
-    StewardDriverFactory,
-    access_point_sort_key,
-    _PersistedAccessPointState,
-    _default_agent_backend_factory,
-    _default_backend_factory,
 )
 from orchestrator.telegram_bridge import (
     TelegramCallbackUpdate,
@@ -171,6 +159,7 @@ def run_telegram_steward(
     max_poll_cycles: Optional[int] = None,
     agent_command: Optional[list[str]] = None,
     request_timeout_sec: float = 0.0,
+    startup_timeout_sec: float = 120.0,
     rpc_timeout_sec: float = 5.0,
     rpc_retries: int = 3,
     approval_policy: Optional[ApprovalPolicy] = None,
@@ -186,6 +175,9 @@ def run_telegram_steward(
     runtime_driver_factory: RuntimeDriverFactory | None = None,
     telegram_status_config: TelegramStatusConfig | None = None,
     status_monotonic_now: Callable[[], float] | None = None,
+    consume_control_events: Callable[[], bool] | None = None,
+    idle_sleep_fn: Callable[[float], None] = time.sleep,
+    routing_queue_capacity: int = StewardCore._DEFAULT_ROUTING_QUEUE_CAPACITY,
 ) -> int:
     if not allowed_chat_ids:
         raise ValueError("allowed_chat_ids must be non-empty")
@@ -226,8 +218,8 @@ def run_telegram_steward(
         default_thread_sandbox=thread_sandbox,
         client_factory=runtime_client_factory,
         driver_factory=runtime_driver_factory,
+        startup_timeout_sec=startup_timeout_sec,
     )
-    routing_profile_control = InMemoryRoutingProfileControl()
     registry = build_steward_registry_context(
         logger=logger,
         agent_runtime=agent_runtime,
@@ -269,7 +261,6 @@ def run_telegram_steward(
         runtime=runtime,
         agent_runtime=agent_runtime,
         access_point_adapter=access_point_adapter,
-        routing_profile_control=routing_profile_control,
         sessions_root=sessions_root,
         persisted_state_by_access_point=registry.persisted_state_by_access_point,
         pending_restore_greeting=registry.pending_restore_greeting,
@@ -283,6 +274,7 @@ def run_telegram_steward(
         kinds=StewardCoreKinds(
             reply=TelegramKind.REPLY,
             command=TelegramKind.COMMAND,
+            session=TelegramKind.SESSION,
             warning=TelegramKind.WARNING,
             restore=TelegramKind.RESTORE,
             steward_status_source="steward",
@@ -319,6 +311,7 @@ def run_telegram_steward(
                 route_target=route_target,
             ),
         ),
+        routing_queue_capacity=routing_queue_capacity,
     )
     core.emit_startup_restore_notices()
 
@@ -372,10 +365,13 @@ def run_telegram_steward(
     loop = StewardTickLoop(
         request_timeout_sec=request_timeout_sec,
         drain_driver_events=core.drain_driver_events,
+        drain_routing_queue=core.drain_routing_queue,
         flush_due_status_runtimes=_flush_due_status_runtimes,
         consume_transport=transport.consume_transport,
         drain_pending_inputs=_drain_pending_inputs,
         is_idle=lambda: core.is_idle() and not access_point_adapter.has_pending_outbound(),
+        consume_control_events=consume_control_events,
+        sleep_fn=idle_sleep_fn,
     )
 
     loop.drain_until_idle(consume_transport=False)
@@ -389,4 +385,5 @@ def run_telegram_steward(
         transport=transport,
         writer=writer,
         logger=logger,
+        sleep_fn=idle_sleep_fn,
     )

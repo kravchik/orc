@@ -3,32 +3,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
-from typing import Any
+from typing import Any, Callable
 
 from orchestrator.access_point_common import (
     ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_CLEANUP,
+    ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_NOTICE,
     ACCESS_POINT_OUTBOUND_CLASS_EDIT,
     ACCESS_POINT_OUTBOUND_CLASS_SEND,
+    AccessPointKey,
     AccessPointDeliveryReceipt,
     AccessPointDeliveryState,
     QueuedAccessPointOutbound,
     access_point_outbound_sort_key,
 )
-from orchestrator.approval_details_formatter import build_approval_details_lines
-from orchestrator.approval import ApprovalRequest, build_accept_settings
+from orchestrator.approval_details_formatter import (
+    approval_source_icon,
+    build_approval_details_lines,
+    build_approval_prompt_detail_lines,
+)
+from orchestrator.approval import ApprovalRequest, supports_session_approval
 from orchestrator.processes import LifecycleLogger
+from orchestrator.runtime_snapshot import AccessPointRuntimeSnapshot, format_status_text
 from orchestrator.slack_api_thread_driver import SlackApiThreadDriver
 from orchestrator.slack_interactivity import SlackInteractivityAction
 from orchestrator.slack_output_runtime import SlackOutputRuntime
-from orchestrator.steward_restore_notice_rendering import render_restore_notice_slack
+from orchestrator.steward_commands import build_steward_help_text
 from orchestrator.steward_inbound import (
     StewardApprovalDecision,
     StewardApprovalDetailsRequest,
     StewardInboundText,
 )
+from orchestrator.steward_restore_notice_rendering import render_session_references_slack
 from orchestrator.telegram_status import TelegramStatusConfig
-from orchestrator.telegram_steward_helpers import AccessPointKey
 from orchestrator.turn_status_store import TurnStatusStore
 
 
@@ -83,76 +89,9 @@ def _build_approval_blocks(*, allow_always: bool) -> list[dict]:
     return [{"type": "actions", "elements": buttons}]
 
 
-def _approval_source_tag(request: ApprovalRequest) -> str:
-    source = str(getattr(request, "role", "") or "").strip().upper()
-    if source:
-        return source
-    return "AGENT"
-
-
-def _approval_source_icon(request: ApprovalRequest) -> str:
-    role = str(getattr(request, "role", "") or "").strip().lower()
-    if role in {"worker", "agent", "runtime"}:
-        return "🚀"
-    if role in {"steward"}:
-        return "🧑‍✈️"
-    if role in {"lead"}:
-        return "🧠"
-    return "🚀"
-
-
-def _approval_prompt_details(request: ApprovalRequest) -> list[str]:
-    params = request.params
-    command = params.get("command")
-    cwd = params.get("cwd")
-    lines: list[str] = []
-    if isinstance(command, str) and command.strip():
-        lines.append(f"command: {command}")
-    if isinstance(cwd, str) and cwd.strip():
-        lines.append(f"cwd: {cwd}")
-    if lines:
-        return lines
-    preferred_keys = ("reason", "tool", "path", "targetPath", "oldPath", "newPath", "itemId", "grantRoot")
-    emitted: set[str] = set()
-    for key in preferred_keys:
-        value = params.get(key)
-        if value is None:
-            continue
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                continue
-            rendered = stripped
-        elif isinstance(value, (int, float, bool)):
-            rendered = str(value)
-        else:
-            continue
-        lines.append(f"{key}: {rendered}")
-        emitted.add(key)
-    if lines:
-        return lines
-    for key in sorted(params.keys()):
-        if key in emitted or key in {"threadId", "turnId", "command", "cwd"}:
-            continue
-        value = params.get(key)
-        if value is None:
-            continue
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                continue
-            rendered = stripped
-        elif isinstance(value, (int, float, bool)):
-            rendered = str(value)
-        else:
-            continue
-        lines.append(f"{key}: {rendered}")
-    return lines
-
-
 def _format_approval_prompt(*, request: ApprovalRequest, allow_always: bool) -> str:
-    lines = [f"{_approval_source_icon(request)} approval needed"]
-    lines.extend(_approval_prompt_details(request))
+    lines = [f"{approval_source_icon(request)} approval needed"]
+    lines.extend(build_approval_prompt_detail_lines(request))
     options = "accept/decline/details"
     if allow_always:
         options += "/always_allow"
@@ -164,7 +103,7 @@ def _format_approval_details(request: ApprovalRequest) -> str:
     return "\n".join(
         build_approval_details_lines(
             request,
-            header=f"{_approval_source_icon(request)} approval details",
+            header=f"{approval_source_icon(request)} approval details",
             include_role=True,
         )
     )
@@ -254,7 +193,13 @@ class SlackStewardAccessPointAdapter:
                 via="text",
             )
             return StewardApprovalDetailsRequest(access_point=inbound.access_point)
-        if raw in ("accept", "decline", "always_allow"):
+        if raw in ("accept", "decline") or (
+            raw == "always_allow"
+            and supports_session_approval(
+                method=pending.request.method,
+                params=pending.request.params,
+            )
+        ):
             self._log_access_point_event(
                 "slack_steward_approval_text_recognized",
                 access_point=inbound.access_point,
@@ -292,7 +237,13 @@ class SlackStewardAccessPointAdapter:
                 action_id=action.action_id,
             )
             return StewardApprovalDetailsRequest(access_point=pending.access_point)
-        if raw in ("accept", "decline", "always_allow"):
+        if raw in ("accept", "decline") or (
+            raw == "always_allow"
+            and supports_session_approval(
+                method=pending.request.method,
+                params=pending.request.params,
+            )
+        ):
             self._log_access_point_event(
                 "slack_steward_approval_action_recognized",
                 access_point=pending.access_point,
@@ -313,9 +264,6 @@ class SlackStewardAccessPointAdapter:
     ) -> bool:
         pending = pending_approval
         if pending is None or inbound.access_point != pending.access_point:
-            return False
-        raw = inbound.text.strip().lower()
-        if raw == "/interrupt" or raw.startswith("/interrupt@"):
             return False
         approval_action = self.approval_action_from_text(
             inbound=inbound,
@@ -342,7 +290,10 @@ class SlackStewardAccessPointAdapter:
         source: str,
         request: ApprovalRequest,
     ) -> PendingSlackStewardApproval:
-        allow_always = build_accept_settings(params=request.params) is not None
+        allow_always = supports_session_approval(
+            method=request.method,
+            params=request.params,
+        )
         pending = PendingSlackStewardApproval(
             access_point=access_point,
             source=source,
@@ -406,7 +357,15 @@ class SlackStewardAccessPointAdapter:
         )
 
     def send_invalid_approval_reply(self, pending_approval: PendingSlackStewardApproval) -> None:
-        text = "reply with accept, decline, details, or always_allow"
+        allow_always = supports_session_approval(
+            method=pending_approval.request.method,
+            params=pending_approval.request.params,
+        )
+        text = (
+            "reply with accept, decline, details, or always_allow"
+            if allow_always
+            else "reply with accept, decline, or details"
+        )
         self._enqueue_outbound(
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
             operation="post_message",
@@ -428,7 +387,10 @@ class SlackStewardAccessPointAdapter:
     def clear_approval_blocks(self, pending_approval: PendingSlackStewardApproval) -> None:
         if pending_approval.prompt_ts is None:
             return
-        allow_always = build_accept_settings(params=pending_approval.request.params) is not None
+        allow_always = supports_session_approval(
+            method=pending_approval.request.method,
+            params=pending_approval.request.params,
+        )
         prompt_text = _format_approval_prompt(request=pending_approval.request, allow_always=allow_always)
         self._enqueue_outbound(
             priority=ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_CLEANUP,
@@ -462,65 +424,21 @@ class SlackStewardAccessPointAdapter:
         self.clear_approval_blocks(pending_approval)
 
     def build_help_text(self, *, state: str) -> str:
-        lines = [
-            f"access point state: {state}",
-            "",
-            "fallback commands:",
-            "/help - show this help.",
-            "/where - show current access point routing key.",
-            "/status - show current runtime state and bound agent details.",
-            "/inspect - show current API-backed session summary and tracked active work.",
-            "/stop - stop runtime agent for this access point (keeps binding; Steward stays active).",
-            "/start - start runtime agent for existing binding (Steward stays active).",
-            "/interrupt - interrupt the current in-flight turn for this access point.",
-            "/reset - clear binding and reset local runtime state for this access point.",
-            "/steward <message> - send one message to steward (available when state is BOUND).",
-        ]
-        return "\n".join(lines)
-
-    def build_where_text(self, *, access_point: AccessPointKey, state: str) -> str:
-        lines = [
-            "access point:",
-            f"- type: {access_point.type}",
-            f"- channel_id: {access_point.chat_id}",
-            f"- thread_ts: {access_point.thread_id or 'main'}",
-            f"- state: {state}",
-        ]
-        return "\n".join(lines)
+        return build_steward_help_text(state=state)
 
     def build_status_text(
         self,
         *,
-        access_point: AccessPointKey,
-        state: str,
-        steward_rows: list[dict[str, str]],
-        agent_rows: list[dict[str, str]],
-        binding: dict[str, str] | None,
+        snapshot: AccessPointRuntimeSnapshot,
     ) -> str:
-        runtime_agent_state = "not_running"
-        if state == "BOUND_IDLE":
-            runtime_agent_state = "stopped"
-        if agent_rows:
-            runtime_agent_state = agent_rows[0]["state"]
-        lines = [
-            f"state: {state}",
-            f"access_point: {access_point.type} channel_id={access_point.chat_id} thread_ts={access_point.thread_id or 'main'}",
-            f"steward_node: {steward_rows[0]['state'] if steward_rows else 'not_started'}",
-            f"runtime_agent: {runtime_agent_state}",
-        ]
-        row = agent_rows[0] if agent_rows else binding
-        if row:
-            lines.extend(
-                [
-                    f"agent_id: {row.get('agent_id', '')}",
-                    f"cwd: {row.get('cwd', '')}",
-                    f"mode: {row.get('mode', '')}",
-                ]
-            )
-            model = str(row.get("model", "")).strip()
-            if model:
-                lines.append(f"model: {model}")
-        return "\n".join(lines)
+        access_point = snapshot.access_point
+        return format_status_text(
+            snapshot,
+            access_point_line=(
+                f"access_point: {access_point.type} channel_id={access_point.chat_id} "
+                f"thread_ts={access_point.thread_id or 'main'}"
+            ),
+        )
 
     def status_runtime_for(
         self,
@@ -695,8 +613,9 @@ class SlackStewardAccessPointAdapter:
         on_sent: Any = None,
         on_failed: Any = None,
     ) -> None:
-        _ = kind
         reply_text = self.decorate_reply(text=text, source=source)
+        if kind in {"command", "restore", "session"}:
+            reply_text = render_session_references_slack(reply_text)
         self._enqueue_outbound(
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
             operation="post_message",
@@ -717,6 +636,24 @@ class SlackStewardAccessPointAdapter:
             on_failure=on_failed if callable(on_failed) else None,
         )
 
+    def queue_routing_copy(
+        self,
+        *,
+        access_point: AccessPointKey,
+        text: str,
+        kind: Any = None,
+        on_sent: Any = None,
+        on_failed: Any = None,
+    ) -> None:
+        self.queue_text_reply(
+            access_point=access_point,
+            text=text,
+            source="agent",
+            kind=kind,
+            on_sent=on_sent,
+            on_failed=on_failed,
+        )
+
     def queue_text_reply_with_result(
         self,
         *,
@@ -727,8 +664,9 @@ class SlackStewardAccessPointAdapter:
         on_sent: Any = None,
         on_failed: Any = None,
     ) -> None:
-        _ = kind
         reply_text = self.decorate_reply(text=text, source=source)
+        if kind in {"command", "restore", "session"}:
+            reply_text = render_session_references_slack(reply_text)
         receipt_id = self._enqueue_outbound(
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
             operation="post_message",
@@ -763,8 +701,9 @@ class SlackStewardAccessPointAdapter:
         on_sent: Any = None,
         on_failed: Any = None,
     ) -> None:
-        _ = kind
         reply_text = self.decorate_reply(text=text, source=source)
+        if kind in {"command", "restore", "session"}:
+            reply_text = render_session_references_slack(reply_text)
         receipt = self._receipts.get(int(message_id))
         ts = receipt.message_ts if receipt is not None else None
         if not isinstance(ts, str) or not ts.strip():
@@ -803,9 +742,9 @@ class SlackStewardAccessPointAdapter:
         kind: Any | None = None,
     ) -> None:
         _ = source
-        rendered_text = render_restore_notice_slack(text) if kind == "restore" else text
+        rendered_text = render_session_references_slack(text) if kind == "restore" else text
         self._enqueue_outbound(
-            priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
+            priority=ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_NOTICE,
             operation="post_message",
             telemetry={
                 "kind": "outbound_note",

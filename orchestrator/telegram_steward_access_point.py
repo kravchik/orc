@@ -9,23 +9,30 @@ from typing import Any, Callable
 from orchestrator import clock
 from orchestrator.access_point_common import (
     ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_CLEANUP,
+    ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_NOTICE,
     ACCESS_POINT_OUTBOUND_CLASS_CALLBACK_ACK,
     ACCESS_POINT_OUTBOUND_CLASS_EDIT,
     ACCESS_POINT_OUTBOUND_CLASS_SEND,
+    AccessPointKey,
     AccessPointDeliveryReceipt,
     AccessPointDeliveryState,
     QueuedAccessPointOutbound,
     access_point_outbound_sort_key,
 )
-from orchestrator.approval_details_formatter import build_approval_details_lines
-from orchestrator.approval import ApprovalRequest, build_accept_settings
+from orchestrator.approval_details_formatter import (
+    approval_source_icon,
+    build_approval_details_lines,
+    build_approval_prompt_detail_lines,
+)
+from orchestrator.approval import ApprovalRequest, supports_session_approval
 from orchestrator.processes import LifecycleLogger
+from orchestrator.runtime_snapshot import AccessPointRuntimeSnapshot, format_status_text
+from orchestrator.steward_restore_notice_rendering import render_session_references_html
 from orchestrator.steward_inbound import (
     StewardApprovalDecision,
     StewardApprovalDetailsRequest,
     StewardInboundText,
 )
-from orchestrator.telegram_approval_helper import _shorten
 from orchestrator.telegram_api_thread_driver import TelegramApiThreadDriver
 from orchestrator.telegram_output_runtime import (
     TelegramBotStatusBudget,
@@ -34,8 +41,8 @@ from orchestrator.telegram_output_runtime import (
     TelegramOutputRuntime,
     TelegramQueuedStatusDelete,
 )
+from orchestrator.steward_commands import build_steward_help_text
 from orchestrator.telegram_status import TelegramStatusConfig
-from orchestrator.telegram_steward_helpers import AccessPointKey
 from orchestrator.turn_status_store import TurnStatusStore
 from orchestrator.telegram_bridge import TelegramCallbackUpdate, TelegramTextUpdate
 
@@ -57,77 +64,10 @@ class _TelegramOutboundExecutionResult:
     sent_chunks: int = 0
 
 
-def _approval_source_tag(request: ApprovalRequest) -> str:
-    source = str(getattr(request, "role", "") or "").strip().upper()
-    if source:
-        return source
-    return "AGENT"
-
-
-def _approval_source_icon(request: ApprovalRequest) -> str:
-    role = str(getattr(request, "role", "") or "").strip().lower()
-    if role in {"worker", "agent", "runtime"}:
-        return "🚀"
-    if role in {"steward"}:
-        return "🧑‍✈️"
-    if role in {"lead"}:
-        return "🧠"
-    return "🚀"
-
-
-def _approval_prompt_details(request: ApprovalRequest) -> list[str]:
-    params = request.params
-    command = params.get("command")
-    cwd = params.get("cwd")
-    lines: list[str] = []
-    if isinstance(command, str) and command.strip():
-        lines.append(f"command: {_shorten(command, limit=220)}")
-    if isinstance(cwd, str) and cwd.strip():
-        lines.append(f"cwd: {cwd}")
-    if lines:
-        return lines
-    preferred_keys = ("reason", "tool", "path", "targetPath", "oldPath", "newPath", "itemId", "grantRoot")
-    emitted: set[str] = set()
-    for key in preferred_keys:
-        value = params.get(key)
-        if value is None:
-            continue
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                continue
-            rendered = _shorten(stripped, limit=220)
-        elif isinstance(value, (int, float, bool)):
-            rendered = str(value)
-        else:
-            continue
-        lines.append(f"{key}: {rendered}")
-        emitted.add(key)
-    if lines:
-        return lines
-    for key in sorted(params.keys()):
-        if key in emitted or key in {"threadId", "turnId", "command", "cwd"}:
-            continue
-        value = params.get(key)
-        if value is None:
-            continue
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                continue
-            rendered = _shorten(stripped, limit=220)
-        elif isinstance(value, (int, float, bool)):
-            rendered = str(value)
-        else:
-            continue
-        lines.append(f"{key}: {rendered}")
-    return lines
-
-
 def _format_steward_approval_prompt(request: ApprovalRequest) -> str:
-    header = f"{_approval_source_icon(request)} approval needed"
+    header = f"{approval_source_icon(request)} approval needed"
     lines = [header]
-    lines.extend(_approval_prompt_details(request))
+    lines.extend(build_approval_prompt_detail_lines(request, string_limit=220))
     return "\n".join(lines)
 
 
@@ -135,7 +75,7 @@ def _format_steward_approval_details(request: ApprovalRequest) -> str:
     return "\n".join(
         build_approval_details_lines(
             request,
-            header=f"{_approval_source_icon(request)} approval details",
+            header=f"{approval_source_icon(request)} approval details",
             include_role=True,
         )
     )
@@ -276,24 +216,25 @@ class TelegramStewardAccessPointAdapter:
             )
 
     def flush_due_status_runtimes(self) -> bool:
-        candidates: list[tuple[TelegramOutputRuntime, TelegramDueStatusCandidate]] = []
-        for output_runtime, _status_store in self._steward_status_runtime_by_access_point.values():
+        candidates: list[tuple[AccessPointKey, TelegramOutputRuntime, TelegramDueStatusCandidate]] = []
+        for access_point, (output_runtime, _status_store) in self._steward_status_runtime_by_access_point.items():
             candidate = output_runtime.peek_due_status_candidate()
             if candidate is not None:
-                candidates.append((output_runtime, candidate))
-        for output_runtime, _status_store in self._agent_status_runtime_by_access_point.values():
+                candidates.append((access_point, output_runtime, candidate))
+        for access_point, (output_runtime, _status_store) in self._agent_status_runtime_by_access_point.items():
             candidate = output_runtime.peek_due_status_candidate()
             if candidate is not None:
-                candidates.append((output_runtime, candidate))
+                candidates.append((access_point, output_runtime, candidate))
         if candidates:
-            selected_runtime, selected_candidate = min(
+            selected_access_point, selected_runtime, selected_candidate = min(
                 candidates,
                 key=lambda pair: (
-                    float("-inf") if pair[1].last_flush_ts is None else float(pair[1].last_flush_ts),
-                    pair[1].status_key,
+                    float("-inf") if pair[2].last_flush_ts is None else float(pair[2].last_flush_ts),
+                    pair[2].status_key,
                 ),
             )
             self._enqueue_status_flush(
+                access_point=selected_access_point,
                 output_runtime=selected_runtime,
                 candidate=selected_candidate,
             )
@@ -307,6 +248,7 @@ class TelegramStewardAccessPointAdapter:
         if steward_entry is not None:
             steward_output, steward_store = steward_entry
             self._enqueue_current_turn_status_flush(
+                access_point=access_point,
                 output_runtime=steward_output,
                 status_store=steward_store,
             )
@@ -315,82 +257,28 @@ class TelegramStewardAccessPointAdapter:
         if agent_entry is not None:
             agent_output, agent_store = agent_entry
             self._enqueue_current_turn_status_flush(
+                access_point=access_point,
                 output_runtime=agent_output,
                 status_store=agent_store,
             )
             agent_store.split_current_turn()
 
     def build_help_text(self, *, state: str) -> str:
-        lines = [
-            f"access point state: {state}",
-            "",
-            "fallback commands:",
-            "/help - show this help.",
-            "/where - show current access point routing key.",
-            "/status - show current runtime state and bound agent details.",
-            "/inspect - show current API-backed session summary and tracked active work.",
-            "/interrupt - interrupt the current in-flight turn for this access point.",
-            "/stop - stop runtime agent for this access point (keeps binding; Steward stays active).",
-            "/start - start runtime agent for existing binding (Steward stays active).",
-            "/reset - clear binding and reset local runtime state for this access point.",
-            "/steward <message> - send one message to steward (available when state is BOUND).",
-        ]
-        return "\n".join(lines)
-
-    def build_where_text(self, *, access_point: AccessPointKey, state: str) -> str:
-        lines = [
-            "access point:",
-            f"- type: {access_point.type}",
-            f"- chat_id: {access_point.chat_id}",
-            f"- thread_id: {access_point.thread_id if access_point.thread_id is not None else 'main'}",
-            f"- state: {state}",
-        ]
-        return "\n".join(lines)
+        return build_steward_help_text(state=state)
 
     def build_status_text(
         self,
         *,
-        access_point: AccessPointKey,
-        state: str,
-        steward_rows: list[dict[str, str]],
-        agent_rows: list[dict[str, str]],
-        binding: dict[str, str] | None,
+        snapshot: AccessPointRuntimeSnapshot,
     ) -> str:
-        runtime_agent_state = "not_running"
-        if state == "BOUND_IDLE":
-            runtime_agent_state = "stopped"
-        if agent_rows:
-            runtime_agent_state = agent_rows[0]["state"]
-        lines = [
-            f"state: {state}",
-            f"access_point: {access_point.type} chat_id={access_point.chat_id} thread_id={access_point.thread_id if access_point.thread_id is not None else 'main'}",
-            f"steward_node: {steward_rows[0]['state'] if steward_rows else 'not_started'}",
-            f"runtime_agent: {runtime_agent_state}",
-        ]
-        if agent_rows:
-            agent = agent_rows[0]
-            model = str(agent.get("model", "")).strip()
-            lines.extend(
-                [
-                    f"agent_id: {agent.get('agent_id', '')}",
-                    f"cwd: {agent.get('cwd', '')}",
-                    f"mode: {agent.get('mode', '')}",
-                ]
-            )
-            if model:
-                lines.append(f"model: {model}")
-        elif binding:
-            model = str(binding.get("model", "")).strip()
-            lines.extend(
-                [
-                    f"agent_id: {binding.get('agent_id', '')}",
-                    f"cwd: {binding.get('cwd', '')}",
-                    f"mode: {binding.get('mode', '')}",
-                ]
-            )
-            if model:
-                lines.append(f"model: {model}")
-        return "\n".join(lines)
+        access_point = snapshot.access_point
+        return format_status_text(
+            snapshot,
+            access_point_line=(
+                f"access_point: {access_point.type} chat_id={access_point.chat_id} "
+                f"thread_id={access_point.thread_id if access_point.thread_id is not None else 'main'}"
+            ),
+        )
 
     def register_approval(
         self,
@@ -399,7 +287,10 @@ class TelegramStewardAccessPointAdapter:
         source: str,
         request: ApprovalRequest,
     ) -> PendingTelegramStewardApproval:
-        allow_always = build_accept_settings(params=request.params) is not None
+        allow_always = supports_session_approval(
+            method=request.method,
+            params=request.params,
+        )
         buttons = [
             {"text": "Accept", "callback_data": "approval:accept"},
             {"text": "Decline", "callback_data": "approval:decline"},
@@ -427,6 +318,7 @@ class TelegramStewardAccessPointAdapter:
             reply_markup={"inline_keyboard": [buttons]},
             parse_mode="HTML",
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
+            ordering_key=access_point,
             on_success=lambda result, p=pending, req=request, ap=access_point, src=source: self._on_approval_prompt_sent(
                 pending=p,
                 send_result=result,
@@ -482,16 +374,23 @@ class TelegramStewardAccessPointAdapter:
                     callback_query_id=update.callback_query_id,
                     text="details sent",
                     priority=ACCESS_POINT_OUTBOUND_CLASS_CALLBACK_ACK,
+                    ordering_key=pending.access_point,
                 )
             return StewardApprovalDetailsRequest(access_point=pending.access_point)
         if update.data not in ("approval:accept", "approval:decline", "approval:always_allow"):
             return None
         decision = update.data.split(":", 1)[1]
+        if decision == "always_allow" and not supports_session_approval(
+            method=pending.request.method,
+            params=pending.request.params,
+        ):
+            return None
         if isinstance(update.callback_query_id, str):
             self._enqueue_answer_callback_query(
                 callback_query_id=update.callback_query_id,
                 text=f"selected: {decision}",
                 priority=ACCESS_POINT_OUTBOUND_CLASS_CALLBACK_ACK,
+                ordering_key=pending.access_point,
             )
         return StewardApprovalDecision(
             access_point=pending.access_point,
@@ -513,9 +412,13 @@ class TelegramStewardAccessPointAdapter:
         if pending is None:
             return True
         raw = inbound.text.strip().lower()
-        if raw == "/interrupt" or raw.startswith("/interrupt@"):
-            return False
-        if raw in ("accept", "decline", "always_allow"):
+        if raw in ("accept", "decline") or (
+            raw == "always_allow"
+            and supports_session_approval(
+                method=pending.request.method,
+                params=pending.request.params,
+            )
+        ):
             return handle_approval_action(
                 StewardApprovalDecision(access_point=inbound.access_point, decision=raw, via="text")
             )
@@ -531,6 +434,7 @@ class TelegramStewardAccessPointAdapter:
             text=_format_steward_approval_details(pending_approval.request),
             kind=TelegramKind.APPROVAL_DETAILS,
             chat_id=pending_approval.access_point.chat_id,
+            ordering_key=pending_approval.access_point,
         )
 
     def send_invalid_approval_reply(self, pending_approval: PendingTelegramStewardApproval) -> None:
@@ -538,11 +442,20 @@ class TelegramStewardAccessPointAdapter:
             access_point=pending_approval.access_point,
             source="agent" if pending_approval.source == "agent" else "steward",
         )
+        allow_always = supports_session_approval(
+            method=pending_approval.request.method,
+            params=pending_approval.request.params,
+        )
         self._enqueue_send_text(
             output_runtime=output_runtime,
-            text="reply with accept, decline, or always_allow",
+            text=(
+                "reply with accept, decline, or always_allow"
+                if allow_always
+                else "reply with accept or decline"
+            ),
             kind=TelegramKind.APPROVAL_INVALID,
             chat_id=pending_approval.access_point.chat_id,
+            ordering_key=pending_approval.access_point,
         )
 
     def clear_approval_markup(self, pending_approval: PendingTelegramStewardApproval) -> None:
@@ -554,6 +467,7 @@ class TelegramStewardAccessPointAdapter:
             message_id=prompt_message_id,
             reply_markup={"inline_keyboard": []},
             priority=ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_CLEANUP,
+            ordering_key=pending_approval.access_point,
             on_failure=lambda exc, pending=pending_approval, mid=prompt_message_id: self._logger.event(
                 "telegram_approval_markup_clear_error",
                 chat_id=pending.access_point.chat_id,
@@ -608,6 +522,25 @@ class TelegramStewardAccessPointAdapter:
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
             on_success=lambda _result: on_sent(),
             on_failure=on_failed,
+            ordering_key=access_point,
+        )
+
+    def queue_routing_copy(
+        self,
+        *,
+        access_point: AccessPointKey,
+        text: str,
+        kind: TelegramKind,
+        on_sent: Callable[[], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None:
+        self.queue_text_reply(
+            access_point=access_point,
+            text=text,
+            source="agent",
+            kind=kind,
+            on_sent=on_sent,
+            on_failed=on_failed,
         )
 
     def queue_text_reply_with_result(
@@ -632,6 +565,7 @@ class TelegramStewardAccessPointAdapter:
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
             on_success=lambda result: on_sent(result.first_message_id),
             on_failure=on_failed,
+            ordering_key=access_point,
         )
 
     def queue_text_reply_edit(
@@ -646,13 +580,20 @@ class TelegramStewardAccessPointAdapter:
         on_failed: Callable[[Exception], None],
     ) -> None:
         decorated = self._decorate_reply(text=text, source=source)
+        rendered = (
+            render_session_references_html(decorated)
+            if kind in {TelegramKind.COMMAND, TelegramKind.RESTORE, TelegramKind.SESSION}
+            else decorated
+        )
         self._enqueue_edit_text(
             chat_id=int(access_point.chat_id),
             message_id=int(message_id),
-            text=decorated,
+            text=rendered,
+            parse_mode="HTML" if rendered != decorated else None,
             priority=ACCESS_POINT_OUTBOUND_CLASS_EDIT,
             on_success=lambda _result: on_sent(),
             on_failure=on_failed,
+            ordering_key=access_point,
         )
 
     def send_outbound_note(
@@ -672,6 +613,8 @@ class TelegramStewardAccessPointAdapter:
             text=text,
             kind=kind or TelegramKind.APPROVAL_ACK,
             chat_id=access_point.chat_id,
+            priority=ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_NOTICE,
+            ordering_key=access_point,
         )
 
     def decorate_reply(self, *, text: str, source: str) -> str:
@@ -693,6 +636,7 @@ class TelegramStewardAccessPointAdapter:
     def _enqueue_status_flush(
         self,
         *,
+        access_point: AccessPointKey,
         output_runtime: TelegramOutputRuntime,
         candidate: TelegramDueStatusCandidate,
     ) -> None:
@@ -719,12 +663,14 @@ class TelegramStewardAccessPointAdapter:
             ),
             on_success=None,
             on_failure=None,
+            ordering_key=access_point,
         )
         self._queued_status_keys.add(coalesce_key)
 
     def _enqueue_current_turn_status_flush(
         self,
         *,
+        access_point: AccessPointKey,
         output_runtime: TelegramOutputRuntime,
         status_store: TurnStatusStore,
     ) -> None:
@@ -747,6 +693,7 @@ class TelegramStewardAccessPointAdapter:
             ),
             on_success=None,
             on_failure=None,
+            ordering_key=access_point,
         )
         self._queued_status_keys.add(coalesce_key)
 
@@ -762,6 +709,7 @@ class TelegramStewardAccessPointAdapter:
         priority: int = ACCESS_POINT_OUTBOUND_CLASS_SEND,
         on_success: Callable[[_TelegramOutboundExecutionResult], None] | None = None,
         on_failure: Callable[[Exception], None] | None = None,
+        ordering_key: AccessPointKey | None = None,
     ) -> int:
         return self._enqueue_outbound(
             op_kind=f"send_text:{kind}",
@@ -777,6 +725,7 @@ class TelegramStewardAccessPointAdapter:
             ),
             on_success=on_success,
             on_failure=on_failure,
+            ordering_key=ordering_key,
         )
 
     def _execute_send_text(
@@ -812,6 +761,7 @@ class TelegramStewardAccessPointAdapter:
         priority: int = ACCESS_POINT_OUTBOUND_CLASS_EDIT,
         on_success: Callable[[_TelegramOutboundExecutionResult], None] | None = None,
         on_failure: Callable[[Exception], None] | None = None,
+        ordering_key: AccessPointKey | None = None,
     ) -> int:
         return self._enqueue_outbound(
             op_kind="edit_reply_markup",
@@ -824,6 +774,7 @@ class TelegramStewardAccessPointAdapter:
             ),
             on_success=on_success,
             on_failure=on_failure,
+            ordering_key=ordering_key,
         )
 
     def _enqueue_edit_text(
@@ -832,21 +783,25 @@ class TelegramStewardAccessPointAdapter:
         chat_id: int,
         message_id: int,
         text: str,
+        parse_mode: str | None = None,
         priority: int = ACCESS_POINT_OUTBOUND_CLASS_EDIT,
         on_success: Callable[[_TelegramOutboundExecutionResult], None] | None = None,
         on_failure: Callable[[Exception], None] | None = None,
+        ordering_key: AccessPointKey | None = None,
     ) -> int:
         return self._enqueue_outbound(
             op_kind="edit_text",
             priority=priority,
             coalesce_key=("edit_text", int(chat_id), int(message_id)),
-            execute=lambda cid=chat_id, mid=message_id, body=text: self._execute_edit_text(
+            execute=lambda cid=chat_id, mid=message_id, body=text, mode=parse_mode: self._execute_edit_text(
                 chat_id=cid,
                 message_id=mid,
                 text=body,
+                parse_mode=mode,
             ),
             on_success=on_success,
             on_failure=on_failure,
+            ordering_key=ordering_key,
         )
 
     def _execute_edit_text(
@@ -855,12 +810,10 @@ class TelegramStewardAccessPointAdapter:
         chat_id: int,
         message_id: int,
         text: str,
+        parse_mode: str | None,
     ) -> _TelegramOutboundExecutionResult:
-        self._client.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-        )
+        kwargs = {"parse_mode": parse_mode} if parse_mode is not None else {}
+        self._client.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, **kwargs)
         return _TelegramOutboundExecutionResult(sent=True)
 
     def _execute_edit_reply_markup(
@@ -885,6 +838,7 @@ class TelegramStewardAccessPointAdapter:
         priority: int = ACCESS_POINT_OUTBOUND_CLASS_CALLBACK_ACK,
         on_success: Callable[[_TelegramOutboundExecutionResult], None] | None = None,
         on_failure: Callable[[Exception], None] | None = None,
+        ordering_key: AccessPointKey | None = None,
     ) -> int:
         return self._enqueue_outbound(
             op_kind="answer_callback_query",
@@ -896,6 +850,7 @@ class TelegramStewardAccessPointAdapter:
             ),
             on_success=on_success,
             on_failure=on_failure,
+            ordering_key=ordering_key,
         )
 
     def _execute_answer_callback_query(
@@ -927,6 +882,11 @@ class TelegramStewardAccessPointAdapter:
                 error=str(exc),
                 error_type=type(exc).__name__,
                 retry_after_sec=_extract_retry_after_sec(exc),
+            ),
+            ordering_key=AccessPointKey(
+                type="telegram",
+                chat_id=delete.chat_id,
+                thread_id=delete.thread_id,
             ),
         )
 
@@ -966,6 +926,7 @@ class TelegramStewardAccessPointAdapter:
         execute: Callable[[], _TelegramOutboundExecutionResult],
         on_success: Callable[[_TelegramOutboundExecutionResult], None] | None,
         on_failure: Callable[[Exception], None] | None,
+        ordering_key: AccessPointKey | None = None,
     ) -> int:
         receipt_id = self._next_outbound_receipt_id
         self._next_outbound_receipt_id += 1
@@ -980,6 +941,7 @@ class TelegramStewardAccessPointAdapter:
             execute=execute,
             on_success=on_success,
             on_failure=on_failure,
+            ordering_key=ordering_key,
         )
         self._next_outbound_sequence += 1
         self._outbound_queue.append(item)
@@ -997,13 +959,24 @@ class TelegramStewardAccessPointAdapter:
     def _drain_outbound_queue(self) -> bool:
         if not self._outbound_queue:
             return False
+        if not self._status_budget.can_send_any():
+            return False
         item = self._outbound_queue[0]
         op_kind = str(item.operation or "")
-        if op_kind == "status":
-            if not self._status_budget.can_send_status():
+        if op_kind == "status" and not self._status_budget.can_send_status():
+            item = next(
+                (
+                    candidate
+                    for candidate in self._outbound_queue[1:]
+                    if str(candidate.operation or "") != "status"
+                    and candidate.ordering_key is not None
+                    and candidate.ordering_key != item.ordering_key
+                ),
+                None,
+            )
+            if item is None:
                 return False
-        elif not self._status_budget.can_send_any():
-            return False
+            op_kind = str(item.operation or "")
         try:
             result = item.execute()
         except Exception as exc:

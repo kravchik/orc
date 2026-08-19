@@ -1,20 +1,9 @@
 from __future__ import annotations
 
-import json
-import threading
-from dataclasses import dataclass
-from queue import Queue
 from typing import Any, Callable
 
-from orchestrator.jsonrpc_stdio import StdioJsonRpcClient
-
-
-@dataclass
-class _JsonRpcClientCommand:
-    method: str
-    args: tuple[Any, ...]
-    kwargs: dict[str, Any]
-    response_queue: Queue[tuple[bool, Any]] | None
+from orchestrator.jsonrpc_stdio import JsonRpcReadResult, StdioJsonRpcClient
+from orchestrator.serialized_call_lane import SerializedCallLane
 
 
 class JsonRpcClientThreadDriver:
@@ -30,8 +19,7 @@ class JsonRpcClientThreadDriver:
         self._client = client
         self._on_message = on_message
         self._thread_name = thread_name
-        self._queue: Queue[_JsonRpcClientCommand | None] = Queue()
-        self._thread: threading.Thread | None = None
+        self._lane = SerializedCallLane(client, thread_name=thread_name)
         self._started = False
 
     @property
@@ -48,13 +36,13 @@ class JsonRpcClientThreadDriver:
         if self._started:
             return
         self._started = True
-        self._thread = threading.Thread(
-            target=self._run,
-            name=self._thread_name,
-            daemon=True,
-        )
-        self._thread.start()
-        self._call("start")
+        self._lane.start()
+        try:
+            self._call("start")
+        except BaseException:
+            self._lane.stop()
+            self._started = False
+            raise
 
     def stop(self) -> None:
         if not self._started:
@@ -62,12 +50,12 @@ class JsonRpcClientThreadDriver:
         try:
             self._call("stop")
         finally:
-            self._queue.put(None)
-            thread = self._thread
-            if thread is not None:
-                thread.join(timeout=2.0)
-            self._thread = None
-            self._started = False
+            try:
+                self._lane.stop()
+            except BaseException:
+                raise
+            else:
+                self._started = False
 
     def send_request(self, method: str, params: dict) -> int:
         result = self._call("send_request", method, params=params)
@@ -98,41 +86,33 @@ class JsonRpcClientThreadDriver:
         )
 
     def read_message(self, timeout_sec: float) -> dict | None:
-        result = self._call("read_message", timeout_sec=timeout_sec)
-        if isinstance(result, dict) and self._on_message is not None:
-            self._on_message(json.dumps(result, ensure_ascii=True), result)
-        return result if isinstance(result, dict) or result is None else None
+        result = self.poll_message(timeout_sec=timeout_sec)
+        if result.kind == "message":
+            return result.message
+        if result.terminal:
+            raise RuntimeError(result.error)
+        return None
+
+    def poll_message(self, timeout_sec: float) -> JsonRpcReadResult:
+        poll = getattr(self._client, "poll_message", None)
+        if callable(poll):
+            result = self._call("poll_message", timeout_sec=timeout_sec)
+            if not isinstance(result, JsonRpcReadResult):
+                raise RuntimeError(f"json-rpc poll_message returned invalid result: {result!r}")
+        else:
+            message = self._call("read_message", timeout_sec=timeout_sec)
+            result = JsonRpcReadResult(
+                kind="message" if isinstance(message, dict) else "idle",
+                message=message if isinstance(message, dict) else None,
+            )
+        if result.kind == "message" and result.message is not None and self._on_message is not None:
+            # The session callback does not consume raw JSON; avoid serializing the
+            # potentially huge response a second time on the edge thread.
+            self._on_message("", result.message)
+        return result
 
     def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
-        response_queue: Queue[tuple[bool, Any]] = Queue(maxsize=1)
-        self._queue.put(
-            _JsonRpcClientCommand(
-                method=method,
-                args=tuple(args),
-                kwargs=dict(kwargs),
-                response_queue=response_queue,
-            )
-        )
-        ok, payload = response_queue.get()
-        if ok:
-            return payload
-        raise payload
-
-    def _run(self) -> None:
-        while True:
-            command = self._queue.get()
-            if command is None:
-                return
-            response_queue = command.response_queue
-            try:
-                method = getattr(self._client, command.method)
-                result = method(*command.args, **command.kwargs)
-            except Exception as exc:
-                if response_queue is not None:
-                    response_queue.put((False, exc))
-                continue
-            if response_queue is not None:
-                response_queue.put((True, result))
+        return self._lane.call(method, *args, **kwargs)
 
 
 def build_threaded_jsonrpc_client_factory(

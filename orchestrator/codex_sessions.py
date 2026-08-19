@@ -46,6 +46,18 @@ def find_latest_codex_cli_session_id(
     return sessions[0].session_id
 
 
+def find_codex_cli_thread_name(
+    session_id: str,
+    *,
+    sessions_root: str | Path | None = None,
+) -> str:
+    key = str(session_id or "").strip()
+    if not key:
+        return ""
+    root = _resolve_sessions_root(sessions_root)
+    return _load_latest_thread_names(root.parent / "session_index.jsonl").get(key, ("", ""))[0]
+
+
 def list_codex_cli_sessions(
     *,
     project_cwd: str | None = None,

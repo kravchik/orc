@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from orchestrator.access_point_common import (
+    AccessPointKey,
     AccessPointApprovalDecision,
     AccessPointApprovalDetailsRequest,
     AccessPointTextInput,
 )
-from orchestrator.telegram_steward_helpers import AccessPointKey
 
 
 class StewardInboundText(AccessPointTextInput[AccessPointKey]):

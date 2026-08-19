@@ -253,6 +253,24 @@ def format_item_status_summary(snapshot: list[dict[str, str]], *, changed_item_i
     return f"items: total={len(snapshot)}, in_progress={in_progress}, completed={completed}"
 
 
+def is_completed_agent_commentary(
+    snapshot: list[dict[str, str]],
+    *,
+    changed_item_id: str | None,
+) -> bool:
+    if not isinstance(changed_item_id, str) or not changed_item_id.strip():
+        return False
+    target_id = changed_item_id.strip()
+    for item in snapshot:
+        if str(item.get("id") or "").strip() != target_id:
+            continue
+        return (
+            str(item.get("type") or "").strip() == "agentCommentary"
+            and str(item.get("status") or "").strip() == "completed"
+        )
+    return False
+
+
 def format_item_status_lines(snapshot: list[dict[str, str]]) -> str:
     if not snapshot:
         return "items: none"

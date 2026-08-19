@@ -31,15 +31,23 @@ def execute_steward_actions(
     actions: list[dict[str, Any]],
     *,
     sessions_root: str | Path | None = None,
-    show_running_provider: Callable[[], list[dict[str, Any]]] | None = None,
+    show_running_provider: Callable[[], dict[str, Any]] | None = None,
     show_running_access_point: dict[str, Any] | None = None,
+    stop_agent_provider: Callable[[str], dict[str, Any]] | None = None,
     start_agent_provider: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     start_agent_access_point: dict[str, Any] | None = None,
-    list_routing_profiles_provider: Callable[[], list[dict[str, Any]]] | None = None,
-    get_routing_profile_provider: Callable[[str], dict[str, Any] | None] | None = None,
-    set_routing_profile_provider: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    attach_routing_profile_provider: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    detach_routing_profile_provider: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    shaman_assign_provider: Callable[[str], dict[str, Any]] | None = None,
+    shaman_show_provider: Callable[[], dict[str, Any]] | None = None,
+    shaman_rename_provider: Callable[[str], dict[str, Any]] | None = None,
+    shaman_remove_provider: Callable[[], dict[str, Any]] | None = None,
+    grunt_assign_provider: Callable[[str], dict[str, Any]] | None = None,
+    grunt_show_provider: Callable[[], dict[str, Any]] | None = None,
+    grunt_rename_provider: Callable[[str], dict[str, Any]] | None = None,
+    grunt_remove_provider: Callable[[], dict[str, Any]] | None = None,
+    approval_target_assign_provider: Callable[[str], dict[str, Any]] | None = None,
+    approval_target_show_provider: Callable[[], dict[str, Any]] | None = None,
+    approval_target_change_provider: Callable[[str], dict[str, Any]] | None = None,
+    approval_target_clear_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for raw in actions:
@@ -63,6 +71,15 @@ def execute_steward_actions(
                 )
             )
             continue
+        if action_type == "STOP_AGENT":
+            results.append(
+                _run_stop_agent(
+                    action,
+                    provider=stop_agent_provider,
+                    access_point=start_agent_access_point,
+                )
+            )
+            continue
         if action_type == "SHOW_RUNNING":
             results.append(
                 _run_show_running(
@@ -75,43 +92,100 @@ def execute_steward_actions(
         if action_type == "LIST_RESUMABLE":
             results.append(_run_list_resumable(action, sessions_root=sessions_root))
             continue
-        if action_type == "ROUTING_PROFILE_LIST":
+        if action_type == "SHAMAN_ASSIGN":
             results.append(
-                _run_routing_profile_list(
+                _run_address_with_value(
                     action,
-                    provider=list_routing_profiles_provider,
+                    action_type=action_type,
+                    provider=shaman_assign_provider,
+                    access_point=start_agent_access_point,
                 )
             )
             continue
-        if action_type == "ROUTING_PROFILE_GET":
+        if action_type == "SHAMAN_SHOW":
             results.append(
-                _run_routing_profile_get(
+                _run_address_without_value(
                     action,
-                    provider=get_routing_profile_provider,
+                    action_type=action_type,
+                    provider=shaman_show_provider,
+                    access_point=start_agent_access_point,
                 )
             )
             continue
-        if action_type == "ROUTING_PROFILE_SET":
+        if action_type == "SHAMAN_RENAME":
             results.append(
-                _run_routing_profile_set(
+                _run_address_with_value(
                     action,
-                    provider=set_routing_profile_provider,
+                    action_type=action_type,
+                    provider=shaman_rename_provider,
+                    access_point=start_agent_access_point,
                 )
             )
             continue
-        if action_type == "ROUTING_PROFILE_ATTACH":
+        if action_type == "SHAMAN_REMOVE":
             results.append(
-                _run_routing_profile_attach(
+                _run_address_without_value(
                     action,
-                    provider=attach_routing_profile_provider,
+                    action_type=action_type,
+                    provider=shaman_remove_provider,
+                    access_point=start_agent_access_point,
                 )
             )
             continue
-        if action_type == "ROUTING_PROFILE_DETACH":
+        if action_type == "GRUNT_ASSIGN":
             results.append(
-                _run_routing_profile_detach(
+                _run_address_with_value(
                     action,
-                    provider=detach_routing_profile_provider,
+                    action_type=action_type,
+                    provider=grunt_assign_provider,
+                    access_point=start_agent_access_point,
+                )
+            )
+            continue
+        if action_type == "GRUNT_SHOW":
+            results.append(
+                _run_address_without_value(
+                    action,
+                    action_type=action_type,
+                    provider=grunt_show_provider,
+                    access_point=start_agent_access_point,
+                )
+            )
+            continue
+        if action_type == "GRUNT_RENAME":
+            results.append(
+                _run_address_with_value(
+                    action,
+                    action_type=action_type,
+                    provider=grunt_rename_provider,
+                    access_point=start_agent_access_point,
+                )
+            )
+            continue
+        if action_type == "GRUNT_REMOVE":
+            results.append(
+                _run_address_without_value(
+                    action,
+                    action_type=action_type,
+                    provider=grunt_remove_provider,
+                    access_point=start_agent_access_point,
+                )
+            )
+            continue
+        if action_type in {
+            "APPROVAL_TARGET_ASSIGN",
+            "APPROVAL_TARGET_SHOW",
+            "APPROVAL_TARGET_CHANGE",
+            "APPROVAL_TARGET_CLEAR",
+        }:
+            results.append(
+                execute_approval_target_action(
+                    action,
+                    access_point=start_agent_access_point,
+                    assign_provider=approval_target_assign_provider,
+                    show_provider=approval_target_show_provider,
+                    change_provider=approval_target_change_provider,
+                    clear_provider=approval_target_clear_provider,
                 )
             )
             continue
@@ -119,10 +193,57 @@ def execute_steward_actions(
             {
                 "type": action_type or "UNKNOWN",
                 "ok": False,
+                "code": "unsupported_action",
                 "error": f"unsupported action type: {action_type or 'UNKNOWN'}",
             }
         )
     return results
+
+
+def execute_approval_target_action(
+    action: dict[str, Any],
+    *,
+    access_point: dict[str, Any] | None = None,
+    assign_provider: Callable[[str], dict[str, Any]] | None = None,
+    show_provider: Callable[[], dict[str, Any]] | None = None,
+    change_provider: Callable[[str], dict[str, Any]] | None = None,
+    clear_provider: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    action_type = str(action.get("type") or "").strip().upper()
+    if action_type == "APPROVAL_TARGET_ASSIGN":
+        return _run_approval_target_with_value(
+            action,
+            action_type=action_type,
+            provider=assign_provider,
+            access_point=access_point,
+        )
+    if action_type == "APPROVAL_TARGET_SHOW":
+        return _run_address_without_value(
+            action,
+            action_type=action_type,
+            provider=show_provider,
+            access_point=access_point,
+        )
+    if action_type == "APPROVAL_TARGET_CHANGE":
+        return _run_approval_target_with_value(
+            action,
+            action_type=action_type,
+            provider=change_provider,
+            access_point=access_point,
+        )
+    if action_type == "APPROVAL_TARGET_CLEAR":
+        return _run_address_without_value(
+            action,
+            action_type=action_type,
+            provider=clear_provider,
+            access_point=access_point,
+        )
+    return {
+        "type": action_type or "UNKNOWN",
+        "ok": False,
+        "code": "unsupported_action",
+        "error": f"unsupported approval target action type: {action_type or 'UNKNOWN'}",
+    }
 
 
 def build_action_result_prompt(results: list[dict[str, Any]]) -> str:
@@ -131,6 +252,45 @@ def build_action_result_prompt(results: list[dict[str, Any]]) -> str:
     return (
         "Control-plane executed your requested actions. "
         "Use action_results to answer user in natural language.\n"
+        "```json\n"
+        f"{formatted}\n"
+        "```"
+    )
+
+
+def build_steward_action_fingerprint(actions: list[dict[str, Any]]) -> str:
+    normalized: list[dict[str, Any]] = []
+    for action in actions:
+        item = dict(action)
+        item["type"] = str(item.get("type") or "").strip().upper()
+        normalized.append(item)
+    return json.dumps(normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def build_action_loop_terminal_prompt(
+    *,
+    reason: str,
+    limit: int,
+    completed_rounds: int,
+    progress: list[dict[str, Any]],
+    pending_actions: list[dict[str, Any]],
+    action_rejections: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "action_loop_terminal": {
+            "reason": reason,
+            "limit": limit,
+            "completed_rounds": completed_rounds,
+            "progress": list(progress),
+            "pending_actions": list(pending_actions),
+            "action_rejections": list(action_rejections),
+        }
+    }
+    formatted = json.dumps(payload, ensure_ascii=True, indent=2)
+    return (
+        "Control-plane action loop stopped before executing the pending actions. "
+        "Do not return actions in this turn. Answer the user in natural language, "
+        "summarize completed progress, and ask whether to continue.\n"
         "```json\n"
         f"{formatted}\n"
         "```"
@@ -227,7 +387,7 @@ def _build_resumable_item(item) -> dict[str, Any]:
 def _run_show_running(
     action: dict[str, Any],
     *,
-    provider: Callable[[], list[dict[str, Any]]] | None,
+    provider: Callable[[], dict[str, Any]] | None,
     access_point: dict[str, Any] | None,
 ) -> dict[str, Any]:
     extra_fields = sorted(str(key) for key in action.keys() if str(key) != "type")
@@ -243,22 +403,164 @@ def _run_show_running(
             "ok": False,
             "error": "SHOW_RUNNING is not available in this runtime",
         }
-    raw_items = provider()
-    items: list[dict[str, Any]] = []
-    for raw in raw_items:
-        if not isinstance(raw, dict):
-            continue
-        agent_id = str(raw.get("agent_id") or "").strip()
-        state = str(raw.get("state") or "").strip()
-        if not agent_id:
-            continue
-        items.append({"agent_id": agent_id, "state": state or "unknown"})
+    payload = provider()
+    raw_runtimes = payload.get("runtimes") if isinstance(payload, dict) else None
+    runtimes = [dict(item) for item in raw_runtimes or [] if isinstance(item, dict)]
+    raw_binding = payload.get("binding") if isinstance(payload, dict) else None
+    binding = dict(raw_binding) if isinstance(raw_binding, dict) else None
     result: dict[str, Any] = {
         "type": "SHOW_RUNNING",
         "ok": True,
-        "count": len(items),
-        "items": items,
+        "count": len(runtimes),
+        "runtimes": runtimes,
+        "binding": binding,
     }
+    if isinstance(access_point, dict):
+        result["access_point"] = dict(access_point)
+    return result
+
+def _run_stop_agent(
+    action: dict[str, Any],
+    *,
+    provider: Callable[[str], dict[str, Any]] | None,
+    access_point: dict[str, Any] | None,
+) -> dict[str, Any]:
+    extra_fields = sorted(str(key) for key in action.keys() if str(key) not in {"type", "agent_id"})
+    if extra_fields:
+        return {
+            "type": "STOP_AGENT",
+            "ok": False,
+            "error": f"STOP_AGENT has unknown fields: {', '.join(extra_fields)}",
+        }
+    agent_id_raw = action.get("agent_id")
+    if not isinstance(agent_id_raw, str) or not agent_id_raw.strip():
+        return {"type": "STOP_AGENT", "ok": False, "error": "agent_id is required"}
+    agent_id = agent_id_raw.strip()
+    if provider is None:
+        return {
+            "type": "STOP_AGENT",
+            "ok": False,
+            "agent_id": agent_id,
+            "error": "STOP_AGENT is not available in this runtime",
+        }
+    try:
+        provider_result = provider(agent_id)
+    except Exception as exc:
+        return {
+            "type": "STOP_AGENT",
+            "ok": False,
+            "agent_id": agent_id,
+            "error": str(exc),
+        }
+    result: dict[str, Any] = {
+        "type": "STOP_AGENT",
+        "ok": bool(provider_result.get("ok")),
+        "agent_id": agent_id,
+    }
+    result.update(provider_result)
+    if isinstance(access_point, dict):
+        result["access_point"] = dict(access_point)
+    return result
+
+
+def _run_address_with_value(
+    action: dict[str, Any],
+    *,
+    action_type: str,
+    provider: Callable[[str], dict[str, Any]] | None,
+    access_point: dict[str, Any] | None,
+) -> dict[str, Any]:
+    extra_fields = sorted(str(key) for key in action.keys() if str(key) not in {"type", "address"})
+    if extra_fields:
+        return {
+            "type": action_type,
+            "ok": False,
+            "error": f"{action_type} has unknown fields: {', '.join(extra_fields)}",
+        }
+    address = action.get("address")
+    if not isinstance(address, str) or not address.strip():
+        return {"type": action_type, "ok": False, "error": "address is required"}
+    if provider is None:
+        return {"type": action_type, "ok": False, "error": f"{action_type} is not available in this runtime"}
+    try:
+        provider_result = provider(address)
+    except Exception as exc:
+        return {"type": action_type, "ok": False, "error": str(exc)}
+    return _build_address_success_result(
+        action_type=action_type,
+        provider_result=provider_result,
+        access_point=access_point,
+    )
+
+
+def _run_address_without_value(
+    action: dict[str, Any],
+    *,
+    action_type: str,
+    provider: Callable[[], dict[str, Any]] | None,
+    access_point: dict[str, Any] | None,
+) -> dict[str, Any]:
+    extra_fields = sorted(str(key) for key in action.keys() if str(key) != "type")
+    if extra_fields:
+        return {
+            "type": action_type,
+            "ok": False,
+            "error": f"{action_type} does not accept fields: {', '.join(extra_fields)}",
+        }
+    if provider is None:
+        return {"type": action_type, "ok": False, "error": f"{action_type} is not available in this runtime"}
+    try:
+        provider_result = provider()
+    except Exception as exc:
+        return {"type": action_type, "ok": False, "error": str(exc)}
+    return _build_address_success_result(
+        action_type=action_type,
+        provider_result=provider_result,
+        access_point=access_point,
+    )
+
+
+def _run_approval_target_with_value(
+    action: dict[str, Any],
+    *,
+    action_type: str,
+    provider: Callable[[str], dict[str, Any]] | None,
+    access_point: dict[str, Any] | None,
+) -> dict[str, Any]:
+    extra_fields = sorted(
+        str(key) for key in action.keys() if str(key) not in {"type", "approval_target"}
+    )
+    if extra_fields:
+        return {
+            "type": action_type,
+            "ok": False,
+            "error": f"{action_type} has unknown fields: {', '.join(extra_fields)}",
+        }
+    target = action.get("approval_target")
+    if not isinstance(target, str) or not target.strip():
+        return {"type": action_type, "ok": False, "error": "approval_target is required"}
+    if provider is None:
+        return {"type": action_type, "ok": False, "error": f"{action_type} is not available in this runtime"}
+    try:
+        provider_result = provider(target)
+    except Exception as exc:
+        return {"type": action_type, "ok": False, "error": str(exc)}
+    return _build_address_success_result(
+        action_type=action_type,
+        provider_result=provider_result,
+        access_point=access_point,
+    )
+
+
+def _build_address_success_result(
+    *,
+    action_type: str,
+    provider_result: dict[str, Any],
+    access_point: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"type": action_type, "ok": True}
+    if isinstance(provider_result, dict):
+        result.update(provider_result)
     if isinstance(access_point, dict):
         result["access_point"] = dict(access_point)
     return result
@@ -497,196 +799,4 @@ def _run_resume_agent(
         result.pop("model", None)
     if isinstance(access_point, dict):
         result["access_point"] = dict(access_point)
-    return result
-
-
-def _run_routing_profile_list(
-    action: dict[str, Any],
-    *,
-    provider: Callable[[], list[dict[str, Any]]] | None,
-) -> dict[str, Any]:
-    extra_fields = sorted(str(key) for key in action.keys() if str(key) != "type")
-    if extra_fields:
-        return {
-            "type": "ROUTING_PROFILE_LIST",
-            "ok": False,
-            "error": f"ROUTING_PROFILE_LIST does not accept fields: {', '.join(extra_fields)}",
-        }
-    if provider is None:
-        return {
-            "type": "ROUTING_PROFILE_LIST",
-            "ok": False,
-            "error": "ROUTING_PROFILE_LIST is not available in this runtime",
-        }
-    try:
-        items_raw = provider()
-    except Exception as exc:
-        return {"type": "ROUTING_PROFILE_LIST", "ok": False, "error": str(exc)}
-    items = [dict(item) for item in items_raw if isinstance(item, dict)]
-    return {
-        "type": "ROUTING_PROFILE_LIST",
-        "ok": True,
-        "count": len(items),
-        "items": items,
-    }
-
-
-def _run_routing_profile_get(
-    action: dict[str, Any],
-    *,
-    provider: Callable[[str], dict[str, Any] | None] | None,
-) -> dict[str, Any]:
-    allowed_fields = {"type", "session_id"}
-    extra_fields = sorted(str(key) for key in action.keys() if str(key) not in allowed_fields)
-    if extra_fields:
-        return {
-            "type": "ROUTING_PROFILE_GET",
-            "ok": False,
-            "error": f"ROUTING_PROFILE_GET has unknown fields: {', '.join(extra_fields)}",
-        }
-    if provider is None:
-        return {
-            "type": "ROUTING_PROFILE_GET",
-            "ok": False,
-            "error": "ROUTING_PROFILE_GET is not available in this runtime",
-        }
-    session_id = str(action.get("session_id") or "").strip()
-    if not session_id:
-        return {"type": "ROUTING_PROFILE_GET", "ok": False, "error": "session_id is required"}
-    try:
-        payload = provider(session_id)
-    except Exception as exc:
-        return {"type": "ROUTING_PROFILE_GET", "ok": False, "error": str(exc)}
-    if payload is None:
-        return {
-            "type": "ROUTING_PROFILE_GET",
-            "ok": False,
-            "error": f"unknown session id: {session_id}",
-        }
-    result = {"type": "ROUTING_PROFILE_GET", "ok": True}
-    result.update(dict(payload))
-    return result
-
-
-def _run_routing_profile_set(
-    action: dict[str, Any],
-    *,
-    provider: Callable[[dict[str, Any]], dict[str, Any]] | None,
-) -> dict[str, Any]:
-    allowed_fields = {"type", "session_id", "profile", "roles"}
-    extra_fields = sorted(str(key) for key in action.keys() if str(key) not in allowed_fields)
-    if extra_fields:
-        return {
-            "type": "ROUTING_PROFILE_SET",
-            "ok": False,
-            "error": f"ROUTING_PROFILE_SET has unknown fields: {', '.join(extra_fields)}",
-        }
-    if provider is None:
-        return {
-            "type": "ROUTING_PROFILE_SET",
-            "ok": False,
-            "error": "ROUTING_PROFILE_SET is not available in this runtime",
-        }
-    session_id = str(action.get("session_id") or "").strip()
-    if not session_id:
-        return {"type": "ROUTING_PROFILE_SET", "ok": False, "error": "session_id is required"}
-    profile = str(action.get("profile") or "").strip()
-    if not profile:
-        return {"type": "ROUTING_PROFILE_SET", "ok": False, "error": "profile is required"}
-    roles_raw = action.get("roles")
-    if not isinstance(roles_raw, dict) or not roles_raw:
-        return {"type": "ROUTING_PROFILE_SET", "ok": False, "error": "roles is required and must be object"}
-    roles: dict[str, str] = {}
-    for key, value in roles_raw.items():
-        alias = str(key or "").strip()
-        node_id = str(value or "").strip()
-        if not alias:
-            return {"type": "ROUTING_PROFILE_SET", "ok": False, "error": "roles keys must be non-empty"}
-        if not node_id:
-            return {
-                "type": "ROUTING_PROFILE_SET",
-                "ok": False,
-                "error": f"roles[{alias!r}] must be non-empty string",
-            }
-        roles[alias] = node_id
-    spec = {
-        "session_id": session_id,
-        "profile": profile,
-        "roles": roles,
-    }
-    try:
-        payload = provider(spec)
-    except Exception as exc:
-        return {"type": "ROUTING_PROFILE_SET", "ok": False, "error": str(exc)}
-    result = {"type": "ROUTING_PROFILE_SET", "ok": True}
-    if isinstance(payload, dict):
-        result.update(dict(payload))
-    return result
-
-
-def _run_routing_profile_attach(
-    action: dict[str, Any],
-    *,
-    provider: Callable[[dict[str, Any]], dict[str, Any]] | None,
-) -> dict[str, Any]:
-    allowed_fields = {"type", "session_id", "source_alias"}
-    extra_fields = sorted(str(key) for key in action.keys() if str(key) not in allowed_fields)
-    if extra_fields:
-        return {
-            "type": "ROUTING_PROFILE_ATTACH",
-            "ok": False,
-            "error": f"ROUTING_PROFILE_ATTACH has unknown fields: {', '.join(extra_fields)}",
-        }
-    if provider is None:
-        return {
-            "type": "ROUTING_PROFILE_ATTACH",
-            "ok": False,
-            "error": "ROUTING_PROFILE_ATTACH is not available in this runtime",
-        }
-    session_id = str(action.get("session_id") or "").strip()
-    if not session_id:
-        return {"type": "ROUTING_PROFILE_ATTACH", "ok": False, "error": "session_id is required"}
-    source_alias = str(action.get("source_alias") or "@HUMAN").strip()
-    if not source_alias:
-        return {"type": "ROUTING_PROFILE_ATTACH", "ok": False, "error": "source_alias must be non-empty"}
-    spec = {
-        "session_id": session_id,
-        "source_alias": source_alias,
-    }
-    try:
-        payload = provider(spec)
-    except Exception as exc:
-        return {"type": "ROUTING_PROFILE_ATTACH", "ok": False, "error": str(exc)}
-    result = {"type": "ROUTING_PROFILE_ATTACH", "ok": True}
-    if isinstance(payload, dict):
-        result.update(dict(payload))
-    return result
-
-
-def _run_routing_profile_detach(
-    action: dict[str, Any],
-    *,
-    provider: Callable[[dict[str, Any]], dict[str, Any]] | None,
-) -> dict[str, Any]:
-    allowed_fields = {"type"}
-    extra_fields = sorted(str(key) for key in action.keys() if str(key) not in allowed_fields)
-    if extra_fields:
-        return {
-            "type": "ROUTING_PROFILE_DETACH",
-            "ok": False,
-            "error": f"ROUTING_PROFILE_DETACH has unknown fields: {', '.join(extra_fields)}",
-        }
-    if provider is None:
-        return {
-            "type": "ROUTING_PROFILE_DETACH",
-            "ok": False,
-            "error": "ROUTING_PROFILE_DETACH is not available in this runtime",
-        }
-    try:
-        payload = provider({})
-    except Exception as exc:
-        return {"type": "ROUTING_PROFILE_DETACH", "ok": False, "error": str(exc)}
-    result = {"type": "ROUTING_PROFILE_DETACH", "ok": True}
-    if isinstance(payload, dict):
-        result.update(dict(payload))
     return result

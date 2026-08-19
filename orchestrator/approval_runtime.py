@@ -6,12 +6,15 @@ from dataclasses import dataclass
 from typing import Callable
 
 from orchestrator.approval import (
+    ApprovalDecisionTrace,
     ApprovalDecisionProvider,
     ApprovalPolicy,
     ApprovalRequest,
-    build_accept_settings,
+    COMMAND_APPROVAL_METHOD,
+    build_session_approval_response,
     format_regex_auto_approval_notification,
     format_regex_fallback_human_notification,
+    supports_session_approval,
 )
 from orchestrator.processes import LifecycleLogger
 
@@ -65,6 +68,7 @@ def build_approval_response_plan(
     log_human_required: bool = True,
     log_human_decision: bool = True,
     log_auto_decision: bool = True,
+    decision_trace: ApprovalDecisionTrace | None = None,
 ) -> ApprovalResponsePlan:
     if not ApprovalPolicy.is_approval_method(request.method):
         return ApprovalResponsePlan(
@@ -85,10 +89,10 @@ def build_approval_response_plan(
         and isinstance(command_from_params, str)
         and command_from_params in always_allow_commands
     ):
-        result: dict = {"decision": "accept"}
-        accept_settings = build_accept_settings(params=request.params)
-        if accept_settings is not None:
-            result["acceptSettings"] = accept_settings
+        result = build_session_approval_response(
+            method=request.method,
+            params=request.params,
+        ) or {"decision": "accept"}
         return ApprovalResponsePlan(
             req_id=request.req_id,
             result=result,
@@ -114,8 +118,12 @@ def build_approval_response_plan(
     decision = "human"
     decision_source = "interactive"
     command_text = ApprovalPolicy._extract_command(method=request.method, params=request.params)
-    if approval_policy is not None:
-        decision_trace = approval_policy.decide_with_trace(method=request.method, params=request.params)
+    if decision_trace is None and approval_policy is not None:
+        decision_trace = approval_policy.decide_with_trace(
+            method=request.method,
+            params=request.params,
+        )
+    if decision_trace is not None:
         decision = decision_trace.decision
         decision_source = decision_trace.source
         command_text = decision_trace.command
@@ -126,11 +134,13 @@ def build_approval_response_plan(
             decision=decision,
             decision_source=decision_source,
             command=command_text,
+            affected_paths=decision_trace.affected_paths,
             regex_trace=decision_trace.regex_trace,
             approval_notify=approval_notify,
         )
 
     always_allow = False
+    session_result: dict | None = None
     human_flow = decision == "human"
     if human_flow:
         if before_human_required is not None:
@@ -160,11 +170,20 @@ def build_approval_response_plan(
 
         normalized = ApprovalPolicy.normalize_human_decision_with_always(
             raw=raw_human_decision,
-            allow_always=ApprovalPolicy.is_approval_method(request.method),
+            allow_always=supports_session_approval(
+                method=request.method,
+                params=request.params,
+            ),
         )
         if normalized == "always_allow":
-            decision = "accept"
             always_allow = True
+            session_result = build_session_approval_response(
+                method=request.method,
+                params=request.params,
+            )
+            if session_result is None:
+                raise RuntimeError("session approval is unavailable for this request")
+            decision = str(session_result["decision"])
         else:
             decision = normalized
         if log_human_decision:
@@ -190,13 +209,17 @@ def build_approval_response_plan(
                 command=command_text,
             )
 
-    result: dict = {"decision": decision}
+    result: dict = session_result or {"decision": decision}
     if always_allow:
-        if always_allow_commands is not None and isinstance(command_from_params, str) and command_from_params:
+        if (
+            request.method == COMMAND_APPROVAL_METHOD
+            and always_allow_commands is not None
+            and isinstance(command_from_params, str)
+            and command_from_params
+        ):
             always_allow_commands.add(command_from_params)
-        accept_settings = build_accept_settings(params=request.params)
-        if accept_settings is not None:
-            result["acceptSettings"] = accept_settings
+        accept_settings = result.get("acceptSettings")
+        if isinstance(accept_settings, dict):
             _event(
                 logger=logger,
                 role=role,
@@ -204,13 +227,13 @@ def build_approval_response_plan(
                 id=request.req_id,
                 accept_settings=accept_settings,
             )
-        else:
+        elif result.get("decision") == "acceptForSession":
             _event(
                 logger=logger,
                 role=role,
-                name="approval_accept_settings_skipped",
+                name="approval_session_accept_applied",
                 id=request.req_id,
-                reason="missing proposedExecpolicyAmendment",
+                method=request.method,
             )
 
     via = "interactive" if human_flow else "policy_auto"
@@ -249,6 +272,7 @@ def _log_regex_allowlist_trace(
     decision: str,
     decision_source: str,
     command: str,
+    affected_paths: tuple[str, ...],
     regex_trace,
     approval_notify: Callable[[str], None] | None,
 ) -> None:
@@ -262,8 +286,10 @@ def _log_regex_allowlist_trace(
             id=request.req_id,
             method=request.method,
             command=command,
+            affected_paths=list(affected_paths),
             file_path=regex_trace.file_path,
             matched_pattern=regex_trace.matched_pattern,
+            matched_patterns=list(regex_trace.matched_patterns),
         )
         if (
             decision == "accept"
@@ -275,6 +301,8 @@ def _log_regex_allowlist_trace(
                 command=command,
                 matched_pattern=regex_trace.matched_pattern,
                 file_path=regex_trace.file_path,
+                affected_paths=affected_paths,
+                matched_patterns=regex_trace.matched_patterns,
             )
             approval_notify(note)
             _event(
@@ -284,6 +312,7 @@ def _log_regex_allowlist_trace(
                 id=request.req_id,
                 source=decision_source,
                 command=command,
+                affected_paths=list(affected_paths),
                 matched_pattern=regex_trace.matched_pattern,
             )
     else:
@@ -294,6 +323,8 @@ def _log_regex_allowlist_trace(
             id=request.req_id,
             method=request.method,
             command=command,
+            affected_paths=list(affected_paths),
+            unmatched_values=list(regex_trace.unmatched_values),
             file_path=regex_trace.file_path,
         )
         if (
@@ -305,6 +336,7 @@ def _log_regex_allowlist_trace(
                 command=command,
                 file_path=regex_trace.file_path,
                 parse_errors=regex_trace.parse_errors,
+                affected_paths=affected_paths,
             )
             approval_notify(note)
             _event(
@@ -314,6 +346,7 @@ def _log_regex_allowlist_trace(
                 id=request.req_id,
                 source=decision_source,
                 command=command,
+                affected_paths=list(affected_paths),
             )
     for parse_error in regex_trace.parse_errors:
         _event(

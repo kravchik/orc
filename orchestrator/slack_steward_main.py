@@ -38,6 +38,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="override Codex sessions root (default: ~/.codex/sessions)",
     )
     parser.add_argument("--request-timeout-sec", type=float, default=0.0)
+    parser.add_argument("--startup-timeout-sec", type=float, default=120.0)
     parser.add_argument("--rpc-timeout-sec", type=float, default=5.0)
     parser.add_argument("--rpc-retries", type=int, default=3)
     parser.add_argument("--steward-command", default="codex app-server")
@@ -103,6 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         steward_command=steward_command,
         agent_command=agent_command,
         request_timeout_sec=float(args.request_timeout_sec),
+        startup_timeout_sec=float(args.startup_timeout_sec),
         rpc_timeout_sec=float(args.rpc_timeout_sec),
         rpc_retries=int(args.rpc_retries),
         approval_policy=ApprovalPolicy.from_csv(
