@@ -9,6 +9,7 @@ from orchestrator.access_point_common import (
     AccessPointApprovalDecision,
     AccessPointTextInput,
 )
+from orchestrator.context_window import format_context_window_remaining
 from orchestrator.inspect_text import append_active_work_lines, format_thread_metadata_lines
 from orchestrator.turn_status_store import TurnStatusStore
 
@@ -69,6 +70,8 @@ class ProxyActionDriver(Protocol[AccessPointKeyT]):
     def get_item_status_snapshot(self) -> list[dict[str, str]]: ...
 
     def get_last_item_apply_info(self) -> dict | None: ...
+
+    def get_context_usage(self) -> dict[str, object]: ...
 
 
 class ProxyApprovalState(Protocol[AccessPointKeyT]):
@@ -151,6 +154,7 @@ def build_proxy_inspect_text(
     approval_command: str | None,
     approval_cwd: str | None,
     rows: list[dict[str, str]],
+    context_usage: dict[str, object] | None,
 ) -> str:
     resolved_active_turn_id = str(active_turn_id or "").strip()
     if not resolved_active_turn_id:
@@ -167,6 +171,7 @@ def build_proxy_inspect_text(
             model_fallback=str(model or "").strip(),
         )
     )
+    lines.append(format_context_window_remaining(context_usage))
     lines.append(f"active turn: {resolved_active_turn_id}")
     lines.append(f"pending approval: {'yes' if pending_approval is not None else 'no'}")
     if approval_command:

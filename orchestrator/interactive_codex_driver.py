@@ -277,6 +277,9 @@ class CodexInteractiveDriver:
     def get_thread_metadata(self) -> dict[str, object]:
         return self._session.get_thread_metadata()
 
+    def get_context_usage(self) -> dict[str, object]:
+        return self._session.get_context_usage()
+
     def is_ready(self) -> bool:
         return self._startup_ready
 

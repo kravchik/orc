@@ -22,6 +22,7 @@ from orchestrator.approval_runtime import (
     build_approval_response_plan,
     parse_server_request,
 )
+from orchestrator.context_window import compaction_matches_thread, parse_context_usage
 from orchestrator.file_change_approval import enrich_file_change_approval_params_from_item
 from orchestrator.jsonrpc_stdio import JsonRpcReadResult, StdioJsonRpcClient
 from orchestrator.processes import LifecycleLogger
@@ -142,6 +143,7 @@ class CodexJsonRpcSession:
         self._thread_id: Optional[str] = None
         self._thread_model: Optional[str] = None
         self._thread_metadata: dict[str, Any] = {}
+        self._context_usage: dict[str, object] = {}
         self._pending_messages: list[dict] = []
         self._always_allow_commands: set[str] = set()
         self._item_tracker = ProtocolItemTracker()
@@ -205,6 +207,9 @@ class CodexJsonRpcSession:
         if "model" not in metadata and isinstance(self._thread_model, str) and self._thread_model.strip():
             metadata["model"] = self._thread_model.strip()
         return metadata
+
+    def get_context_usage(self) -> dict[str, object]:
+        return dict(self._context_usage)
 
     def start(
         self,
@@ -313,6 +318,7 @@ class CodexJsonRpcSession:
         self._thread_id = None
         self._thread_model = None
         self._thread_metadata = {}
+        self._context_usage = {}
         self._client.start()
         self._startup_started_at = clock.monotonic()
         self._startup_last_waiting_at = self._startup_started_at
@@ -400,6 +406,7 @@ class CodexJsonRpcSession:
                         raise RuntimeError(f"{state.active_start_method} response did not contain model")
                     self._thread_id = thread_id
                     self._thread_model = model
+                    self._context_usage = {}
                     thread_payload = result.get("thread")
                     self._thread_metadata = dict(thread_payload) if isinstance(thread_payload, dict) else {}
                     self._thread_metadata.setdefault("id", thread_id)
@@ -755,6 +762,7 @@ class CodexJsonRpcSession:
                 raise RuntimeError("thread/start response did not contain model")
             self._thread_id = str(thread_id)
             self._thread_model = thread_model
+            self._context_usage = {}
             thread_payload = result.get("thread")
             self._thread_metadata = dict(thread_payload) if isinstance(thread_payload, dict) else {}
             self._thread_metadata.setdefault("id", self._thread_id)
@@ -774,6 +782,7 @@ class CodexJsonRpcSession:
         )
         self._thread_id = start_result.thread_id
         self._thread_model = start_result.model
+        self._context_usage = {}
         self._thread_metadata = {"id": self._thread_id, "model": self._thread_model}
 
     def _request_thread_read(self, thread_id: str) -> dict[str, Any]:
@@ -1606,6 +1615,7 @@ class CodexJsonRpcSession:
         )
 
     def _emit_protocol_status(self, method: str, params: dict) -> None:
+        self._update_context_usage(method=method, params=params)
         changed_item_id = self._item_tracker.apply(method=method, params=params)
         if changed_item_id is not None:
             apply_info = self._item_tracker.last_apply_info() or {}
@@ -1641,6 +1651,20 @@ class CodexJsonRpcSession:
         if not should_emit_status_method(method):
             return
         callback(self._role, method, params)
+
+    def _update_context_usage(self, *, method: str, params: dict[str, Any]) -> None:
+        thread_id = str(self._thread_id or "").strip()
+        if not thread_id:
+            self._context_usage = {}
+            return
+        if compaction_matches_thread(method, params, expected_thread_id=thread_id):
+            self._context_usage = {}
+            return
+        if method != "thread/tokenUsage/updated":
+            return
+        usage = parse_context_usage(params, expected_thread_id=thread_id)
+        if usage is not None:
+            self._context_usage = usage
 
 
 def _summarize_protocol_response(msg: dict[str, Any]) -> dict[str, Any]:

@@ -5,6 +5,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from orchestrator.context_window import format_context_usage_status
+
 IGNORED_STATUS_METHODS = {
     # These are verbose codex/event deltas mirrored by item/* events.
     "codex/event/agent_message_content_delta",
@@ -305,7 +307,7 @@ def format_protocol_status(method: str, params: dict | None = None) -> str:
     rate_limits = _format_rate_limits_status(method=method, params=params)
     if rate_limits is not None:
         return rate_limits
-    usage = _format_context_usage_status(method=method, params=params)
+    usage = format_context_usage_status(method=method, params=params)
     if usage is not None:
         return usage
     return method
@@ -339,23 +341,6 @@ def format_protocol_status_with_role(
         source=role,
         text=format_protocol_status(method=method, params=params),
     )
-
-
-def _format_context_usage_status(method: str, params: dict | None) -> str | None:
-    if method != "thread/tokenUsage/updated" or not isinstance(params, dict):
-        return None
-    token_usage = params.get("tokenUsage")
-    if not isinstance(token_usage, dict):
-        return None
-    total_obj = token_usage.get("total")
-    if not isinstance(total_obj, dict):
-        return None
-    total_tokens = total_obj.get("totalTokens")
-    model_context = token_usage.get("modelContextWindow")
-    if not isinstance(total_tokens, int) or not isinstance(model_context, int) or model_context <= 0:
-        return None
-    pct = max(0.0, min(100.0, (float(total_tokens) / float(model_context)) * 100.0))
-    return f"thread/tokenUsage/updated ({pct:.1f}% ctx: {total_tokens}/{model_context})"
 
 
 def _format_task_started_status(method: str, params: dict | None) -> str | None:

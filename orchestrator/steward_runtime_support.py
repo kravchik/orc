@@ -147,6 +147,7 @@ class StewardDeliveryLane(Protocol):
     def has_active_turn(self, access_point: AccessPointKey) -> bool: ...
     def interrupt_active_turn(self, access_point: AccessPointKey) -> None: ...
     def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]: ...
+    def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]: ...
     def reset(self, access_point: AccessPointKey) -> bool: ...
     def close(self) -> None: ...
 
@@ -197,6 +198,7 @@ class AgentDeliveryLane(StewardDeliveryLane, Protocol):
     def change_approval_target(self, access_point: AccessPointKey, target: str) -> dict[str, str]: ...
     def clear_approval_target(self, access_point: AccessPointKey) -> dict[str, str]: ...
     def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]: ...
+    def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]: ...
     def stop_agent(self, access_point: AccessPointKey) -> bool: ...
     def start_bound_agent(self, access_point: AccessPointKey) -> dict[str, Any]: ...
     def restore_binding(
@@ -367,6 +369,14 @@ class InteractiveStewardRuntime:
         if not callable(getter):
             return {}
         raw = getter()
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]:
+        handle = self._handles.get(access_point)
+        if handle is None:
+            return {}
+        getter = getattr(handle.driver, "get_context_usage", None)
+        raw = getter() if callable(getter) else {}
         return dict(raw) if isinstance(raw, dict) else {}
 
     def submit_approval_decision(self, access_point: AccessPointKey, decision: str) -> None:
@@ -1458,6 +1468,14 @@ class InteractiveAgentRuntime:
         if not callable(getter):
             return {}
         raw = getter()
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None:
+            return {}
+        getter = getattr(binding.driver, "get_context_usage", None)
+        raw = getter() if callable(getter) else {}
         return dict(raw) if isinstance(raw, dict) else {}
 
     def close(self) -> None:

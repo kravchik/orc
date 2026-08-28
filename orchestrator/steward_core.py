@@ -17,6 +17,7 @@ from orchestrator.approval_delegation import (
 )
 from orchestrator.approval_target import HUMAN_APPROVAL_TARGET
 from orchestrator.codex_sessions import find_codex_cli_thread_name, list_codex_cli_sessions
+from orchestrator.context_window import format_context_window_remaining
 from orchestrator.delivery_errors import extract_http_code
 from orchestrator.inspect_text import append_active_work_lines, format_thread_metadata_lines
 from orchestrator.interactive_driver_events import (
@@ -67,7 +68,9 @@ from orchestrator.steward_commands import (
     parse_approver_command,
     parse_grunt_command,
     parse_shaman_command,
+    parse_steward_user_command,
 )
+from orchestrator.user_commands import UNKNOWN_USER_COMMAND_TEXT
 from orchestrator.binding_address import (
     ROUTING_MODE_GRUNT,
     ROUTING_MODE_SHAMAN,
@@ -1200,9 +1203,10 @@ class StewardCore:
             access_point = inbound.access_point
             pending = self._pending_approvals.get(access_point)
             active = self._active_operations.get(access_point)
+            parsed_command = parse_steward_user_command(inbound.text)
             fallback_cmd = extract_fallback_command(inbound.text)
-            local_immediate = is_local_immediate_command(fallback_cmd)
-            is_slash_command = str(inbound.text or "").strip().startswith("/")
+            local_immediate = parsed_command.is_unknown or is_local_immediate_command(fallback_cmd)
+            is_slash_command = parsed_command.is_command
             has_earlier_same_access_point = any(
                 pending_inbound.access_point == access_point
                 for pending_inbound in self._pending_text_updates[:idx]
@@ -1513,6 +1517,19 @@ class StewardCore:
         last_apply_info: dict | None
         has_active_turn: bool
         thread_metadata: dict[str, Any]
+        steward_context_usage: dict[str, object] = {}
+        agent_context_usage: dict[str, object] = {}
+        steward = snapshot.steward
+        if steward is not None:
+            getter = getattr(self._runtime, "get_context_usage", None)
+            raw_usage = getter(access_point) if callable(getter) else {}
+            if isinstance(raw_usage, dict):
+                steward_context_usage = dict(raw_usage)
+        if binding is not None:
+            getter = getattr(self._agent_runtime, "get_context_usage", None)
+            raw_usage = getter(access_point) if callable(getter) else {}
+            if isinstance(raw_usage, dict):
+                agent_context_usage = dict(raw_usage)
         if binding is not None:
             rows = self._agent_runtime.get_item_status_snapshot(access_point)
             last_apply_info = self._agent_runtime.get_last_item_apply_info(access_point)
@@ -1540,7 +1557,6 @@ class StewardCore:
             "inspect",
             f"access point state: {snapshot.state}",
         ]
-        steward = snapshot.steward
         lines.extend(
             [
                 "steward runtime:",
@@ -1548,6 +1564,12 @@ class StewardCore:
                 f"id: {steward.agent_id if steward is not None else 'none'}",
                 f"state: {steward.state if steward is not None else 'NOT_STARTED'}",
                 f"controllable: {'yes' if steward is not None and steward.controllable else 'no'}",
+            ]
+        )
+        if steward is not None:
+            lines.append(format_context_window_remaining(steward_context_usage))
+        lines.extend(
+            [
                 "bound agent:",
                 "role: agent",
                 f"id: {binding.agent_id if binding is not None else 'none'}",
@@ -1555,6 +1577,8 @@ class StewardCore:
                 f"controllable: {'yes' if binding is not None and binding.controllable else 'no'}",
             ]
         )
+        if binding is not None:
+            lines.append(format_context_window_remaining(agent_context_usage))
         if binding is not None:
             lines.extend(
                 [
@@ -3654,6 +3678,7 @@ class StewardCore:
         agent_state = snapshot.state
         is_bound = agent_state != "UNBOUND"
         is_running_bound = agent_state == "RUNNING"
+        parsed_command = parse_steward_user_command(inbound.text)
         fallback_cmd = extract_fallback_command(inbound.text)
         self._logger.event(
             "steward_inbound_state_snapshot",
@@ -3663,6 +3688,22 @@ class StewardCore:
             is_running_bound=is_running_bound,
             fallback_cmd=fallback_cmd,
         )
+        if parsed_command.is_unknown:
+            self._logger.event(
+                "unknown_user_command_rejected",
+                **self._hooks.access_point_fields(access_point),
+                command=parsed_command.name,
+            )
+            self._queue_local_command_reply(
+                access_point=access_point,
+                outcome=LocalCommandOutcome(
+                    command=str(inbound.text or "").strip(),
+                    result={"ok": False, "code": "unknown_command"},
+                ),
+                text=UNKNOWN_USER_COMMAND_TEXT,
+                kind=self._kinds.warning,
+            )
+            return
         if fallback_cmd == "help":
             if self._hooks.on_fallback_command is not None:
                 self._hooks.on_fallback_command(access_point, fallback_cmd, is_bound)

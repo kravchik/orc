@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from orchestrator.user_commands import UserCommandInput, parse_user_command
+
 
 @dataclass(frozen=True)
 class StewardCommandSpec:
@@ -92,16 +94,18 @@ STEWARD_COMMANDS = (
 _COMMAND_BY_NAME = {spec.name: spec for spec in STEWARD_COMMANDS}
 
 
+def parse_steward_user_command(raw_text: str) -> UserCommandInput:
+    return parse_user_command(raw_text, known_commands=_COMMAND_BY_NAME)
+
+
 def extract_fallback_command(raw_text: str) -> str | None:
-    stripped = str(raw_text or "").strip()
-    if not stripped.startswith("/"):
+    parsed = parse_steward_user_command(raw_text)
+    if not parsed.is_known:
         return None
-    head = stripped.split(None, 1)[0].lower()
-    command = head[1:].split("@", 1)[0]
-    spec = _COMMAND_BY_NAME.get(command)
+    spec = _COMMAND_BY_NAME.get(parsed.name)
     if spec is None or not spec.fallback_handler:
         return None
-    return command
+    return parsed.name
 
 
 def is_local_immediate_command(command: str | None) -> bool:
