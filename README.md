@@ -18,15 +18,54 @@ I am using it instead of CLI even on desktop.
 - keeps chat-to-session mappings between restarts;
 - optionally routes tasks and replies between sessions.
 
-## Sessions And Routing
+## Sessions And Networks
 
-Each chat, channel, DM, or topic can be connected to one local Codex session. By default, sessions are independent and behave like regular Codex coding agents.
+Each chat, channel, DM, or topic can be connected to one local Codex session. Sessions are independent by default and behave like regular coding agents. Assigning an address opts a session into an ORC network.
 
-Routing is opt-in and enabled by assigning an address:
-- Shaman mode uses explicit `FROM`/`TO` envelopes for incoming and outgoing routed messages. It is suitable for coordinators that know how the session network is organized.
-- Grunt mode keeps the coding agent unaware of the routing protocol. Orc Master delivers a plain task and returns the final reply to whoever sent it.
+### Routing Modes
 
-Routed messages are mirrored in the relevant chats so a human can follow and join the conversation. Approval requests can independently stay with the human or be delegated to another addressed session.
+- **Shaman** is a network-aware coordinator. Every inbound message has a strict `FROM`/`TO` envelope, and every final response must address either `human` or one other session.
+- **Grunt** is a network-unaware executor. It receives a plain task and returns its final response to the session or human that sent that task. A Grunt cannot choose another destination.
+
+ORC routes final responses only. Reasoning, commentary, status updates, approvals, and tool events remain in the session where they originated. Routed messages are mirrored in the sender and recipient access points so a human can follow the exchange and intervene in either chat.
+
+### Build A Network
+
+A minimal coordinator/worker network looks like this:
+
+```text
+human <-> Shaman lead <-> Grunt worker
+```
+
+1. Bind one Codex session in each access point.
+2. Before enabling routing, send the coordinator an adapted copy of [`prompts/shaman-network-prompt.md`](prompts/shaman-network-prompt.md). State that its address is `lead`, that `worker` is a known peer, and how work should be divided.
+3. In the coordinator access point, assign the Shaman address:
+
+   ```text
+   /shaman assign lead
+   ```
+
+4. In the worker access point, assign the Grunt address:
+
+   ```text
+   /grunt assign worker
+   ```
+
+5. Send a task to the coordinator. ORC wraps the human message for `lead`; the Shaman can answer with `TO: worker`; the Grunt receives only the task body; and ORC returns its final response to `lead` with a canonical envelope.
+
+ORC does not inject the network topology or role instructions into a Shaman. The explicit network prompt is what tells the coordinator which peers exist and how to use them. A Grunt needs no network prompt and never sees ORC routing metadata.
+
+Addresses are global, case-normalized, and unique. They must match `[a-z][a-z0-9_-]{0,63}`; `human` is reserved. Assigning the other routing mode atomically replaces the current mode and address. Address changes are allowed only while the affected session is idle.
+
+### Delegate Approvals
+
+Approval routing is independent of message routing. An addressed or addressless session can delegate unresolved approvals to another addressed session:
+
+```text
+/approver assign lead
+```
+
+Local regexp auto-approval is evaluated first. If it does not decide the request, ORC sends a typed approval request to `lead`; the target receives the exact response contract automatically. A session cannot approve itself, and approval cycles are rejected. Use `/approver clear` to return approval decisions to the human.
 
 ## Security And Network Model
 
