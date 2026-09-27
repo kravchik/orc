@@ -46,8 +46,6 @@ def execute_steward_actions(
     grunt_remove_provider: Callable[[], dict[str, Any]] | None = None,
     approval_target_assign_provider: Callable[[str], dict[str, Any]] | None = None,
     approval_target_show_provider: Callable[[], dict[str, Any]] | None = None,
-    approval_target_change_provider: Callable[[str], dict[str, Any]] | None = None,
-    approval_target_clear_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for raw in actions:
@@ -175,8 +173,6 @@ def execute_steward_actions(
         if action_type in {
             "APPROVAL_TARGET_ASSIGN",
             "APPROVAL_TARGET_SHOW",
-            "APPROVAL_TARGET_CHANGE",
-            "APPROVAL_TARGET_CLEAR",
         }:
             results.append(
                 execute_approval_target_action(
@@ -184,8 +180,6 @@ def execute_steward_actions(
                     access_point=start_agent_access_point,
                     assign_provider=approval_target_assign_provider,
                     show_provider=approval_target_show_provider,
-                    change_provider=approval_target_change_provider,
-                    clear_provider=approval_target_clear_provider,
                 )
             )
             continue
@@ -206,8 +200,6 @@ def execute_approval_target_action(
     access_point: dict[str, Any] | None = None,
     assign_provider: Callable[[str], dict[str, Any]] | None = None,
     show_provider: Callable[[], dict[str, Any]] | None = None,
-    change_provider: Callable[[str], dict[str, Any]] | None = None,
-    clear_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     action_type = str(action.get("type") or "").strip().upper()
     if action_type == "APPROVAL_TARGET_ASSIGN":
@@ -222,20 +214,6 @@ def execute_approval_target_action(
             action,
             action_type=action_type,
             provider=show_provider,
-            access_point=access_point,
-        )
-    if action_type == "APPROVAL_TARGET_CHANGE":
-        return _run_approval_target_with_value(
-            action,
-            action_type=action_type,
-            provider=change_provider,
-            access_point=access_point,
-        )
-    if action_type == "APPROVAL_TARGET_CLEAR":
-        return _run_address_without_value(
-            action,
-            action_type=action_type,
-            provider=clear_provider,
             access_point=access_point,
         )
     return {

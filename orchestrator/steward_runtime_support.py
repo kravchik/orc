@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 import time
 from typing import Any, Callable, Protocol
 
 from orchestrator.access_point_common import (
     AccessPointKey,
+    AccessPointMessageRef,
     access_point_sort_key,
 )
 from orchestrator.approval import ApprovalPolicy, ApprovalRequest
@@ -32,9 +34,15 @@ from orchestrator.interactive_driver_events import (
     RuntimeDriverFactory,
     StewardDriverFactory,
 )
+from orchestrator.local_command_journal import LocalCommandOutcome
 from orchestrator.processes import LifecycleLogger
-from orchestrator.steward_state import PersistedAccessPointState
-
+from orchestrator.interaction_queue import InteractionTickContext
+from orchestrator.steward_state import (
+    RUNTIME_INTENT_BOUND_IDLE,
+    RUNTIME_INTENT_RUNNING,
+    PersistedAccessPointState,
+    normalize_runtime_intent,
+)
 
 
 @dataclass
@@ -44,82 +52,117 @@ class StewardDriverEvent:
     event: Any
 
 
-@dataclass
-class RoutedHandoff:
-    sender_address: str
-    target_address: str
-    source_turn_id: str
-    target_turn_started: bool = False
+class AgentRuntimeStartDecision(StrEnum):
+    UNBOUND = "unbound"
+    DEFERRED = "deferred"
+    STARTING = "starting"
+    RUNNING = "running"
+    EXPLICITLY_STOPPED = "explicitly_stopped"
 
 
-@dataclass(frozen=True)
-class RoutedReplyTo:
-    access_point: AccessPointKey
-    address: str
-
-
-@dataclass(frozen=True)
-class RoutingFailure:
-    code: str
-    details: str
-    target_state: str
+class InterruptNoticeRuntime(Protocol):
+    def interrupt_queue_initial(self, notice: PendingInterruptRequest) -> int | None: ...
+    def interrupt_supersede(self, notice: PendingInterruptRequest) -> bool: ...
+    def interrupt_queue_edit(self, notice: PendingInterruptRequest, text: str) -> None: ...
+    def interrupt_log_final_sent(self, notice: PendingInterruptRequest) -> None: ...
+    def interrupt_log_failure(self, notice: PendingInterruptRequest, exc: Exception, *, phase: str) -> None: ...
+    def interrupt_complete(self, notice: PendingInterruptRequest, *, user_delivery: str) -> None: ...
 
 
 @dataclass
-class PendingRoutedRequest:
-    sequence: int
-    sender_access_point: AccessPointKey
-    sender_address: str
-    sender_mode: str
-    target_access_point: AccessPointKey
-    target_address: str
-    target_mode: str
-    target_input: str
-    output_kind: Any
-    source_turn_id: str
-    repair_attempt: int
-    routed_reply_to: RoutedReplyTo | None = None
-    deferred_notice_sent: bool = False
-    last_deferred_reason: str = ""
-    failure: RoutingFailure | None = None
-
-
-@dataclass
-class RoutingResponseState:
-    sender_address: str = ""
-    target_address: str = ""
-    turn_id: str = ""
-    repair_attempt: int = 0
-
-
-@dataclass
-class PendingStewardOperation:
+class PendingInterruptRequest:
     access_point: AccessPointKey
     source: str
-    output_kind: Any
-    phase: str = "initial"
-    fallback_reply: str = ""
-    allow_steer: bool = False
-    routing: RoutingResponseState = field(default_factory=RoutingResponseState)
-    routed_handoff: RoutedHandoff | None = None
-    routed_reply_to: RoutedReplyTo | None = None
-    pending_action_results: list[dict[str, Any]] | None = None
-    action_round: int = 0
-    action_limit: int = 4
-    last_action_fingerprint: str = ""
-    action_progress: list[dict[str, Any]] = field(default_factory=list)
-    action_terminal_reason: str = ""
+    ack_message_ref: AccessPointMessageRef | None = None
+    final_text: str | None = None
+    outcome: LocalCommandOutcome | None = None
+    delivery_failed: bool = False
+    queue_token: int | None = None
+    final_sent_as_initial: bool = False
+    superseded_text: str | None = None
+    edit_text: str | None = None
+    orphan: bool = False
+    finished: bool = False
 
+    def begin(self, runtime: InterruptNoticeRuntime) -> None:
+        self.queue_token = runtime.interrupt_queue_initial(self)
 
-@dataclass
-class PendingApprovalDelegation:
-    approval_id: str
-    source_access_point: AccessPointKey
-    target_access_point: AccessPointKey
-    source_address: str
-    target_address: str
-    request: ApprovalRequest
-    source_cancelled: bool = False
+    def set_result(self, runtime: InterruptNoticeRuntime, *, text: str, outcome: LocalCommandOutcome) -> None:
+        if self.finished:
+            return
+        self.final_text = text
+        self.outcome = outcome
+        self._advance(runtime)
+
+    def suppress_reply(self, runtime: InterruptNoticeRuntime, *, text: str) -> None:
+        if not self.finished and self.final_text is None:
+            self.final_text = text
+            self._advance(runtime)
+
+    def notice_sent(self, runtime: InterruptNoticeRuntime, message_ref: AccessPointMessageRef) -> None:
+        if self.finished:
+            return
+        self.ack_message_ref = message_ref
+        self._advance(runtime)
+
+    def notice_failed(self, runtime: InterruptNoticeRuntime, exc: Exception) -> None:
+        if self.finished:
+            return
+        runtime.interrupt_log_failure(self, exc, phase="send")
+        self.delivery_failed = True
+        self._advance(runtime)
+
+    def notice_edited(self, runtime: InterruptNoticeRuntime, text: str) -> None:
+        if self.finished:
+            return
+        self.edit_text = None
+        if text == self.final_text:
+            self._complete(runtime, user_delivery="sent")
+        else:
+            self._advance(runtime)
+
+    def edit_failed(self, runtime: InterruptNoticeRuntime, exc: Exception, text: str) -> None:
+        if self.finished:
+            return
+        self.edit_text = None
+        if text == self.final_text:
+            runtime.interrupt_log_failure(self, exc, phase="edit")
+            self._complete(runtime, user_delivery="failed")
+        else:
+            self._advance(runtime)
+
+    def _advance(self, runtime: InterruptNoticeRuntime) -> None:
+        if self.finished or self.final_text is None or self.outcome is None:
+            return
+        if self.delivery_failed:
+            self._complete(runtime, user_delivery="failed")
+            return
+        if self.ack_message_ref is None:
+            if isinstance(self.queue_token, int) and self.superseded_text != self.final_text:
+                if runtime.interrupt_supersede(self):
+                    self.final_sent_as_initial = True
+                    self.superseded_text = self.final_text
+            return
+        if self.final_sent_as_initial and self.superseded_text == self.final_text:
+            runtime.interrupt_log_final_sent(self)
+            self._complete(runtime, user_delivery="sent")
+            return
+        if self.edit_text is None:
+            self.edit_text = self.final_text
+            runtime.interrupt_queue_edit(self, self.edit_text)
+
+    def _complete(self, runtime: InterruptNoticeRuntime, *, user_delivery: str) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        runtime.interrupt_complete(self, user_delivery=user_delivery)
+
+    def tick(self, context: InteractionTickContext) -> str | None:
+        return "completed" if self.finished else None
+
+    def on_completed(self, context: InteractionTickContext, outcome: str) -> None:
+        if outcome != "completed":
+            raise AssertionError(f"unexpected interrupt notice outcome: {outcome}")
 
 
 @dataclass
@@ -136,10 +179,11 @@ class StewardDeliveryLane(Protocol):
         text: str,
         *,
         context_note: str | None = None,
+        as_steer: bool = False,
     ) -> None: ...
     def poll_once(self) -> list[StewardDriverEvent]: ...
     def consume_poll_progress(self) -> bool: ...
-    def submit_approval_decision(self, access_point: AccessPointKey, decision: str) -> None: ...
+    def submit_approval_decision(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None: ...
     def show_running(self, access_point: AccessPointKey) -> list[dict[str, Any]]: ...
     def get_item_status_snapshot(self, access_point: AccessPointKey) -> list[dict[str, str]]: ...
     def get_item_status_snapshot_for_turn(self, access_point: AccessPointKey, turn_id: str) -> list[dict[str, str]]: ...
@@ -153,11 +197,12 @@ class StewardDeliveryLane(Protocol):
 
 
 class AgentDeliveryLane(StewardDeliveryLane, Protocol):
-    def submit_approval_decision_now(self, access_point: AccessPointKey, decision: str) -> None: ...
+    def submit_approval_decision_now(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None: ...
     def start_agent(self, access_point: AccessPointKey, spec: dict[str, Any]) -> dict[str, Any]: ...
     def is_bound(self, access_point: AccessPointKey) -> bool: ...
     def has_binding(self, access_point: AccessPointKey) -> bool: ...
     def runtime_state(self, access_point: AccessPointKey) -> str: ...
+    def start_decision(self, access_point: AccessPointKey) -> AgentRuntimeStartDecision: ...
     def get_binding_info(self, access_point: AccessPointKey) -> dict[str, str] | None: ...
     def assign_address(
         self,
@@ -195,8 +240,6 @@ class AgentDeliveryLane(StewardDeliveryLane, Protocol):
     def approval_target(self, access_point: AccessPointKey) -> str: ...
     def assign_approval_target(self, access_point: AccessPointKey, target: str) -> dict[str, str]: ...
     def show_approval_target(self, access_point: AccessPointKey) -> dict[str, str]: ...
-    def change_approval_target(self, access_point: AccessPointKey, target: str) -> dict[str, str]: ...
-    def clear_approval_target(self, access_point: AccessPointKey) -> dict[str, str]: ...
     def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]: ...
     def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]: ...
     def stop_agent(self, access_point: AccessPointKey) -> bool: ...
@@ -208,6 +251,7 @@ class AgentDeliveryLane(StewardDeliveryLane, Protocol):
         spec: dict[str, Any],
         agent_id: str = "",
         thread_id: str = "",
+        runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE,
     ) -> dict[str, str]: ...
     def snapshot_persisted(self) -> dict[AccessPointKey, PersistedAccessPointState]: ...
 
@@ -253,6 +297,7 @@ class InteractiveStewardRuntime:
         text: str,
         *,
         context_note: str | None = None,
+        as_steer: bool = False,
     ) -> None:
         handle = self._ensure_handle(access_point)
         request_text = str(text)
@@ -287,6 +332,7 @@ class InteractiveStewardRuntime:
                 chat_id=access_point.chat_id,
                 thread_id=access_point.thread_id,
                 prompt=request_text,
+                as_steer=as_steer,
             )
         )
         if prepend_prompt:
@@ -328,6 +374,8 @@ class InteractiveStewardRuntime:
                 "agent_id": handle.node_id,
                 "state": state,
                 "controllable": False,
+                "configured_model": "",
+                "effective_model": handle.driver.get_actual_thread_model(),
             }
         ]
 
@@ -379,7 +427,7 @@ class InteractiveStewardRuntime:
         raw = getter() if callable(getter) else {}
         return dict(raw) if isinstance(raw, dict) else {}
 
-    def submit_approval_decision(self, access_point: AccessPointKey, decision: str) -> None:
+    def submit_approval_decision(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None:
         handle = self._handles.get(access_point)
         if handle is None:
             raise RuntimeError("no running steward node for this access point")
@@ -391,7 +439,7 @@ class InteractiveStewardRuntime:
             node_id=handle.node_id,
             decision=decision,
         )
-        handle.driver.submit_approval_decision(decision)
+        handle.driver.submit_approval_decision(decision, expected_request=expected_request)
 
     def reset(self, access_point: AccessPointKey) -> bool:
         handle = self._handles.pop(access_point, None)
@@ -457,6 +505,7 @@ class _InteractiveAgentBinding:
     thread_id: str
     requested_thread_id: str
     driver: InteractiveCodexDriver | None
+    runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE
     thread_name: str = ""
     approval_target: str = HUMAN_APPROVAL_TARGET
     effective_model: str = ""
@@ -515,6 +564,9 @@ class InteractiveAgentRuntime:
         resolved_spec["cwd"] = str(resolved_spec.get("cwd") or "")
         resolved_spec["model"] = str(resolved_spec.get("model") or "")
         resolved_spec["mode"] = str(resolved_spec.get("mode") or "proxy")
+        resolved_spec["approval_target"] = normalize_approval_target(
+            resolved_spec.get("approval_target") or HUMAN_APPROVAL_TARGET
+        )
         if "thread_id" in resolved_spec and resolved_spec.get("thread_id") is None:
             resolved_spec.pop("thread_id", None)
         return resolved_spec
@@ -541,6 +593,7 @@ class InteractiveAgentRuntime:
             thread_id=str(resolved_spec.get("thread_id") or ""),
             requested_thread_id=str(resolved_spec.get("thread_id") or ""),
             driver=self._build_driver(access_point=access_point, spec=resolved_spec),
+            runtime_intent=RUNTIME_INTENT_RUNNING,
             thread_name=str(resolved_spec.get("thread_name") or "").strip(),
             approval_target=str(resolved_spec.get("approval_target") or HUMAN_APPROVAL_TARGET),
             state="STARTING",
@@ -557,7 +610,9 @@ class InteractiveAgentRuntime:
             if existing is None:
                 binding.driver = None
                 binding.state = "BOUND_IDLE"
+                binding.runtime_intent = RUNTIME_INTENT_BOUND_IDLE
             else:
+                existing.runtime_intent = RUNTIME_INTENT_BOUND_IDLE
                 self._binding_by_access_point[access_point] = existing
             try:
                 driver.stop()
@@ -601,6 +656,18 @@ class InteractiveAgentRuntime:
         if binding is None:
             return "UNBOUND"
         return binding.state
+
+    def start_decision(self, access_point: AccessPointKey) -> AgentRuntimeStartDecision:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None:
+            return AgentRuntimeStartDecision.UNBOUND
+        if binding.state == "STARTING":
+            return AgentRuntimeStartDecision.STARTING
+        if binding.state == "RUNNING":
+            return AgentRuntimeStartDecision.RUNNING
+        if binding.runtime_intent == RUNTIME_INTENT_RUNNING:
+            return AgentRuntimeStartDecision.DEFERRED
+        return AgentRuntimeStartDecision.EXPLICITLY_STOPPED
 
     def get_binding_info(self, access_point: AccessPointKey) -> dict[str, str] | None:
         binding = self._binding_by_access_point.get(access_point)
@@ -725,49 +792,39 @@ class InteractiveAgentRuntime:
         updated = 0
         for binding in self._binding_by_access_point.values():
             if binding.approval_target == previous:
-                binding.approval_target = address
+                self._set_binding_approval_target(binding, address)
                 updated += 1
         return updated
 
+    @staticmethod
+    def _set_binding_approval_target(
+        binding: _InteractiveAgentBinding,
+        target: str,
+    ) -> None:
+        approval_target = normalize_approval_target(target)
+        binding.approval_target = approval_target
+        binding.spec["approval_target"] = approval_target
+
     def assign_approval_target(self, access_point: AccessPointKey, target: str) -> dict[str, str]:
         binding = self._require_approval_target_binding(access_point)
-        if binding.approval_target != HUMAN_APPROVAL_TARGET:
-            raise ValueError(f"approval target is already assigned: {binding.approval_target}")
-        if str(target).strip().lower() == HUMAN_APPROVAL_TARGET:
-            raise ValueError("approval target must be an agent address; human is already the default")
-        binding.approval_target = self._validate_approval_target(access_point, target)
-        self._log_address_event("approval_target_assigned", access_point, approval_target=binding.approval_target)
-        return {"approval_target": binding.approval_target}
+        previous = binding.approval_target
+        approval_target = self._validate_approval_target(access_point, target)
+        self._set_binding_approval_target(binding, approval_target)
+        self._log_address_event(
+            "approval_target_assigned",
+            access_point,
+            previous_approval_target=previous,
+            approval_target=approval_target,
+        )
+        result: dict[str, str] = {}
+        if previous != HUMAN_APPROVAL_TARGET:
+            result["previous_approval_target"] = previous
+        result["approval_target"] = approval_target
+        return result
 
     def show_approval_target(self, access_point: AccessPointKey) -> dict[str, str]:
-        binding = self._require_approval_target_binding(access_point, require_idle=False)
+        binding = self._require_approval_target_binding(access_point)
         return {"approval_target": binding.approval_target}
-
-    def change_approval_target(self, access_point: AccessPointKey, target: str) -> dict[str, str]:
-        binding = self._require_approval_target_binding(access_point)
-        if binding.approval_target == HUMAN_APPROVAL_TARGET:
-            raise ValueError("approval target is human; use assign")
-        previous = binding.approval_target
-        binding.approval_target = self._validate_approval_target(access_point, target)
-        self._log_address_event(
-            "approval_target_changed",
-            access_point,
-            previous_approval_target=previous,
-            approval_target=binding.approval_target,
-        )
-        return {"previous_approval_target": previous, "approval_target": binding.approval_target}
-
-    def clear_approval_target(self, access_point: AccessPointKey) -> dict[str, str]:
-        binding = self._require_approval_target_binding(access_point)
-        previous = binding.approval_target
-        binding.approval_target = HUMAN_APPROVAL_TARGET
-        self._log_address_event(
-            "approval_target_cleared",
-            access_point,
-            previous_approval_target=previous,
-            approval_target=HUMAN_APPROVAL_TARGET,
-        )
-        return {"previous_approval_target": previous, "approval_target": HUMAN_APPROVAL_TARGET}
 
     def approval_target(self, access_point: AccessPointKey) -> str:
         binding = self._binding_by_access_point.get(access_point)
@@ -778,14 +835,10 @@ class InteractiveAgentRuntime:
     def _require_approval_target_binding(
         self,
         access_point: AccessPointKey,
-        *,
-        require_idle: bool = True,
     ) -> _InteractiveAgentBinding:
         binding = self._binding_by_access_point.get(access_point)
         if binding is None:
             raise RuntimeError("no bound agent for this access point")
-        if require_idle and self.has_active_turn(access_point):
-            raise RuntimeError("cannot change approval target during active turn")
         return binding
 
     def _validate_approval_target(self, access_point: AccessPointKey, target: str) -> str:
@@ -838,6 +891,7 @@ class InteractiveAgentRuntime:
         if binding is None:
             return False
         if binding.driver is None:
+            binding.runtime_intent = RUNTIME_INTENT_BOUND_IDLE
             return True
         self._transition_to_bound_idle(
             access_point=access_point,
@@ -886,6 +940,7 @@ class InteractiveAgentRuntime:
         spec: dict[str, Any],
         agent_id: str = "",
         thread_id: str = "",
+        runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE,
     ) -> dict[str, str]:
         resolved_spec = self._normalize_spec(spec)
         restored_address = str(resolved_spec.pop("address", "") or "").strip()
@@ -908,6 +963,7 @@ class InteractiveAgentRuntime:
             thread_id=str(resolved_spec.get("thread_id") or ""),
             requested_thread_id=str(resolved_spec.get("thread_id") or ""),
             driver=None,
+            runtime_intent=normalize_runtime_intent(runtime_intent),
             thread_name=str(resolved_spec.get("thread_name") or "").strip(),
             approval_target=str(resolved_spec.get("approval_target") or HUMAN_APPROVAL_TARGET),
         )
@@ -944,6 +1000,7 @@ class InteractiveAgentRuntime:
             identity = self._address_registry.identity(access_point)
             snapshot[access_point] = PersistedAccessPointState(
                 project_cwd=binding.cwd,
+                runtime_intent=binding.runtime_intent,
                 address=identity.address if identity is not None else "",
                 routing_mode=identity.mode if identity is not None else "",
                 approval_target=binding.approval_target,
@@ -987,6 +1044,7 @@ class InteractiveAgentRuntime:
         text: str,
         *,
         context_note: str | None = None,
+        as_steer: bool = False,
     ) -> None:
         binding = self._binding_by_access_point.get(access_point)
         if binding is None or binding.driver is None:
@@ -1008,11 +1066,12 @@ class InteractiveAgentRuntime:
                 chat_id=access_point.chat_id,
                 thread_id=access_point.thread_id,
                 prompt=str(text),
+                as_steer=as_steer,
             )
         )
         binding.pending_request_sequences.append(request_sequence)
 
-    def submit_approval_decision(self, access_point: AccessPointKey, decision: str) -> None:
+    def submit_approval_decision(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None:
         binding = self._binding_by_access_point.get(access_point)
         if binding is None or binding.driver is None:
             raise RuntimeError("no running agent is bound to this access point")
@@ -1025,9 +1084,9 @@ class InteractiveAgentRuntime:
             runtime_thread_id=binding.thread_id,
             decision=decision,
         )
-        binding.driver.submit_approval_decision(decision)
+        binding.driver.submit_approval_decision(decision, expected_request=expected_request)
 
-    def submit_approval_decision_now(self, access_point: AccessPointKey, decision: str) -> None:
+    def submit_approval_decision_now(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None:
         binding = self._binding_by_access_point.get(access_point)
         if binding is None or binding.driver is None:
             raise RuntimeError("no running agent is bound to this access point")
@@ -1042,9 +1101,9 @@ class InteractiveAgentRuntime:
         )
         submit_now = getattr(binding.driver, "submit_approval_decision_now", None)
         if callable(submit_now):
-            submit_now(decision)
+            submit_now(decision, expected_request=expected_request)
             return
-        binding.driver.submit_approval_decision(decision)
+        binding.driver.submit_approval_decision(decision, expected_request=expected_request)
 
     def poll_once(self) -> list[StewardDriverEvent]:
         self._poll_progressed = False
@@ -1150,6 +1209,7 @@ class InteractiveAgentRuntime:
                     binding.spec["thread_id"] = actual_thread_id
                     persisted_metadata_changed = True
                 binding.state = "RUNNING"
+                binding.runtime_intent = RUNTIME_INTENT_RUNNING
                 binding.startup_started_at = None
                 binding.startup_deadline = None
                 binding.rollback_binding = None
@@ -1357,6 +1417,7 @@ class InteractiveAgentRuntime:
             binding.startup_deadline = None
             binding.rollback_binding = None
             idle_binding = binding
+        idle_binding.runtime_intent = RUNTIME_INTENT_BOUND_IDLE
         cleanup_error = ""
         try:
             driver.stop()
@@ -1527,7 +1588,7 @@ class StewardTickLoop:
         *,
         request_timeout_sec: float,
         drain_driver_events: Callable[[], bool],
-        drain_routing_queue: Callable[[], bool],
+        tick_interactions: Callable[[], bool],
         flush_due_status_runtimes: Callable[[], bool],
         consume_transport: Callable[[], bool],
         drain_pending_inputs: Callable[[], bool],
@@ -1535,10 +1596,11 @@ class StewardTickLoop:
         consume_control_events: Callable[[], bool] | None = None,
         drain_sleep_sec: float = 0.02,
         sleep_fn: Callable[[float], None] = time.sleep,
+        wall_monotonic_now: Callable[[], float] = time.monotonic,
     ) -> None:
         self._request_timeout_sec = request_timeout_sec
         self._drain_driver_events = drain_driver_events
-        self._drain_routing_queue = drain_routing_queue
+        self._tick_interactions = tick_interactions
         self._flush_due_status_runtimes = flush_due_status_runtimes
         self._consume_transport = consume_transport
         self._drain_pending_inputs = drain_pending_inputs
@@ -1546,6 +1608,7 @@ class StewardTickLoop:
         self._consume_control_events = consume_control_events or (lambda: False)
         self._drain_sleep_sec = drain_sleep_sec
         self._sleep_fn = sleep_fn
+        self._wall_monotonic_now = wall_monotonic_now
 
     def tick_once(self) -> bool:
         return self._run_phases(
@@ -1553,7 +1616,7 @@ class StewardTickLoop:
                 self._consume_control_events,
                 self._flush_due_status_runtimes,
                 self._drain_driver_events,
-                self._drain_routing_queue,
+                self._tick_interactions,
                 self._flush_due_status_runtimes,
                 self._consume_transport,
                 self._drain_pending_inputs,
@@ -1567,7 +1630,7 @@ class StewardTickLoop:
                 self._consume_control_events,
                 self._flush_due_status_runtimes,
                 self._drain_driver_events,
-                self._drain_routing_queue,
+                self._tick_interactions,
                 self._flush_due_status_runtimes,
                 self._drain_pending_inputs,
                 self._flush_due_status_runtimes,
@@ -1582,8 +1645,13 @@ class StewardTickLoop:
         return progressed
 
     def drain_until_idle(self, *, consume_transport: bool = True) -> int:
-        idle_deadline = clock.monotonic() + max(0.5, float(self._request_timeout_sec) + 0.5)
-        while clock.monotonic() < idle_deadline:
+        idle_timeout_sec = max(0.5, float(self._request_timeout_sec) + 0.5)
+        idle_deadline = clock.monotonic() + idle_timeout_sec
+        wall_idle_deadline = self._wall_monotonic_now() + idle_timeout_sec
+        while (
+            clock.monotonic() < idle_deadline
+            and self._wall_monotonic_now() < wall_idle_deadline
+        ):
             try:
                 progressed = self.tick_once() if consume_transport else self.tick_without_transport()
             except StopStewardLoop as stop:
@@ -1591,6 +1659,7 @@ class StewardTickLoop:
             if self._is_idle() and not progressed:
                 return 0
             if progressed:
-                idle_deadline = clock.monotonic() + max(0.5, float(self._request_timeout_sec) + 0.5)
+                idle_deadline = clock.monotonic() + idle_timeout_sec
+                wall_idle_deadline = self._wall_monotonic_now() + idle_timeout_sec
             self._sleep_fn(self._drain_sleep_sec)
         return 0

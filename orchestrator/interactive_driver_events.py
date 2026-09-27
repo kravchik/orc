@@ -22,6 +22,7 @@ class InteractiveAgentRequest:
     chat_id: AccessPointId
     thread_id: AccessPointId | None
     prompt: str
+    as_steer: bool = False
 
     @property
     def access_point(self) -> tuple[AccessPointId, AccessPointId | None]:
@@ -34,6 +35,22 @@ class InteractiveAgentResult:
     thread_id: AccessPointId | None
     prompt: str
     reply: str
+    turn_id: str = ""
+
+
+@dataclass
+class InteractiveSteerFallbackActivated:
+    chat_id: AccessPointId
+    thread_id: AccessPointId | None
+    prompt: str
+    turn_id: str = ""
+
+
+@dataclass
+class InteractiveSteerSubmitted:
+    chat_id: AccessPointId
+    thread_id: AccessPointId | None
+    prompt: str
     turn_id: str = ""
 
 
@@ -106,8 +123,8 @@ class InteractiveCodexDriver(Protocol):
     def start(self) -> None: ...
     def stop(self) -> None: ...
     def submit_request(self, request: InteractivePrompt) -> None: ...
-    def submit_approval_decision(self, decision: str) -> None: ...
-    def submit_approval_decision_now(self, decision: str) -> None: ...
+    def submit_approval_decision(self, decision: str, *, expected_request: ApprovalRequest | None = None) -> None: ...
+    def submit_approval_decision_now(self, decision: str, *, expected_request: ApprovalRequest | None = None) -> None: ...
     def poll_once(self) -> list[Any]: ...
     def consume_poll_progress(self) -> bool: ...
     def is_ready(self) -> bool: ...

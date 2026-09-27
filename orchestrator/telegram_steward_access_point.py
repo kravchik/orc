@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 from typing import Any, Callable
 
 from orchestrator import clock
@@ -12,12 +11,21 @@ from orchestrator.access_point_common import (
     ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_NOTICE,
     ACCESS_POINT_OUTBOUND_CLASS_CALLBACK_ACK,
     ACCESS_POINT_OUTBOUND_CLASS_EDIT,
+    ACCESS_POINT_OUTBOUND_CLASS_LIFECYCLE_UPDATE,
     ACCESS_POINT_OUTBOUND_CLASS_SEND,
     AccessPointKey,
-    AccessPointDeliveryReceipt,
+    AccessPointMessageRef,
     AccessPointDeliveryState,
+    AccessPointOutboundQueue,
+    AccessPointRetryPolicy,
     QueuedAccessPointOutbound,
-    access_point_outbound_sort_key,
+    access_point_delivery_log_fields,
+    decide_access_point_outbound_failure,
+    expire_access_point_outbounds,
+    format_access_point,
+    log_abandoned_access_point_outbounds,
+    select_access_point_outbound,
+    wake_durable_access_point_outbounds,
 )
 from orchestrator.approval_details_formatter import (
     approval_source_icon,
@@ -39,9 +47,8 @@ from orchestrator.telegram_output_runtime import (
     TelegramDueStatusCandidate,
     TelegramKind,
     TelegramOutputRuntime,
-    TelegramQueuedStatusDelete,
 )
-from orchestrator.steward_commands import build_steward_help_text
+from orchestrator.steward_commands import StewardHelpContext, build_steward_help_text
 from orchestrator.telegram_status import TelegramStatusConfig
 from orchestrator.turn_status_store import TurnStatusStore
 from orchestrator.telegram_bridge import TelegramCallbackUpdate, TelegramTextUpdate
@@ -53,7 +60,7 @@ class PendingTelegramStewardApproval:
     source: str
     request: ApprovalRequest
     prompt_state: AccessPointDeliveryState
-    prompt_receipt_id: int | None
+    prompt_queue_token: int | None
     prompt_message_id: int | None
 
 
@@ -104,11 +111,7 @@ class TelegramStewardAccessPointAdapter:
             monotonic_now=status_monotonic_now or clock.monotonic,
             cooldown_sec=2.0,
         )
-        self._outbound_queue: list[QueuedAccessPointOutbound[_TelegramOutboundExecutionResult]] = []
-        self._next_outbound_receipt_id = 1
-        self._next_outbound_sequence = 1
-        self._queued_status_keys: set[tuple[Any, ...]] = set()
-        self._receipts: dict[int, AccessPointDeliveryReceipt] = {}
+        self._outbound = AccessPointOutboundQueue[_TelegramOutboundExecutionResult]()
         self._approval_prompt_failure_handler: Callable[[AccessPointKey, Exception], None] | None = None
         self._steward_status_runtime_by_access_point: dict[
             AccessPointKey,
@@ -162,19 +165,25 @@ class TelegramStewardAccessPointAdapter:
         return pair
 
     def clear_status_runtimes(self, *, access_point: AccessPointKey, include_steward: bool = False) -> None:
+        sources = {"agent", "steward"} if include_steward else {"agent"}
+        removed = self._drop_queued_status_updates(
+            access_point=access_point,
+            sources=sources,
+        )
         runtime_entry = self._agent_status_runtime_by_access_point.get(access_point)
         if runtime_entry is not None:
-            runtime_output, runtime_store = runtime_entry
-            for delete in runtime_output.take_clear_deletes():
-                self._enqueue_status_delete(delete)
-            runtime_store.clear(clear_output=False)
+            _runtime_output, runtime_store = runtime_entry
+            runtime_store.clear()
         if include_steward:
             steward_entry = self._steward_status_runtime_by_access_point.get(access_point)
             if steward_entry is not None:
-                steward_output, steward_store = steward_entry
-                for delete in steward_output.take_clear_deletes():
-                    self._enqueue_status_delete(delete)
-                steward_store.clear(clear_output=False)
+                _steward_output, steward_store = steward_entry
+                steward_store.clear()
+        if removed > 0:
+            self._log_pending_status_updates_dropped(
+                access_point=access_point,
+                removed=removed,
+            )
 
     def drop_pending_status_updates(
         self,
@@ -182,73 +191,75 @@ class TelegramStewardAccessPointAdapter:
         access_point: AccessPointKey,
         include_steward: bool = False,
     ) -> None:
-        status_keys: set[str] = set()
+        sources = {"agent", "steward"} if include_steward else {"agent"}
         runtime_entry = self._agent_status_runtime_by_access_point.get(access_point)
         if runtime_entry is not None:
             runtime_output, _runtime_store = runtime_entry
             runtime_output.discard_pending_status_updates()
-            status_keys.update(runtime_output.status_keys())
         if include_steward:
             steward_entry = self._steward_status_runtime_by_access_point.get(access_point)
             if steward_entry is not None:
                 steward_output, _steward_store = steward_entry
                 steward_output.discard_pending_status_updates()
-                status_keys.update(steward_output.status_keys())
-        if not status_keys:
-            return
-        stale_keys = {("status", key) for key in status_keys}
-        if not stale_keys:
-            return
-        before = len(self._outbound_queue)
-        self._outbound_queue = [
-            item for item in self._outbound_queue if item.coalesce_key not in stale_keys
-        ]
-        for key in stale_keys:
-            self._queued_status_keys.discard(key)
-        removed = before - len(self._outbound_queue)
+        removed = self._drop_queued_status_updates(
+            access_point=access_point,
+            sources=sources,
+        )
         if removed > 0:
-            self._logger.event(
-                "telegram_pending_status_updates_dropped",
-                source="telegram_steward",
-                chat_id=access_point.chat_id,
-                thread_id=access_point.thread_id,
-                removed=removed,
-            )
+            self._log_pending_status_updates_dropped(access_point=access_point, removed=removed)
 
     def flush_due_status_runtimes(self) -> bool:
-        candidates: list[tuple[AccessPointKey, TelegramOutputRuntime, TelegramDueStatusCandidate]] = []
+        candidates: list[
+            tuple[AccessPointKey, str, TelegramOutputRuntime, TelegramDueStatusCandidate]
+        ] = []
         for access_point, (output_runtime, _status_store) in self._steward_status_runtime_by_access_point.items():
             candidate = output_runtime.peek_due_status_candidate()
             if candidate is not None:
-                candidates.append((access_point, output_runtime, candidate))
+                candidates.append((access_point, "steward", output_runtime, candidate))
         for access_point, (output_runtime, _status_store) in self._agent_status_runtime_by_access_point.items():
             candidate = output_runtime.peek_due_status_candidate()
             if candidate is not None:
-                candidates.append((access_point, output_runtime, candidate))
+                candidates.append((access_point, "agent", output_runtime, candidate))
         if candidates:
-            selected_access_point, selected_runtime, selected_candidate = min(
+            selected_access_point, selected_source, selected_runtime, selected_candidate = min(
                 candidates,
                 key=lambda pair: (
-                    float("-inf") if pair[2].last_flush_ts is None else float(pair[2].last_flush_ts),
-                    pair[2].status_key,
+                    float("-inf") if pair[3].last_flush_ts is None else float(pair[3].last_flush_ts),
+                    pair[3].status_key,
                 ),
             )
             self._enqueue_status_flush(
                 access_point=selected_access_point,
+                source=selected_source,
                 output_runtime=selected_runtime,
                 candidate=selected_candidate,
             )
         return self._drain_outbound_queue()
 
     def has_pending_outbound(self) -> bool:
-        return bool(self._outbound_queue)
+        return bool(self._outbound)
 
-    def split_status_after_approval(self, access_point: AccessPointKey) -> None:
+    def log_delivery_handles_closed(self) -> None:
+        log_abandoned_access_point_outbounds(
+            self._outbound,
+            logger=self._logger,
+            source="telegram_steward",
+            access_point_type="telegram",
+        )
+        self._logger.event(
+            "telegram_delivery_handles_closed",
+            source="telegram_steward",
+            live_delivery_handles=self._outbound.count,
+            peak_live_delivery_handles=self._outbound.peak_count,
+        )
+
+    def split_status(self, access_point: AccessPointKey) -> None:
         steward_entry = self._steward_status_runtime_by_access_point.get(access_point)
         if steward_entry is not None:
             steward_output, steward_store = steward_entry
             self._enqueue_current_turn_status_flush(
                 access_point=access_point,
+                source="steward",
                 output_runtime=steward_output,
                 status_store=steward_store,
             )
@@ -258,13 +269,14 @@ class TelegramStewardAccessPointAdapter:
             agent_output, agent_store = agent_entry
             self._enqueue_current_turn_status_flush(
                 access_point=access_point,
+                source="agent",
                 output_runtime=agent_output,
                 status_store=agent_store,
             )
             agent_store.split_current_turn()
 
-    def build_help_text(self, *, state: str) -> str:
-        return build_steward_help_text(state=state)
+    def build_help_text(self, *, state: str, startup: StewardHelpContext) -> str:
+        return build_steward_help_text(state=state, startup=startup)
 
     def build_status_text(
         self,
@@ -274,10 +286,7 @@ class TelegramStewardAccessPointAdapter:
         access_point = snapshot.access_point
         return format_status_text(
             snapshot,
-            access_point_line=(
-                f"access_point: {access_point.type} chat_id={access_point.chat_id} "
-                f"thread_id={access_point.thread_id if access_point.thread_id is not None else 'main'}"
-            ),
+            access_point_line=f"access_point: {format_access_point(access_point)}",
         )
 
     def register_approval(
@@ -307,10 +316,10 @@ class TelegramStewardAccessPointAdapter:
             source=source,
             request=request,
             prompt_state=AccessPointDeliveryState.PENDING,
-            prompt_receipt_id=None,
+            prompt_queue_token=None,
             prompt_message_id=None,
         )
-        pending.prompt_receipt_id = self._enqueue_send_text(
+        pending.prompt_queue_token = self._enqueue_send_text(
             output_runtime=output_runtime,
             text=_format_steward_approval_prompt(request),
             kind=TelegramKind.APPROVAL_PROMPT,
@@ -479,18 +488,21 @@ class TelegramStewardAccessPointAdapter:
         )
 
     def cancel_pending_approval_prompt(self, pending_approval: PendingTelegramStewardApproval) -> None:
-        receipt_id = pending_approval.prompt_receipt_id
-        if not isinstance(receipt_id, int):
+        queue_token = pending_approval.prompt_queue_token
+        if not isinstance(queue_token, int):
             return
-        for item in list(self._outbound_queue):
-            if item.receipt_id != receipt_id:
-                continue
-            self._finish_outbound_item(item)
-            pending_approval.prompt_receipt_id = None
+        item = self._outbound.find(queue_token)
+        if item is not None:
+            self._logger.event(
+                "access_point_delivery_cancelled",
+                source="telegram_steward",
+                **access_point_delivery_log_fields(item),
+                attempts=item.attempt_count,
+                cancellation_reason="approval_no_longer_pending",
+            )
+            self._outbound.cancel(item)
+            pending_approval.prompt_queue_token = None
             pending_approval.prompt_state = AccessPointDeliveryState.CANCELLED
-            receipt = self._receipts.get(receipt_id)
-            if receipt is not None:
-                receipt.mark_cancelled()
             self._logger.event(
                 "telegram_approval_prompt_cancelled",
                 chat_id=pending_approval.access_point.chat_id,
@@ -550,50 +562,114 @@ class TelegramStewardAccessPointAdapter:
         text: str,
         source: str,
         kind: TelegramKind,
-        on_sent: Callable[[int | None], None],
+        on_sent: Callable[[AccessPointMessageRef], None],
         on_failed: Callable[[Exception], None],
-    ) -> None:
+    ) -> int:
         output_runtime, _status_store = self.status_runtime_for(
             access_point=access_point,
             source="agent" if source == "agent" else "steward",
         )
-        self._enqueue_send_text(
+        return self._enqueue_send_text(
             output_runtime=output_runtime,
             text=self._decorate_reply(text=text, source=source),
             kind=kind,
             chat_id=access_point.chat_id,
             priority=ACCESS_POINT_OUTBOUND_CLASS_SEND,
-            on_success=lambda result: on_sent(result.first_message_id),
+            on_success=lambda result, ap=access_point: self._on_text_reply_with_result_sent(
+                access_point=ap,
+                result=result,
+                on_sent=on_sent,
+                on_failed=on_failed,
+            ),
             on_failure=on_failed,
             ordering_key=access_point,
+            retry_policy=AccessPointRetryPolicy.SUPERSEDABLE,
         )
+
+    def supersede_text_reply(
+        self,
+        *,
+        queue_token: int,
+        text: str,
+        source: str,
+        kind: TelegramKind,
+        reason: str,
+    ) -> bool:
+        item = self._outbound.find(queue_token)
+        if item is not None:
+            if (
+                item.retry_policy != AccessPointRetryPolicy.SUPERSEDABLE
+                or (item.attempt_count <= 0 and item.operation != "edit_text")
+                or item.replace_payload is None
+            ):
+                return False
+            decorated = self._decorate_reply(text=text, source=source)
+            if item.operation == "edit_text":
+                rendered = (
+                    render_session_references_html(decorated)
+                    if kind in {TelegramKind.COMMAND, TelegramKind.RESTORE, TelegramKind.SESSION}
+                    else decorated
+                )
+                item.replace_payload((rendered, "HTML" if rendered != decorated else None))
+            else:
+                item.replace_payload(decorated)
+            self._logger.event(
+                "access_point_delivery_superseded",
+                source="telegram_steward",
+                **access_point_delivery_log_fields(item),
+                supersession_reason=reason,
+            )
+            return True
+        return False
 
     def queue_text_reply_edit(
         self,
         *,
         access_point: AccessPointKey,
-        message_id: int,
+        message_ref: AccessPointMessageRef,
         text: str,
         source: str,
         kind: TelegramKind,
         on_sent: Callable[[], None],
         on_failed: Callable[[Exception], None],
-    ) -> None:
+    ) -> int | None:
+        if message_ref.access_point != access_point or not isinstance(message_ref.transport_id, int):
+            on_failed(RuntimeError("invalid Telegram message reference for lifecycle edit"))
+            return None
         decorated = self._decorate_reply(text=text, source=source)
         rendered = (
             render_session_references_html(decorated)
             if kind in {TelegramKind.COMMAND, TelegramKind.RESTORE, TelegramKind.SESSION}
             else decorated
         )
-        self._enqueue_edit_text(
+        return self._enqueue_edit_text(
             chat_id=int(access_point.chat_id),
-            message_id=int(message_id),
+            message_id=message_ref.transport_id,
             text=rendered,
             parse_mode="HTML" if rendered != decorated else None,
-            priority=ACCESS_POINT_OUTBOUND_CLASS_EDIT,
+            priority=ACCESS_POINT_OUTBOUND_CLASS_LIFECYCLE_UPDATE,
             on_success=lambda _result: on_sent(),
             on_failure=on_failed,
             ordering_key=access_point,
+            retry_policy=AccessPointRetryPolicy.SUPERSEDABLE,
+        )
+
+    @staticmethod
+    def _on_text_reply_with_result_sent(
+        *,
+        access_point: AccessPointKey,
+        result: _TelegramOutboundExecutionResult,
+        on_sent: Callable[[AccessPointMessageRef], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None:
+        if not isinstance(result.first_message_id, int):
+            on_failed(RuntimeError("Telegram lifecycle send did not return a message id"))
+            return
+        on_sent(
+            AccessPointMessageRef(
+                access_point=access_point,
+                transport_id=result.first_message_id,
+            )
         )
 
     def send_outbound_note(
@@ -637,11 +713,12 @@ class TelegramStewardAccessPointAdapter:
         self,
         *,
         access_point: AccessPointKey,
+        source: str,
         output_runtime: TelegramOutputRuntime,
         candidate: TelegramDueStatusCandidate,
     ) -> None:
-        coalesce_key = ("status", candidate.status_key)
-        if coalesce_key in self._queued_status_keys:
+        coalesce_key = ("status", source, access_point, candidate.status_key)
+        if self._outbound.contains_coalesce_key(coalesce_key):
             return
         self._logger.event(
             "telegram_status_global_candidate_selected",
@@ -662,23 +739,25 @@ class TelegramStewardAccessPointAdapter:
                 sent=bool(runtime.flush_status(status_key=status_key))
             ),
             on_success=None,
-            on_failure=None,
+            on_failure=lambda _exc, runtime=output_runtime: runtime.discard_pending_status_updates(),
             ordering_key=access_point,
+            retry_policy=AccessPointRetryPolicy.SUPERSEDABLE,
+            deduplicate=True,
         )
-        self._queued_status_keys.add(coalesce_key)
 
     def _enqueue_current_turn_status_flush(
         self,
         *,
         access_point: AccessPointKey,
+        source: str,
         output_runtime: TelegramOutputRuntime,
         status_store: TurnStatusStore,
     ) -> None:
         status_key = status_store.current_turn_status_key()
         if not isinstance(status_key, str) or not status_key:
             return
-        coalesce_key = ("status", status_key)
-        if coalesce_key in self._queued_status_keys:
+        coalesce_key = ("status", source, access_point, status_key)
+        if self._outbound.contains_coalesce_key(coalesce_key):
             return
         self._enqueue_outbound(
             op_kind="status",
@@ -692,10 +771,44 @@ class TelegramStewardAccessPointAdapter:
                 sent=bool(runtime.flush_status(status_key=key))
             ),
             on_success=None,
-            on_failure=None,
+            on_failure=lambda _exc, runtime=output_runtime: runtime.discard_pending_status_updates(),
             ordering_key=access_point,
+            retry_policy=AccessPointRetryPolicy.SUPERSEDABLE,
+            deduplicate=True,
         )
-        self._queued_status_keys.add(coalesce_key)
+
+    def _drop_queued_status_updates(
+        self,
+        *,
+        access_point: AccessPointKey,
+        sources: set[str],
+    ) -> int:
+        def should_remove(item: QueuedAccessPointOutbound[_TelegramOutboundExecutionResult]) -> bool:
+            key = item.coalesce_key
+            return (
+                str(item.operation or "") == "status"
+                and item.ordering_key == access_point
+                and isinstance(key, tuple)
+                and len(key) >= 2
+                and key[0] == "status"
+                and key[1] in sources
+            )
+
+        return len(self._outbound.cancel_matching(should_remove))
+
+    def _log_pending_status_updates_dropped(
+        self,
+        *,
+        access_point: AccessPointKey,
+        removed: int,
+    ) -> None:
+        self._logger.event(
+            "telegram_pending_status_updates_dropped",
+            source="telegram_steward",
+            chat_id=access_point.chat_id,
+            thread_id=access_point.thread_id,
+            removed=removed,
+        )
 
     def _enqueue_send_text(
         self,
@@ -710,14 +823,16 @@ class TelegramStewardAccessPointAdapter:
         on_success: Callable[[_TelegramOutboundExecutionResult], None] | None = None,
         on_failure: Callable[[Exception], None] | None = None,
         ordering_key: AccessPointKey | None = None,
+        retry_policy: AccessPointRetryPolicy = AccessPointRetryPolicy.DURABLE,
     ) -> int:
+        payload = {"text": text}
         return self._enqueue_outbound(
             op_kind=f"send_text:{kind}",
             priority=priority,
             coalesce_key=None,
-            execute=lambda runtime=output_runtime, body=text, body_kind=kind, cid=chat_id, markup=reply_markup, mode=parse_mode: self._execute_send_text(
+            execute=lambda runtime=output_runtime, body=payload, body_kind=kind, cid=chat_id, markup=reply_markup, mode=parse_mode: self._execute_send_text(
                 output_runtime=runtime,
-                text=body,
+                text=str(body["text"]),
                 kind=body_kind,
                 chat_id=cid,
                 reply_markup=markup,
@@ -726,6 +841,8 @@ class TelegramStewardAccessPointAdapter:
             on_success=on_success,
             on_failure=on_failure,
             ordering_key=ordering_key,
+            retry_policy=retry_policy,
+            replace_payload=lambda replacement, body=payload: body.__setitem__("text", replacement),
         )
 
     def _execute_send_text(
@@ -788,20 +905,26 @@ class TelegramStewardAccessPointAdapter:
         on_success: Callable[[_TelegramOutboundExecutionResult], None] | None = None,
         on_failure: Callable[[Exception], None] | None = None,
         ordering_key: AccessPointKey | None = None,
+        retry_policy: AccessPointRetryPolicy = AccessPointRetryPolicy.DURABLE,
     ) -> int:
+        payload = {"text": text, "parse_mode": parse_mode}
         return self._enqueue_outbound(
             op_kind="edit_text",
             priority=priority,
             coalesce_key=("edit_text", int(chat_id), int(message_id)),
-            execute=lambda cid=chat_id, mid=message_id, body=text, mode=parse_mode: self._execute_edit_text(
+            execute=lambda cid=chat_id, mid=message_id, body=payload: self._execute_edit_text(
                 chat_id=cid,
                 message_id=mid,
-                text=body,
-                parse_mode=mode,
+                text=str(body["text"]),
+                parse_mode=body["parse_mode"],
             ),
             on_success=on_success,
             on_failure=on_failure,
             ordering_key=ordering_key,
+            retry_policy=retry_policy,
+            replace_payload=lambda replacement, body=payload: body.update(
+                text=replacement[0], parse_mode=replacement[1],
+            ),
         )
 
     def _execute_edit_text(
@@ -851,6 +974,9 @@ class TelegramStewardAccessPointAdapter:
             on_success=on_success,
             on_failure=on_failure,
             ordering_key=ordering_key,
+            retry_policy=AccessPointRetryPolicy.EPHEMERAL,
+            expires_at=clock.monotonic() + 30.0,
+            ttl_sec=30.0,
         )
 
     def _execute_answer_callback_query(
@@ -860,61 +986,6 @@ class TelegramStewardAccessPointAdapter:
         text: str | None,
     ) -> _TelegramOutboundExecutionResult:
         self._client.answer_callback_query(callback_query_id, text=text)
-        return _TelegramOutboundExecutionResult(sent=True)
-
-    def _enqueue_status_delete(
-        self,
-        delete: TelegramQueuedStatusDelete,
-    ) -> None:
-        self._enqueue_outbound(
-            op_kind="delete_status",
-            priority=ACCESS_POINT_OUTBOUND_CLASS_EDIT,
-            coalesce_key=("delete_status", delete.status_key, int(delete.message_id)),
-            execute=lambda task=delete: self._execute_status_delete(task),
-            on_success=None,
-            on_failure=lambda exc, task=delete: self._logger.event(
-                "telegram_status_delete_error",
-                source=task.source,
-                status_key=task.status_key,
-                chat_id=task.chat_id,
-                message_id=task.message_id,
-                thread_id=task.thread_id,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                retry_after_sec=_extract_retry_after_sec(exc),
-            ),
-            ordering_key=AccessPointKey(
-                type="telegram",
-                chat_id=delete.chat_id,
-                thread_id=delete.thread_id,
-            ),
-        )
-
-    def _execute_status_delete(
-        self,
-        delete: TelegramQueuedStatusDelete,
-    ) -> _TelegramOutboundExecutionResult:
-        self._client.delete_message(chat_id=delete.chat_id, message_id=delete.message_id)
-        self._logger.event(
-            "telegram_op",
-            source=delete.source,
-            op="delete",
-            kind="status",
-            status_key=delete.status_key,
-            chat_id=delete.chat_id,
-            message_id=delete.message_id,
-            thread_id=delete.thread_id,
-        )
-        self._logger.event(
-            "telegram_status_cleared",
-            source=delete.source,
-            status_key=delete.status_key,
-            chat_id=delete.chat_id,
-            message_id=delete.message_id,
-            message_count=1,
-            dropped_pending_lines=delete.dropped_pending_lines,
-            thread_id=delete.thread_id,
-        )
         return _TelegramOutboundExecutionResult(sent=True)
 
     def _enqueue_outbound(
@@ -927,14 +998,14 @@ class TelegramStewardAccessPointAdapter:
         on_success: Callable[[_TelegramOutboundExecutionResult], None] | None,
         on_failure: Callable[[Exception], None] | None,
         ordering_key: AccessPointKey | None = None,
+        retry_policy: AccessPointRetryPolicy = AccessPointRetryPolicy.DURABLE,
+        expires_at: float | None = None,
+        ttl_sec: float | None = None,
+        replace_payload: Callable[[object], None] | None = None,
+        deduplicate: bool = False,
     ) -> int:
-        receipt_id = self._next_outbound_receipt_id
-        self._next_outbound_receipt_id += 1
-        self._receipts[receipt_id] = AccessPointDeliveryReceipt(receipt_id=receipt_id)
-        item = QueuedAccessPointOutbound(
-            receipt_id=receipt_id,
-            priority=int(priority),
-            sequence=self._next_outbound_sequence,
+        queue_token = self._outbound.enqueue(
+            priority=priority,
             operation=op_kind,
             coalesce_key=coalesce_key,
             progress_on_success=True,
@@ -942,82 +1013,104 @@ class TelegramStewardAccessPointAdapter:
             on_success=on_success,
             on_failure=on_failure,
             ordering_key=ordering_key,
+            retry_policy=retry_policy,
+            expires_at=expires_at,
+            ttl_sec=ttl_sec,
+            replace_payload=replace_payload,
+            deduplicate=deduplicate,
         )
-        self._next_outbound_sequence += 1
-        self._outbound_queue.append(item)
-        self._outbound_queue.sort(key=access_point_outbound_sort_key)
+        if queue_token == 0:
+            return 0
         self._logger.event(
             "telegram_outbound_enqueued",
             source="telegram_steward",
-            receipt_id=receipt_id,
+            queue_token=queue_token,
             op_kind=op_kind,
             priority=priority,
-            queue_size=len(self._outbound_queue),
+            queue_size=self._outbound.count,
         )
-        return receipt_id
+        return queue_token
 
     def _drain_outbound_queue(self) -> bool:
-        if not self._outbound_queue:
+        if not self._outbound:
             return False
         if not self._status_budget.can_send_any():
             return False
-        item = self._outbound_queue[0]
+        now = (self._status_monotonic_now or clock.monotonic)()
+        expired = expire_access_point_outbounds(
+            self._outbound,
+            now=now,
+            logger=self._logger,
+            source="telegram_steward",
+        )
+        if not self._outbound:
+            return expired
+        ready = self._outbound.ready(now=now)
+        if not ready:
+            return expired
+        item = select_access_point_outbound(ready)
         op_kind = str(item.operation or "")
         if op_kind == "status" and not self._status_budget.can_send_status():
-            item = next(
-                (
-                    candidate
-                    for candidate in self._outbound_queue[1:]
-                    if str(candidate.operation or "") != "status"
-                    and candidate.ordering_key is not None
-                    and candidate.ordering_key != item.ordering_key
-                ),
-                None,
-            )
-            if item is None:
+            eligible = [
+                candidate
+                for candidate in ready
+                if candidate is not item
+                and str(candidate.operation or "") != "status"
+                and candidate.ordering_key is not None
+                and candidate.ordering_key != item.ordering_key
+            ]
+            if not eligible:
                 return False
+            item = select_access_point_outbound(eligible)
             op_kind = str(item.operation or "")
+        item.attempt_count += 1
         try:
             result = item.execute()
         except Exception as exc:
-            retry_after_sec = _extract_retry_after_sec(exc)
-            if retry_after_sec is not None and retry_after_sec > 0:
+            failure_now = (self._status_monotonic_now or clock.monotonic)()
+            decision = decide_access_point_outbound_failure(item, exc, now=failure_now)
+            if decision.retry_scheduled:
                 self._logger.event(
                     "telegram_outbound_retry_scheduled",
                     source="telegram_steward",
-                    receipt_id=item.receipt_id,
+                    queue_token=item.queue_token,
                     op_kind=op_kind,
-                    retry_after_sec=retry_after_sec,
-                    queue_size=len(self._outbound_queue),
+                    retry_after_sec=decision.retry_delay_sec,
+                    queue_size=self._outbound.count,
+                )
+                self._logger.event(
+                    "access_point_delivery_retry_scheduled",
+                    source="telegram_steward",
+                    **access_point_delivery_log_fields(item),
+                    attempt=item.attempt_count,
+                    error_class=decision.error_class,
+                    retry_delay_sec=decision.retry_delay_sec,
+                    retry_not_before=item.retry_not_before,
                 )
                 return True
-            receipt = self._receipts.get(item.receipt_id)
-            if receipt is not None:
-                receipt.mark_failed(exc)
-            self._finish_outbound_item(item)
+            self._outbound.complete(item)
             if item.on_failure is not None:
                 item.on_failure(exc)
             return True
-        receipt = self._receipts.get(item.receipt_id)
-        if receipt is not None:
-            receipt.mark_sent(message_id=result.first_message_id)
-        self._finish_outbound_item(item)
+        self._outbound.complete(item)
+        if item.attempt_count > 1:
+            self._logger.event(
+                "access_point_delivery_recovered",
+                source="telegram_steward",
+                **access_point_delivery_log_fields(item),
+                attempts=item.attempt_count,
+            )
         if result.sent:
             self._status_budget.mark_status_sent()
+            wake_durable_access_point_outbounds(
+                self._outbound,
+                now=(self._status_monotonic_now or clock.monotonic)(),
+                logger=self._logger,
+                source="telegram_steward",
+            )
         if item.on_success is not None:
             item.on_success(result)
         return result.sent
-
-    def _finish_outbound_item(self, item: QueuedAccessPointOutbound[_TelegramOutboundExecutionResult]) -> None:
-        if self._outbound_queue and self._outbound_queue[0] is item:
-            self._outbound_queue.pop(0)
-        else:
-            try:
-                self._outbound_queue.remove(item)
-            except ValueError:
-                pass
-        if item.coalesce_key is not None:
-            self._queued_status_keys.discard(item.coalesce_key)
 
     def _on_approval_prompt_sent(
         self,
@@ -1029,7 +1122,7 @@ class TelegramStewardAccessPointAdapter:
         source: str,
     ) -> None:
         pending.prompt_state = AccessPointDeliveryState.SENT
-        pending.prompt_receipt_id = None
+        pending.prompt_queue_token = None
         pending.prompt_message_id = send_result.first_message_id
         self._logger.event(
             "telegram_approval_prompt_sent",
@@ -1050,7 +1143,7 @@ class TelegramStewardAccessPointAdapter:
         source: str,
     ) -> None:
         pending.prompt_state = AccessPointDeliveryState.FAILED
-        pending.prompt_receipt_id = None
+        pending.prompt_queue_token = None
         pending.prompt_message_id = None
         self._logger.event(
             "telegram_approval_prompt_error",
@@ -1063,13 +1156,3 @@ class TelegramStewardAccessPointAdapter:
         )
         if self._approval_prompt_failure_handler is not None:
             self._approval_prompt_failure_handler(access_point, exc)
-
-
-def _extract_retry_after_sec(exc: Exception) -> int | None:
-    match = re.search(r"retry after (\d+)", str(exc), flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None

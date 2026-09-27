@@ -62,7 +62,7 @@ def list_codex_cli_sessions(
     *,
     project_cwd: str | None = None,
     sessions_root: str | Path | None = None,
-    limit: int = 20,
+    limit: int | None = 20,
 ) -> list[CodexCliSession]:
     root = _resolve_sessions_root(sessions_root)
     if not root.exists() or not root.is_dir():
@@ -97,6 +97,8 @@ def list_codex_cli_sessions(
             )
         )
     items.sort(key=lambda item: item.last_activity_epoch, reverse=True)
+    if limit is None:
+        return items
     safe_limit = max(0, int(limit))
     if safe_limit == 0:
         return []

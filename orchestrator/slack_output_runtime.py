@@ -8,6 +8,7 @@ from typing import Callable
 
 from orchestrator import clock
 from orchestrator.protocol_status import format_item_status_lines
+from orchestrator.status_output_runtime import MAX_IN_PROGRESS_STATUS_WINDOWS
 from orchestrator.telegram_status import TelegramStatusConfig
 
 
@@ -22,6 +23,7 @@ class SlackStatusWindow:
         thread_ts_getter: Callable[[], str | None] | None = None,
         config: TelegramStatusConfig = TelegramStatusConfig(),
         monotonic_now: Callable[[], float] = clock.monotonic,
+        eager_flush_when_due: bool = True,
     ) -> None:
         self._client = client
         self._logger = logger
@@ -30,6 +32,7 @@ class SlackStatusWindow:
         self._thread_ts_getter = thread_ts_getter or (lambda: None)
         self._config = config
         self._now = monotonic_now
+        self._eager_flush_when_due = bool(eager_flush_when_due)
         self._lock = threading.Lock()
         self._message_ts_list: list[str] = []
         self._message_channel_id: str | None = None
@@ -46,7 +49,7 @@ class SlackStatusWindow:
         with self._lock:
             self._pending.extend(lines)
             now = float(self._now())
-            if self._should_flush(now):
+            if self._eager_flush_when_due and self._should_flush(now):
                 if self._pending_snapshot_lines is not None:
                     self._flush_pending_snapshot_locked(now=now, reason="append")
                 else:
@@ -90,7 +93,7 @@ class SlackStatusWindow:
                         ts=self._message_ts_list[0] if self._message_ts_list else None,
                     )
                     return
-                if not self._should_flush(now):
+                if not self._eager_flush_when_due or not self._should_flush(now):
                     self._pending_snapshot_lines = snapshot_lines
                     self._logger.event(
                         "slack_status_snapshot_buffered",
@@ -118,41 +121,6 @@ class SlackStatusWindow:
             else:
                 self._window.clear()
 
-    def clear(self) -> None:
-        with self._lock:
-            dropped_pending = len(self._pending)
-            self._pending.clear()
-            self._pending_snapshot_lines = None
-            self._window.clear()
-            self._last_flush_ts = None
-            message_ts_list = list(self._message_ts_list)
-            channel_id = self._message_channel_id
-            self._message_ts_list = []
-            self._message_channel_id = None
-            self._last_payload_chunks = []
-            if not message_ts_list or not channel_id:
-                return
-            for ts in message_ts_list:
-                try:
-                    self._client.delete_message(channel_id=channel_id, ts=ts)
-                except Exception as exc:
-                    self._logger.event(
-                        "slack_status_delete_error",
-                        source=self._source,
-                        channel_id=channel_id,
-                        ts=ts,
-                        error=str(exc),
-                        error_type=type(exc).__name__,
-                    )
-            self._logger.event(
-                "slack_status_cleared",
-                source=self._source,
-                channel_id=channel_id,
-                ts=message_ts_list[0],
-                message_count=len(message_ts_list),
-                dropped_pending_lines=dropped_pending,
-            )
-
     def flush_pending(self, *, reason: str = "manual") -> None:
         with self._lock:
             now = float(self._now())
@@ -162,6 +130,23 @@ class SlackStatusWindow:
             if not self._pending:
                 return
             self._flush_locked(now=now, reason=reason)
+
+    def discard_pending(self) -> None:
+        with self._lock:
+            dropped_pending = len(self._pending)
+            had_snapshot = self._pending_snapshot_lines is not None
+            if dropped_pending == 0 and not had_snapshot:
+                return
+            self._pending.clear()
+            self._pending_snapshot_lines = None
+            self._logger.event(
+                "slack_status_pending_dropped",
+                source=self._source,
+                dropped_pending_lines=dropped_pending,
+                dropped_snapshot=had_snapshot,
+                channel_id=self._message_channel_id,
+                ts=self._message_ts_list[0] if self._message_ts_list else None,
+            )
 
     def flush_due(self, *, reason: str = "due") -> bool:
         with self._lock:
@@ -396,6 +381,7 @@ class SlackStructuredStatusThread:
         thread_ts_getter: Callable[[], str | None] | None = None,
         config: TelegramStatusConfig = TelegramStatusConfig(),
         monotonic_now: Callable[[], float] = clock.monotonic,
+        eager_flush_when_due: bool = True,
     ) -> None:
         self._client = client
         self._logger = logger
@@ -404,6 +390,7 @@ class SlackStructuredStatusThread:
         self._thread_ts_getter = thread_ts_getter or (lambda: None)
         self._config = config
         self._now = monotonic_now
+        self._eager_flush_when_due = bool(eager_flush_when_due)
         self._lock = threading.Lock()
         self._root_ts: str | None = None
         self._root_channel_id: str | None = None
@@ -435,7 +422,7 @@ class SlackStructuredStatusThread:
                 self._last_item_text_by_id.clear()
             self._pending_meta_lines = list(meta_lines)
             self._pending_snapshot = [dict(item) for item in snapshot]
-            if not self._should_flush(now):
+            if not self._eager_flush_when_due or not self._should_flush(now):
                 self._logger.event(
                     "slack_status_snapshot_buffered",
                     source=self._source,
@@ -445,30 +432,26 @@ class SlackStructuredStatusThread:
                 return
             self._flush_pending_locked(now=now, reason="snapshot")
 
-    def clear(self) -> None:
-        with self._lock:
-            root_ts = self._root_ts
-            channel_id = self._root_channel_id
-            item_ts_list = list(self._item_ts_by_id.values())
-            self._root_ts = None
-            self._root_channel_id = None
-            self._last_root_text = None
-            self._item_ts_by_id.clear()
-            self._last_item_text_by_id.clear()
-            self._pending_meta_lines = None
-            self._pending_snapshot = None
-            self._last_flush_ts = None
-            if not channel_id:
-                return
-            for ts in item_ts_list:
-                self._client.delete_message(channel_id=channel_id, ts=ts)
-            if root_ts:
-                self._client.delete_message(channel_id=channel_id, ts=root_ts)
-
     def flush_pending(self, *, reason: str = "manual") -> None:
         with self._lock:
             now = float(self._now())
             self._flush_pending_locked(now=now, reason=reason)
+
+    def discard_pending(self) -> None:
+        with self._lock:
+            had_pending = self._pending_meta_lines is not None or self._pending_snapshot is not None
+            if not had_pending:
+                return
+            self._pending_meta_lines = None
+            self._pending_snapshot = None
+            self._logger.event(
+                "slack_status_pending_dropped",
+                source=self._source,
+                dropped_pending_lines=0,
+                dropped_snapshot=True,
+                channel_id=self._root_channel_id,
+                ts=self._root_ts,
+            )
 
     def flush_due(self, *, reason: str = "due") -> bool:
         with self._lock:
@@ -677,6 +660,7 @@ class SlackOutputRuntime:
         thread_ts_getter: Callable[[], str | None] | None = None,
         status_config: TelegramStatusConfig = TelegramStatusConfig(),
         status_monotonic_now: Callable[[], float] | None = None,
+        status_eager_flush_when_due: bool = True,
     ) -> None:
         self._client = client
         self._logger = logger
@@ -685,8 +669,12 @@ class SlackOutputRuntime:
         self._thread_ts_getter = thread_ts_getter
         self._status_config = status_config
         self._status_monotonic_now = status_monotonic_now
+        self._status_eager_flush_when_due = bool(status_eager_flush_when_due)
         self._status_windows: dict[str, SlackStatusWindow] = {}
         self._structured_threads: dict[str, SlackStructuredStatusThread] = {}
+        self._status_window_order: dict[str, None] = {}
+        self._in_progress_status_keys: dict[str, None] = {}
+        self._release_after_flush_status_keys: set[str] = set()
         self._latest_status_key: str | None = None
 
     def append_status(
@@ -712,13 +700,37 @@ class SlackOutputRuntime:
         self._latest_status_key = key
 
     def clear_status(self) -> None:
-        for window in self._status_windows.values():
-            window.clear()
         self._status_windows.clear()
-        for thread in self._structured_threads.values():
-            thread.clear()
         self._structured_threads.clear()
+        self._status_window_order.clear()
+        self._in_progress_status_keys.clear()
+        self._release_after_flush_status_keys.clear()
         self._latest_status_key = None
+
+    def set_status_in_progress(self, *, status_key: str, in_progress: bool) -> None:
+        if in_progress:
+            self._release_after_flush_status_keys.discard(status_key)
+            self._in_progress_status_keys.setdefault(status_key, None)
+            self._enforce_in_progress_retention()
+            self._prune_status_windows()
+            return
+        if status_key not in self._in_progress_status_keys:
+            return
+        if self._status_has_pending_delivery(status_key):
+            self._release_after_flush_status_keys.add(status_key)
+            return
+        self._release_status_key(status_key)
+
+    def status_keys(self) -> list[str]:
+        return list(self._status_window_order)
+
+    def discard_pending_status_updates(self) -> None:
+        for window in self._status_windows.values():
+            window.discard_pending()
+        for thread in self._structured_threads.values():
+            thread.discard_pending()
+        for status_key in list(self._release_after_flush_status_keys):
+            self._release_status_key(status_key)
 
     def flush_status(self, *, status_key: str | None = None) -> None:
         key = status_key if status_key is not None else self._latest_status_key
@@ -727,18 +739,22 @@ class SlackOutputRuntime:
         structured = self._structured_threads.get(key)
         if structured is not None:
             structured.flush_pending(reason="manual")
+            self._release_status_key_after_flush(key)
             return
         window = self._status_windows.get(key)
         if window is not None:
             window.flush_pending(reason="manual")
+            self._release_status_key_after_flush(key)
 
     def flush_due_statuses(self) -> bool:
         progressed = False
-        for window in self._status_windows.values():
+        for status_key, window in self._status_windows.items():
             if window.flush_due(reason="due"):
+                self._release_status_key_after_flush(status_key)
                 progressed = True
-        for thread in self._structured_threads.values():
+        for status_key, thread in self._structured_threads.items():
             if thread.flush_due(reason="due"):
+                self._release_status_key_after_flush(status_key)
                 progressed = True
         return progressed
 
@@ -787,8 +803,10 @@ class SlackOutputRuntime:
             thread_ts_getter=self._thread_ts_getter,
             config=self._status_config,
             monotonic_now=self._status_monotonic_now or clock.monotonic,
+            eager_flush_when_due=self._status_eager_flush_when_due,
         )
         self._status_windows[key] = window
+        self._remember_status_window(key)
         return window
 
     def _structured_thread_for_key(self, key: str) -> SlackStructuredStatusThread:
@@ -803,9 +821,79 @@ class SlackOutputRuntime:
             thread_ts_getter=self._thread_ts_getter,
             config=self._status_config,
             monotonic_now=self._status_monotonic_now or clock.monotonic,
+            eager_flush_when_due=self._status_eager_flush_when_due,
         )
         self._structured_threads[key] = thread
+        self._remember_status_window(key)
         return thread
+
+    def _remember_status_window(self, status_key: str) -> None:
+        self._status_window_order.setdefault(status_key, None)
+        self._prune_status_windows()
+
+    def _prune_status_windows(self) -> None:
+        retention_limit = max(1, int(self._status_config.max_tracked_windows))
+        evictable = [
+            key for key in self._status_window_order if key not in self._in_progress_status_keys
+        ]
+        while len(evictable) > retention_limit:
+            status_key = evictable.pop(0)
+            self._evict_status_window(
+                status_key=status_key,
+                reason="completed_retention_limit",
+                retention_limit=retention_limit,
+            )
+
+    def _enforce_in_progress_retention(self) -> None:
+        retention_limit = MAX_IN_PROGRESS_STATUS_WINDOWS
+        while len(self._in_progress_status_keys) > retention_limit:
+            status_key = next(iter(self._in_progress_status_keys))
+            self._evict_status_window(
+                status_key=status_key,
+                reason="in_progress_retention_limit",
+                retention_limit=retention_limit,
+            )
+
+    def _evict_status_window(
+        self,
+        *,
+        status_key: str,
+        reason: str,
+        retention_limit: int,
+    ) -> None:
+        self._status_window_order.pop(status_key, None)
+        self._status_windows.pop(status_key, None)
+        self._structured_threads.pop(status_key, None)
+        self._in_progress_status_keys.pop(status_key, None)
+        self._release_after_flush_status_keys.discard(status_key)
+        if self._latest_status_key == status_key:
+            self._latest_status_key = None
+        self._logger.event(
+            "slack_status_window_evicted",
+            source=self._source,
+            status_key=status_key,
+            channel_id=self._channel_id_getter(),
+            thread_ts=(self._thread_ts_getter or (lambda: None))(),
+            tracked_windows=len(self._status_window_order),
+            in_progress_windows=len(self._in_progress_status_keys),
+            retention_limit=retention_limit,
+            reason=reason,
+        )
+
+    def _status_has_pending_delivery(self, status_key: str) -> bool:
+        structured = self._structured_threads.get(status_key)
+        if structured is not None:
+            return structured.pending_delivery_kind() is not None
+        window = self._status_windows.get(status_key)
+        return window is not None and window.pending_delivery_kind() is not None
+
+    def _release_status_key_after_flush(self, status_key: str) -> None:
+        if status_key in self._release_after_flush_status_keys:
+            self._release_status_key(status_key)
+
+    def _release_status_key(self, status_key: str) -> None:
+        self._release_after_flush_status_keys.discard(status_key)
+        self._in_progress_status_keys.pop(status_key, None)
 
     def _resolve_status_key(self, *, status_key: str | None) -> str:
         if status_key is not None:

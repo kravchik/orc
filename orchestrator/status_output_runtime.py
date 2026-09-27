@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Protocol
 
 
+MAX_IN_PROGRESS_STATUS_WINDOWS = 10
+
+
 class StatusOutputRuntime(Protocol):
     def append_status(
         self,
@@ -27,6 +30,8 @@ class StatusOutputRuntime(Protocol):
     def flush_status(self, *, status_key: str | None = None) -> None: ...
 
     def flush_due_statuses(self) -> bool: ...
+
+    def set_status_in_progress(self, *, status_key: str, in_progress: bool) -> None: ...
 
 
 class StructuredStatusOutputRuntime(Protocol):

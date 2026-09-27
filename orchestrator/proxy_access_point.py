@@ -178,6 +178,7 @@ def build_proxy_inspect_text(
         lines.append(f"approval command: {approval_command}")
     if approval_cwd:
         lines.append(f"approval cwd: {approval_cwd}")
+    lines.append("active work:")
     append_active_work_lines(lines, rows)
     return "\n".join(lines)
 

@@ -39,12 +39,14 @@ from orchestrator.telegram_steward_access_point import (
 from orchestrator.telegram_bridge import (
     TelegramCallbackUpdate,
     TelegramChatState,
+    TelegramMessageUpdate,
     TelegramTextUpdate,
     extract_telegram_http_code,
     process_telegram_updates,
 )
 from orchestrator.telegram_api_thread_driver import TelegramApiThreadDriver
 from orchestrator.telegram_smoke import TelegramApi
+from orchestrator.uploads import MAX_UPLOAD_FILE_BYTES
 
 
 Writer = Callable[[str], None]
@@ -66,6 +68,7 @@ class _TelegramStewardTransport(StewardTransportAdapter):
         offset_ref: list[int | None],
         chat_state: TelegramChatState,
         on_text_update: Callable[[TelegramTextUpdate], None],
+        on_message_update: Callable[[TelegramMessageUpdate], None],
         on_callback_update: Callable[[TelegramCallbackUpdate], None],
         agent_runtime: InteractiveAgentRuntime,
         runtime: InteractiveStewardRuntime,
@@ -78,6 +81,7 @@ class _TelegramStewardTransport(StewardTransportAdapter):
         self._offset_ref = offset_ref
         self._chat_state = chat_state
         self._on_text_update = on_text_update
+        self._on_message_update = on_message_update
         self._on_callback_update = on_callback_update
         self._agent_runtime = agent_runtime
         self._runtime = runtime
@@ -114,6 +118,7 @@ class _TelegramStewardTransport(StewardTransportAdapter):
             chat_state=self._chat_state,
             on_text_update=self._on_text_update,
             on_callback_update=self._on_callback_update,
+            on_message_update=self._on_message_update,
         )
         return True
 
@@ -250,9 +255,6 @@ def run_telegram_steward(
     def _flush_due_status_runtimes() -> bool:
         return access_point_adapter.flush_due_status_runtimes()
 
-    def _split_status_after_approval(access_point: AccessPointKey, _decision: str) -> None:
-        access_point_adapter.split_status_after_approval(access_point)
-
     if registry.state_store is not None:
         registry.persist(reason="startup_restore")
     core = StewardCore(
@@ -263,20 +265,18 @@ def run_telegram_steward(
         access_point_adapter=access_point_adapter,
         sessions_root=sessions_root,
         persisted_state_by_access_point=registry.persisted_state_by_access_point,
-        pending_restore_greeting=registry.pending_restore_greeting,
         persist_registry=lambda reason, access_point=None: registry.persist(reason=reason, access_point=access_point),
         drop_persisted_state=registry.drop,
         clear_status_runtimes=lambda access_point, include_steward=False: _clear_status_runtimes(
             access_point=access_point,
             include_steward=include_steward,
         ),
-        split_status_after_approval=_split_status_after_approval,
+        split_status=access_point_adapter.split_status,
         kinds=StewardCoreKinds(
             reply=TelegramKind.REPLY,
             command=TelegramKind.COMMAND,
             session=TelegramKind.SESSION,
             warning=TelegramKind.WARNING,
-            restore=TelegramKind.RESTORE,
             steward_status_source="steward",
             agent_status_source="agent",
         ),
@@ -313,7 +313,6 @@ def run_telegram_steward(
         ),
         routing_queue_capacity=routing_queue_capacity,
     )
-    core.emit_startup_restore_notices()
 
     def _enqueue_text_update(update: TelegramTextUpdate) -> None:
         core.enqueue_inbound(access_point_adapter.inbound_text_from_update(update))
@@ -325,6 +324,77 @@ def run_telegram_steward(
             thread_id=update.thread_id,
             queue_size=core.pending_queue_size,
         )
+
+    def _handle_message_update(update: TelegramMessageUpdate) -> None:
+        access_point = AccessPointKey(
+            type="telegram",
+            chat_id=update.chat_id,
+            thread_id=update.thread_id,
+        )
+        for attachment in update.attachments:
+            try:
+                core.validate_incoming_upload(
+                    access_point,
+                    declared_size=attachment.declared_size,
+                )
+                file_info = client.get_file(attachment.download_ref)
+                file_path = str(file_info.get("file_path") or "").strip()
+                if not file_path:
+                    raise RuntimeError("telegram getFile returned no file_path")
+                remote_size = file_info.get("file_size")
+                core.validate_incoming_upload(
+                    access_point,
+                    declared_size=(
+                        int(remote_size)
+                        if isinstance(remote_size, int)
+                        else attachment.declared_size
+                    ),
+                )
+                content = client.download_file(file_path, max_bytes=MAX_UPLOAD_FILE_BYTES)
+                ordinal, saved, persisted = core.save_incoming_upload(
+                    access_point,
+                    preferred_name=attachment.preferred_name,
+                    content=content,
+                )
+                reply = (
+                    f"🧑‍✈️ Uploaded: {ordinal}. {saved.name}\n"
+                    "It will be included with your next message."
+                )
+                if not persisted:
+                    reply += "\nWarning: pending upload state was not persisted."
+                access_point_adapter.send_outbound_note(
+                    access_point=access_point,
+                    source="steward",
+                    text=reply,
+                    kind=TelegramKind.SESSION,
+                )
+            except Exception as exc:
+                logger.event(
+                    "telegram_upload_failed",
+                    access_point_type=access_point.type,
+                    chat_id=access_point.chat_id,
+                    thread_id=access_point.thread_id,
+                    file_id=attachment.source_id,
+                    file_name=attachment.preferred_name,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                access_point_adapter.send_outbound_note(
+                    access_point=access_point,
+                    source="steward",
+                    text=f"🧑‍✈️ Upload failed for {attachment.preferred_name}: {exc}",
+                    kind=TelegramKind.WARNING,
+                )
+        if update.text is not None and (not update.attachments or update.text.strip()):
+            _enqueue_text_update(
+                TelegramTextUpdate(
+                    update_id=update.update_id,
+                    chat_id=update.chat_id,
+                    message_id=update.message_id,
+                    thread_id=update.thread_id,
+                    text=update.text,
+                )
+            )
 
     def _handle_callback_update(update: TelegramCallbackUpdate) -> None:
         pending_approval = core.pending_approval_for(
@@ -357,6 +427,7 @@ def run_telegram_steward(
         offset_ref=offset_ref,
         chat_state=chat_state,
         on_text_update=_enqueue_text_update,
+        on_message_update=_handle_message_update,
         on_callback_update=_handle_callback_update,
         agent_runtime=agent_runtime,
         runtime=runtime,
@@ -365,11 +436,11 @@ def run_telegram_steward(
     loop = StewardTickLoop(
         request_timeout_sec=request_timeout_sec,
         drain_driver_events=core.drain_driver_events,
-        drain_routing_queue=core.drain_routing_queue,
+        tick_interactions=core.tick_interactions,
         flush_due_status_runtimes=_flush_due_status_runtimes,
         consume_transport=transport.consume_transport,
         drain_pending_inputs=_drain_pending_inputs,
-        is_idle=lambda: core.is_idle() and not access_point_adapter.has_pending_outbound(),
+        is_idle=core.is_idle,
         consume_control_events=consume_control_events,
         sleep_fn=idle_sleep_fn,
     )
@@ -380,10 +451,13 @@ def run_telegram_steward(
         poll_timeout_sec=poll_timeout_sec,
         poll_error_backoff_sec=transport_error_sleep_sec,
     )
-    return run_steward_runtime(
-        loop=loop,
-        transport=transport,
-        writer=writer,
-        logger=logger,
-        sleep_fn=idle_sleep_fn,
-    )
+    try:
+        return run_steward_runtime(
+            loop=loop,
+            transport=transport,
+            writer=writer,
+            logger=logger,
+            sleep_fn=idle_sleep_fn,
+        )
+    finally:
+        access_point_adapter.log_delivery_handles_closed()

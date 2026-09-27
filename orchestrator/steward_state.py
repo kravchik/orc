@@ -14,16 +14,34 @@ from orchestrator.binding_address import ROUTING_MODE_SHAMAN, RoutingIdentityReg
 from orchestrator.local_command_journal import LocalCommandJournal
 from orchestrator.processes import LifecycleLogger
 from orchestrator.safe_write import write_text_atomic
+from orchestrator.uploads import (
+    PendingUpload,
+    pending_upload_from_payload,
+    validate_loaded_pending,
+)
+
+
+RUNTIME_INTENT_BOUND_IDLE = "BOUND_IDLE"
+RUNTIME_INTENT_RUNNING = "RUNNING"
+
+
+def normalize_runtime_intent(value: object) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"RUNNING", "STARTING"}:
+        return RUNTIME_INTENT_RUNNING
+    return RUNTIME_INTENT_BOUND_IDLE
 
 
 @dataclass
 class PersistedAccessPointState:
     project_cwd: str
     agent: dict[str, Any] | None
+    runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE
     address: str = ""
     routing_mode: str = ""
     approval_target: str = HUMAN_APPROVAL_TARGET
     local_command_journal: LocalCommandJournal = field(default_factory=LocalCommandJournal)
+    pending_uploads: tuple[PendingUpload, ...] = ()
 
 
 def merge_runtime_persisted_state(
@@ -32,7 +50,11 @@ def merge_runtime_persisted_state(
 ) -> PersistedAccessPointState:
     if previous is None:
         return runtime_state
-    return replace(runtime_state, local_command_journal=previous.local_command_journal)
+    return replace(
+        runtime_state,
+        local_command_journal=previous.local_command_journal,
+        pending_uploads=previous.pending_uploads,
+    )
 
 
 def _is_access_point_id(value: object) -> bool:
@@ -105,6 +127,7 @@ class AccessPointStateStore:
             project_cwd = project_cwd_raw.strip() if isinstance(project_cwd_raw, str) else ""
             agent_raw = item.get("agent")
             agent = dict(agent_raw) if isinstance(agent_raw, dict) else None
+            runtime_intent = normalize_runtime_intent(item.get("runtime_intent"))
             address_raw = item.get("address")
             address = address_raw.strip() if isinstance(address_raw, str) else ""
             routing_mode_raw = item.get("routing_mode")
@@ -122,6 +145,27 @@ class AccessPointStateStore:
             local_command_journal = LocalCommandJournal.from_payload(
                 item.get("local_command_journal")
             )
+            pending_upload_list = [
+                parsed
+                for raw_upload in (
+                    item.get("pending_uploads")
+                    if isinstance(item.get("pending_uploads"), list)
+                    else []
+                )
+                if (parsed := pending_upload_from_payload(raw_upload)) is not None
+            ]
+            try:
+                validate_loaded_pending(pending_upload_list)
+            except ValueError as exc:
+                self._logger.event(
+                    "pending_upload_restore_discarded",
+                    access_point_type=ap_type,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    error=str(exc),
+                )
+                pending_upload_list = []
+            pending_uploads = tuple(pending_upload_list)
             access_point = AccessPointKey(
                 type=ap_type.strip() or "telegram",
                 chat_id=chat_id,
@@ -138,10 +182,12 @@ class AccessPointStateStore:
             restored[access_point] = PersistedAccessPointState(
                 project_cwd=project_cwd,
                 agent=agent,
+                runtime_intent=runtime_intent,
                 address=address,
                 routing_mode=routing_mode,
                 approval_target=approval_target,
                 local_command_journal=local_command_journal,
+                pending_uploads=pending_uploads,
             )
         try:
             if any(state.routing_mode and not state.address for state in restored.values()):
@@ -217,6 +263,7 @@ class AccessPointStateStore:
             }
             if state.agent is not None:
                 entry["agent"] = dict(state.agent)
+                entry["runtime_intent"] = normalize_runtime_intent(state.runtime_intent)
             if state.address:
                 entry["address"] = state.address
                 entry["routing_mode"] = state.routing_mode or ROUTING_MODE_SHAMAN
@@ -224,6 +271,8 @@ class AccessPointStateStore:
                 entry["approval_target"] = state.approval_target
             if state.local_command_journal.has_state():
                 entry["local_command_journal"] = state.local_command_journal.to_payload()
+            if state.pending_uploads:
+                entry["pending_uploads"] = [item.to_payload() for item in state.pending_uploads]
             access_points.append(entry)
         payload = {
             "version": 1,
@@ -251,6 +300,7 @@ class PersistedAgentRuntime(Protocol):
         spec: dict[str, Any],
         agent_id: str,
         thread_id: str,
+        runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE,
     ) -> dict[str, Any]: ...
 
 @dataclass
@@ -259,7 +309,6 @@ class StewardRegistryContext:
     agent_runtime: PersistedAgentRuntime
     state_store: AccessPointStateStore | None
     persisted_state_by_access_point: dict[AccessPointKey, PersistedAccessPointState]
-    pending_restore_greeting: set[AccessPointKey]
     sort_key: Callable[[AccessPointKey], tuple[str, str, str]]
 
     def persist(self, *, reason: str, access_point: AccessPointKey | None = None) -> bool:
@@ -273,7 +322,8 @@ class StewardRegistryContext:
             has_agent = isinstance(value.agent, dict) and bool(value.agent)
             has_cwd = bool((value.project_cwd or "").strip())
             has_local_commands = value.local_command_journal.has_state()
-            if has_agent or has_cwd or has_local_commands:
+            has_pending_uploads = bool(value.pending_uploads)
+            if has_agent or has_cwd or has_local_commands or has_pending_uploads:
                 pruned[key] = value
         try:
             self.state_store.save(pruned, sort_key=self.sort_key)
@@ -321,7 +371,6 @@ def build_steward_registry_context(
 ) -> StewardRegistryContext:
     state_store: AccessPointStateStore | None = None
     persisted_state_by_access_point: dict[AccessPointKey, PersistedAccessPointState] = {}
-    pending_restore_greeting: set[AccessPointKey] = set()
     if state_path is not None and str(state_path).strip():
         state_store = AccessPointStateStore(path=Path(str(state_path)).expanduser(), logger=logger)
         persisted_state_by_access_point = state_store.load()
@@ -342,6 +391,9 @@ def build_steward_registry_context(
                     spec["model"] = model
             if not str(spec.get("cwd") or "").strip():
                 continue
+            thread_name = str(agent_payload.get("thread_name") or "").strip()
+            if thread_name and not str(spec.get("thread_name") or "").strip():
+                spec["thread_name"] = thread_name
             if state.address:
                 spec["address"] = state.address
                 spec["routing_mode"] = state.routing_mode
@@ -353,6 +405,7 @@ def build_steward_registry_context(
                     spec=spec,
                     agent_id=str(agent_payload.get("agent_id") or ""),
                     thread_id=str(agent_payload.get("thread_id") or ""),
+                    runtime_intent=state.runtime_intent,
                 )
             except Exception as exc:
                 logger.event(
@@ -363,16 +416,10 @@ def build_steward_registry_context(
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
-        pending_restore_greeting = {
-            access_point
-            for access_point, state in persisted_state_by_access_point.items()
-            if isinstance(state.agent, dict) and bool(state.agent)
-        }
     return StewardRegistryContext(
         logger=logger,
         agent_runtime=agent_runtime,
         state_store=state_store,
         persisted_state_by_access_point=persisted_state_by_access_point,
-        pending_restore_greeting=pending_restore_greeting,
         sort_key=sort_key,
     )

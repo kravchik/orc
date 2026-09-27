@@ -34,6 +34,7 @@ from orchestrator.steward_runner import (
 )
 from orchestrator.steward_state import build_steward_registry_context
 from orchestrator.telegram_status import TelegramStatusConfig
+from orchestrator.uploads import MAX_UPLOAD_FILE_BYTES, slack_uploads_from_message
 
 Writer = Callable[[str], None]
 
@@ -296,9 +297,6 @@ def run_slack_steward(
     def _flush_due_status_runtimes() -> bool:
         return access_point_adapter.flush_due_status_runtimes()
 
-    def _split_status_after_approval(access_point: AccessPointKey, _decision: str) -> None:
-        access_point_adapter.split_status_after_approval(access_point)
-
     if registry.state_store is not None:
         registry.persist(reason="startup_restore")
     core = StewardCore(
@@ -309,20 +307,18 @@ def run_slack_steward(
         access_point_adapter=access_point_adapter,
         sessions_root=sessions_root,
         persisted_state_by_access_point=registry.persisted_state_by_access_point,
-        pending_restore_greeting=registry.pending_restore_greeting,
         persist_registry=lambda reason, access_point=None: registry.persist(reason=reason, access_point=access_point),
         drop_persisted_state=registry.drop,
         clear_status_runtimes=lambda access_point, include_steward=False: _clear_status_runtimes(
             access_point=access_point,
             include_steward=include_steward,
         ),
-        split_status_after_approval=_split_status_after_approval,
+        split_status=access_point_adapter.split_status,
         kinds=StewardCoreKinds(
             reply="reply",
             command="command",
             session="session",
             warning="warning",
-            restore="restore",
             steward_status_source="steward",
             agent_status_source="agent",
         ),
@@ -344,12 +340,62 @@ def run_slack_steward(
         ),
         routing_queue_capacity=routing_queue_capacity,
     )
-    core.emit_startup_restore_notices()
 
     def _handle_message(message: dict[str, Any]) -> None:
-        inbound = access_point_adapter.inbound_text_from_message(message)
-        if inbound is None:
+        access_point = access_point_adapter.access_point_from_message(message)
+        if access_point is None:
             return
+        attachments = slack_uploads_from_message(message)
+        for attachment in attachments:
+            try:
+                if not attachment.download_ref:
+                    raise ValueError("slack file has no private download URL")
+                core.validate_incoming_upload(
+                    access_point,
+                    declared_size=attachment.declared_size,
+                )
+                content = client.download_file(
+                    attachment.download_ref,
+                    max_bytes=MAX_UPLOAD_FILE_BYTES,
+                )
+                ordinal, saved, persisted = core.save_incoming_upload(
+                    access_point,
+                    preferred_name=attachment.preferred_name,
+                    content=content,
+                )
+                reply = (
+                    f"🧑‍✈️ Uploaded: {ordinal}. {saved.name}\n"
+                    "It will be included with your next message."
+                )
+                if not persisted:
+                    reply += "\nWarning: pending upload state was not persisted."
+                access_point_adapter.send_outbound_note(
+                    access_point=access_point,
+                    source="steward",
+                    text=reply,
+                    kind="session",
+                )
+            except Exception as exc:
+                logger.event(
+                    "slack_upload_failed",
+                    access_point_type=access_point.type,
+                    channel_id=access_point.chat_id,
+                    thread_ts=access_point.thread_id,
+                    file_id=attachment.source_id,
+                    file_name=attachment.preferred_name,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                access_point_adapter.send_outbound_note(
+                    access_point=access_point,
+                    source="steward",
+                    text=f"🧑‍✈️ Upload failed for {attachment.preferred_name}: {exc}",
+                    kind="warning",
+                )
+        text = message.get("text")
+        if not isinstance(text, str) or (attachments and not text.strip()):
+            return
+        inbound = StewardInboundText(access_point=access_point, text=text)
         logger.event(
             "slack_steward_inbound_enqueued",
             access_point_type=inbound.access_point.type,
@@ -407,11 +453,11 @@ def run_slack_steward(
     loop = StewardTickLoop(
         request_timeout_sec=request_timeout_sec,
         drain_driver_events=core.drain_driver_events,
-        drain_routing_queue=core.drain_routing_queue,
+        tick_interactions=core.tick_interactions,
         flush_due_status_runtimes=_flush_due_status_runtimes,
         consume_transport=transport.consume_transport,
         drain_pending_inputs=_drain_pending_inputs,
-        is_idle=lambda: core.is_idle() and not access_point_adapter.has_pending_outbound(),
+        is_idle=core.is_idle,
         consume_control_events=consume_control_events,
         sleep_fn=idle_sleep_fn,
     )
@@ -420,10 +466,13 @@ def run_slack_steward(
     if interactivity_source is not None:
         interactivity_source.start()
 
-    return run_steward_runtime(
-        loop=loop,
-        transport=transport,
-        writer=writer,
-        logger=logger,
-        sleep_fn=idle_sleep_fn,
-    )
+    try:
+        return run_steward_runtime(
+            loop=loop,
+            transport=transport,
+            writer=writer,
+            logger=logger,
+            sleep_fn=idle_sleep_fn,
+        )
+    finally:
+        access_point_adapter.log_delivery_handles_closed()

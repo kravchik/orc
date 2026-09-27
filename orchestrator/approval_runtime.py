@@ -11,9 +11,12 @@ from orchestrator.approval import (
     ApprovalPolicy,
     ApprovalRequest,
     COMMAND_APPROVAL_METHOD,
+    approval_response_decision_name,
     build_session_approval_response,
     format_regex_auto_approval_notification,
+    format_regex_budget_exhausted_notification,
     format_regex_fallback_human_notification,
+    format_regex_timeout_notification,
     supports_session_approval,
 )
 from orchestrator.processes import LifecycleLogger
@@ -83,27 +86,17 @@ def build_approval_response_plan(
             always_allow=False,
         )
 
+    cached_plan = build_always_allow_cached_response_plan(
+        request=request,
+        logger=logger,
+        role=role,
+        always_allow_commands=always_allow_commands,
+        log_auto_decision=log_auto_decision,
+    )
+    if cached_plan is not None:
+        return cached_plan
+
     command_from_params = request.params.get("command")
-    if (
-        always_allow_commands is not None
-        and isinstance(command_from_params, str)
-        and command_from_params in always_allow_commands
-    ):
-        result = build_session_approval_response(
-            method=request.method,
-            params=request.params,
-        ) or {"decision": "accept"}
-        return ApprovalResponsePlan(
-            req_id=request.req_id,
-            result=result,
-            via="always_allow_cache",
-            method=request.method,
-            params=request.params,
-            decision="accept",
-            source="always_allow_cache",
-            command=command_from_params,
-            always_allow=False,
-        )
 
     if log_approval_requested:
         _event(
@@ -183,7 +176,7 @@ def build_approval_response_plan(
             )
             if session_result is None:
                 raise RuntimeError("session approval is unavailable for this request")
-            decision = str(session_result["decision"])
+            decision = approval_response_decision_name(session_result)
         else:
             decision = normalized
         if log_human_decision:
@@ -218,23 +211,13 @@ def build_approval_response_plan(
             and command_from_params
         ):
             always_allow_commands.add(command_from_params)
-        accept_settings = result.get("acceptSettings")
-        if isinstance(accept_settings, dict):
-            _event(
-                logger=logger,
-                role=role,
-                name="approval_accept_settings_applied",
-                id=request.req_id,
-                accept_settings=accept_settings,
-            )
-        elif result.get("decision") == "acceptForSession":
-            _event(
-                logger=logger,
-                role=role,
-                name="approval_session_accept_applied",
-                id=request.req_id,
-                method=request.method,
-            )
+        log_session_approval_applied(
+            logger=logger,
+            role=role,
+            req_id=request.req_id,
+            method=request.method,
+            result=result,
+        )
 
     via = "interactive" if human_flow else "policy_auto"
 
@@ -249,6 +232,81 @@ def build_approval_response_plan(
         command=command_text,
         always_allow=always_allow,
     )
+
+
+def build_always_allow_cached_response_plan(
+    *,
+    request: ApprovalServerRequest,
+    logger: LifecycleLogger,
+    role: str | None,
+    always_allow_commands: set[str] | None,
+    log_auto_decision: bool = True,
+) -> ApprovalResponsePlan | None:
+    command = request.params.get("command")
+    if (
+        request.method != COMMAND_APPROVAL_METHOD
+        or always_allow_commands is None
+        or not isinstance(command, str)
+        or command not in always_allow_commands
+    ):
+        return None
+    result = build_session_approval_response(
+        method=request.method,
+        params=request.params,
+    ) or {"decision": "accept"}
+    decision = approval_response_decision_name(result)
+    if log_auto_decision:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_auto_decision",
+            id=request.req_id,
+            method=request.method,
+            decision=decision,
+            source="always_allow_cache",
+            command=command,
+        )
+    return ApprovalResponsePlan(
+        req_id=request.req_id,
+        result=result,
+        via="always_allow_cache",
+        method=request.method,
+        params=request.params,
+        decision=decision,
+        source="always_allow_cache",
+        command=command,
+        always_allow=False,
+    )
+
+
+def log_session_approval_applied(
+    *,
+    logger: LifecycleLogger,
+    role: str | None,
+    req_id: int,
+    method: str,
+    result: dict,
+) -> None:
+    decision = result.get("decision")
+    if isinstance(decision, dict):
+        payload = decision.get("acceptWithExecpolicyAmendment")
+        if isinstance(payload, dict):
+            _event(
+                logger=logger,
+                role=role,
+                name="approval_execpolicy_amendment_applied",
+                id=req_id,
+                execpolicy_amendment=payload.get("execpolicy_amendment"),
+            )
+            return
+    if decision == "acceptForSession":
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_session_accept_applied",
+            id=req_id,
+            method=method,
+        )
 
 
 def _event(
@@ -278,6 +336,84 @@ def _log_regex_allowlist_trace(
 ) -> None:
     if regex_trace is None:
         return
+    for timeout in regex_trace.timed_out_patterns:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_timeout",
+            id=request.req_id,
+            method=request.method,
+            file_path=regex_trace.file_path,
+            line_number=timeout.line_number,
+            pattern=timeout.pattern,
+            duration_sec=timeout.duration_sec,
+            severity="warning",
+            warning="approval regex timed out and requires correction",
+            action_required="fix_regex",
+            command=command,
+            affected_paths=list(affected_paths),
+        )
+        if approval_notify is not None and regex_trace.budget_exhausted is None:
+            approval_notify(
+                format_regex_timeout_notification(
+                    file_path=regex_trace.file_path,
+                    timeout=timeout,
+                    method=request.method,
+                    command=command,
+                    affected_paths=affected_paths,
+                )
+            )
+            _event(
+                logger=logger,
+                role=role,
+                name="approval_regex_timeout_warning_sent",
+                id=request.req_id,
+                method=request.method,
+                file_path=regex_trace.file_path,
+                line_number=timeout.line_number,
+                duration_sec=timeout.duration_sec,
+                command=command,
+                affected_paths=list(affected_paths),
+            )
+    budget_exhausted = regex_trace.budget_exhausted
+    if budget_exhausted is not None:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_budget_exhausted",
+            id=request.req_id,
+            method=request.method,
+            file_path=regex_trace.file_path,
+            budget_sec=budget_exhausted.budget_sec,
+            duration_sec=budget_exhausted.duration_sec,
+            severity="warning",
+            warning="approval regex total budget exhausted and requires correction",
+            action_required="fix_regex",
+            command=command,
+            affected_paths=list(affected_paths),
+        )
+        if approval_notify is not None:
+            approval_notify(
+                format_regex_budget_exhausted_notification(
+                    file_path=regex_trace.file_path,
+                    budget=budget_exhausted,
+                    method=request.method,
+                    command=command,
+                    affected_paths=affected_paths,
+                )
+            )
+            _event(
+                logger=logger,
+                role=role,
+                name="approval_regex_budget_warning_sent",
+                id=request.req_id,
+                method=request.method,
+                file_path=regex_trace.file_path,
+                budget_sec=budget_exhausted.budget_sec,
+                duration_sec=budget_exhausted.duration_sec,
+                command=command,
+                affected_paths=list(affected_paths),
+            )
     if regex_trace.matched:
         _event(
             logger=logger,
@@ -330,12 +466,15 @@ def _log_regex_allowlist_trace(
         if (
             decision == "human"
             and decision_source == "regex_fallback_human"
+            and regex_trace.budget_exhausted is None
+            and (regex_trace.parse_errors or regex_trace.match_errors)
             and approval_notify is not None
         ):
             note = format_regex_fallback_human_notification(
                 command=command,
                 file_path=regex_trace.file_path,
                 parse_errors=regex_trace.parse_errors,
+                match_errors=regex_trace.match_errors,
                 affected_paths=affected_paths,
             )
             approval_notify(note)
@@ -357,4 +496,16 @@ def _log_regex_allowlist_trace(
             method=request.method,
             file_path=regex_trace.file_path,
             error=parse_error,
+        )
+    for match_error in regex_trace.match_errors:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_match_error",
+            id=request.req_id,
+            method=request.method,
+            file_path=regex_trace.file_path,
+            error=match_error,
+            command=command,
+            affected_paths=list(affected_paths),
         )

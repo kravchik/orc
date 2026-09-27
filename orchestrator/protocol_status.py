@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.context_window import format_context_usage_status
+from orchestrator.status_output_runtime import MAX_IN_PROGRESS_STATUS_WINDOWS
 
 IGNORED_STATUS_METHODS = {
     # These are verbose codex/event deltas mirrored by item/* events.
@@ -29,7 +30,12 @@ def should_emit_status_method(method: str) -> bool:
 class ProtocolItemTracker:
     """Tracks protocol item lifecycle from item/* events."""
 
-    def __init__(self, *, max_tracked_turns: int = 5) -> None:
+    def __init__(
+        self,
+        *,
+        max_tracked_turns: int = 5,
+        max_in_progress_turns: int = MAX_IN_PROGRESS_STATUS_WINDOWS,
+    ) -> None:
         self._turn_items: "OrderedDict[str, OrderedDict[str, dict[str, str]]]" = OrderedDict()
         self._turn_order: list[str] = []
         self._turn_status: dict[str, str] = {}
@@ -38,6 +44,7 @@ class ProtocolItemTracker:
         self._command_output_stats: dict[tuple[str, str], dict[str, Any]] = {}
         self._aux_turn_id = "__aux__"
         self._max_tracked_turns = max(1, int(max_tracked_turns))
+        self._max_in_progress_turns = max(1, int(max_in_progress_turns))
         self._last_apply_info: dict[str, Any] | None = None
         self._forgotten_turn_ids: "OrderedDict[str, None]" = OrderedDict()
 
@@ -71,11 +78,16 @@ class ProtocolItemTracker:
             self._current_turn_id = turn_id
             self._turn_status[turn_id] = "in_progress"
             self._ensure_turn(turn_id)
-            self._prune_turns()
+            forgotten_turn_ids, forgotten_turn_reasons = self._prune_turns(
+                preserve_turn_id=turn_id
+            )
             self._last_apply_info = {
                 "kind": "turn_started",
                 "turn_id": turn_id,
             }
+            if forgotten_turn_ids:
+                self._last_apply_info["forgotten_turn_ids"] = forgotten_turn_ids
+                self._last_apply_info["forgotten_turn_reasons"] = forgotten_turn_reasons
             return None
         if method == "turn/completed":
             turn_id = _extract_turn_id(method=method, params=params)
@@ -86,11 +98,16 @@ class ProtocolItemTracker:
                 self._current_turn_id = None
             self._last_completed_turn_id = turn_id
             self._ensure_turn(turn_id)
-            self._prune_turns()
+            forgotten_turn_ids, forgotten_turn_reasons = self._prune_turns(
+                preserve_turn_id=turn_id
+            )
             self._last_apply_info = {
                 "kind": "turn_completed",
                 "turn_id": turn_id,
             }
+            if forgotten_turn_ids:
+                self._last_apply_info["forgotten_turn_ids"] = forgotten_turn_ids
+                self._last_apply_info["forgotten_turn_reasons"] = forgotten_turn_reasons
             return None
 
         current_turn_id = self.current_turn_id()
@@ -126,9 +143,14 @@ class ProtocolItemTracker:
         current = bucket.get(item_id)
         if current == payload:
             return None
+        releases_in_progress_retention = (
+            isinstance(current, dict)
+            and current.get("status") == "in_progress"
+            and payload.get("status") != "in_progress"
+        )
         bucket[item_id] = payload
         late_distance = self._late_distance(turn_id)
-        self._last_apply_info = {
+        apply_info = {
             "kind": "item_changed",
             "turn_id": turn_id,
             "item_id": item_id,
@@ -138,7 +160,14 @@ class ProtocolItemTracker:
             "has_active_turn": current_turn_id is not None,
             "turn_status": self._turn_status.get(turn_id),
         }
-        self._prune_turns()
+        forgotten_turn_ids, forgotten_turn_reasons = self._prune_turns(
+            preserve_turn_id=turn_id,
+            allow_preserved_overflow=releases_in_progress_retention,
+        )
+        if forgotten_turn_ids:
+            apply_info["forgotten_turn_ids"] = forgotten_turn_ids
+            apply_info["forgotten_turn_reasons"] = forgotten_turn_reasons
+        self._last_apply_info = apply_info
         return item_id
 
     def _extract_command_output_payload(self, params: dict[str, Any] | None, *, turn_id: str) -> dict[str, str] | None:
@@ -204,11 +233,51 @@ class ProtocolItemTracker:
             self._turn_items[turn_id] = OrderedDict()
             self._turn_order.append(turn_id)
 
-    def _prune_turns(self) -> None:
+    def _prune_turns(
+        self,
+        *,
+        preserve_turn_id: str | None = None,
+        allow_preserved_overflow: bool = False,
+    ) -> tuple[list[str], dict[str, str]]:
         non_aux = [turn_id for turn_id in self._turn_order if turn_id != self._aux_turn_id]
-        if len(non_aux) <= self._max_tracked_turns:
-            return
-        to_remove = non_aux[: len(non_aux) - self._max_tracked_turns]
+        in_progress = [turn_id for turn_id in non_aux if self._turn_has_in_progress_item(turn_id)]
+        to_remove: list[str] = []
+        reasons: dict[str, str] = {}
+
+        while len(in_progress) > self._max_in_progress_turns:
+            candidate = next(
+                (turn_id for turn_id in in_progress if turn_id != preserve_turn_id),
+                None,
+            )
+            if candidate is None:
+                break
+            in_progress.remove(candidate)
+            to_remove.append(candidate)
+            reasons[candidate] = "in_progress_retention_limit"
+
+        retained_in_progress = set(in_progress)
+        evictable = [
+            turn_id
+            for turn_id in non_aux
+            if turn_id not in retained_in_progress and turn_id not in to_remove
+        ]
+        while len(evictable) > self._max_tracked_turns:
+            if allow_preserved_overflow and preserve_turn_id in evictable:
+                without_preserved = [
+                    turn_id for turn_id in evictable if turn_id != preserve_turn_id
+                ]
+                if len(without_preserved) <= self._max_tracked_turns:
+                    break
+            candidate = next(
+                (turn_id for turn_id in evictable if turn_id != preserve_turn_id),
+                None,
+            )
+            if candidate is None:
+                break
+            evictable.remove(candidate)
+            to_remove.append(candidate)
+            reasons[candidate] = "completed_retention_limit"
+
         for turn_id in to_remove:
             self._turn_items.pop(turn_id, None)
             self._turn_status.pop(turn_id, None)
@@ -221,6 +290,13 @@ class ProtocolItemTracker:
         keys = {key for key in self._command_output_stats.keys() if key[0] in to_remove}
         for key in keys:
             self._command_output_stats.pop(key, None)
+        return to_remove, reasons
+
+    def _turn_has_in_progress_item(self, turn_id: str) -> bool:
+        bucket = self._turn_items.get(turn_id)
+        if not isinstance(bucket, OrderedDict):
+            return False
+        return any(item.get("status") == "in_progress" for item in bucket.values())
 
     def _remember_forgotten_turn(self, turn_id: str) -> None:
         if not isinstance(turn_id, str) or not turn_id or turn_id == self._aux_turn_id:

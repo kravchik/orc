@@ -11,7 +11,7 @@ from orchestrator.adapters import (
     InteractiveSessionStartState,
     InteractiveTurnState,
 )
-from orchestrator.approval import ApprovalPolicy
+from orchestrator.approval import ApprovalPolicy, ApprovalRequest
 from orchestrator.interactive_driver_events import (
     InteractiveAgentResult,
     InteractiveApprovalPromptEvent,
@@ -19,6 +19,8 @@ from orchestrator.interactive_driver_events import (
     InteractiveModelApplyResult,
     InteractiveOutboundNote,
     InteractivePrompt,
+    InteractiveSteerFallbackActivated,
+    InteractiveSteerSubmitted,
     InteractiveStatusEvent,
 )
 from orchestrator.jsonrpc_client_thread_driver import build_threaded_jsonrpc_client_factory
@@ -86,7 +88,7 @@ class CodexInteractiveDriver:
         self._startup_ready = False
         self._backend_started_logged = False
         self._pending_requests: list[InteractivePrompt] = []
-        self._pending_decisions: list[str] = []
+        self._pending_decisions: list[tuple[str, ApprovalRequest | None, InteractiveTurnState | None]] = []
         self._pending_model_selections: list[
             ProxyModelSelection[tuple[AccessPointId, AccessPointId | None]]
         ] = []
@@ -154,13 +156,25 @@ class CodexInteractiveDriver:
             pending_model_selections=len(self._pending_model_selections),
         )
 
-    def submit_approval_decision(self, decision: str) -> None:
-        self._pending_decisions.append(decision)
+    def submit_approval_decision(self, decision: str, *, expected_request: ApprovalRequest | None = None) -> None:
+        self._pending_decisions.append((decision, expected_request, self._active_turn))
 
-    def submit_approval_decision_now(self, decision: str) -> None:
+    def submit_approval_decision_now(self, decision: str, *, expected_request: ApprovalRequest | None = None) -> None:
         if self._active_turn is None:
             raise RuntimeError("no active turn is waiting for approval")
+        self._check_approval_request(expected_request)
         self._session.submit_interactive_approval_decision(self._active_turn, decision=decision)
+
+    def _check_approval_request(self, expected_request: ApprovalRequest | None) -> None:
+        if expected_request is None:
+            return
+        turn = self._active_turn
+        pending = turn.pending_approval if turn is not None else None
+        current = pending.approval_request if pending is not None else None
+        if (current is not expected_request
+                or (expected_request.params.get("turnId")
+                    and str(turn.turn_id or "") != str(expected_request.params["turnId"]))):
+            raise RuntimeError("approval request or turn no longer matches")
 
     def submit_model_selection(
         self,
@@ -215,6 +229,10 @@ class CodexInteractiveDriver:
 
     def poll_once(self) -> list[Any]:
         self._poll_progressed = False
+        if self._active_turn is None and self._pending_decisions:
+            self._pending_decisions = [
+                item for item in self._pending_decisions if item[1] is None
+            ]
         was_ready = self._startup_ready
         if not self._startup_ready:
             self._log_pending_request_waiting("startup_not_ready")
@@ -470,6 +488,14 @@ class CodexInteractiveDriver:
             )
         except Exception as exc:
             self._logger.event("interactive_driver_error", error=str(exc), error_type=type(exc).__name__)
+            if bool(getattr(request, "as_steer", False)):
+                self._event_queue.append(
+                    InteractiveSteerFallbackActivated(
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        prompt=request.prompt,
+                    )
+                )
             self._event_queue.append(
                 InteractiveAgentResult(
                     chat_id=chat_id,
@@ -484,6 +510,15 @@ class CodexInteractiveDriver:
             self._interrupt_in_flight = False
             self._steer_blocked_turn_id = None
             return
+        if bool(getattr(request, "as_steer", False)):
+            self._event_queue.append(
+                InteractiveSteerFallbackActivated(
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    prompt=request.prompt,
+                    turn_id=str(self._active_turn.turn_id or ""),
+                )
+            )
         self._steer_blocked_turn_id = None
         self._active_turn_started_at = clock.monotonic()
         self._logger.event(
@@ -523,6 +558,14 @@ class CodexInteractiveDriver:
         self._pending_requests.pop(0)
         self._last_pending_wait_log_key = None
         chat_id, thread_id = request.access_point
+        self._event_queue.append(
+            InteractiveSteerSubmitted(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                prompt=request.prompt,
+                turn_id=turn_id,
+            )
+        )
         self._logger.event(
             "interactive_driver_steer_submitted",
             chat_id=chat_id,
@@ -535,7 +578,7 @@ class CodexInteractiveDriver:
     def _maybe_submit_approval_decision(self) -> None:
         if self._active_turn is None or self._active_request is None or not self._pending_decisions:
             return
-        decision = self._pending_decisions.pop(0)
+        decision, expected_request, expected_turn = self._pending_decisions.pop(0)
         self._logger.event(
             "interactive_driver_submit_approval_decision",
             chat_id=self._active_request.access_point[0],
@@ -543,8 +586,14 @@ class CodexInteractiveDriver:
             decision=decision,
         )
         try:
+            if expected_request is not None and self._active_turn is not expected_turn:
+                raise RuntimeError("approval request or turn no longer matches")
+            self._check_approval_request(expected_request)
             self._session.submit_interactive_approval_decision(self._active_turn, decision=decision)
         except Exception as exc:
+            if expected_request is not None and str(exc) == "approval request or turn no longer matches":
+                self._logger.event("interactive_driver_stale_approval_decision_ignored", error=str(exc))
+                return
             chat_id, thread_id = self._active_request.access_point
             self._logger.event("interactive_driver_error", error=str(exc), error_type=type(exc).__name__)
             self._event_queue.append(

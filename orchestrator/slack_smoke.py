@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
+from orchestrator.access_point_common import AccessPointTransportError
 from orchestrator.processes import LifecycleLogger
 from orchestrator.slack_interactivity import SlackInboundSource, SlackSocketModeSource
 
@@ -23,6 +25,40 @@ class SlackApi:
 
     def auth_test(self) -> dict:
         return self._post_json("auth.test", {})
+
+    def download_file(self, url: str, *, max_bytes: int) -> bytes:
+        parsed = urllib.parse.urlparse(str(url or ""))
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (host == "slack.com" or host.endswith(".slack.com")):
+            raise ValueError("slack file URL must use HTTPS on a slack.com host")
+        req = urllib.request.Request(
+            str(url),
+            headers={"Authorization": f"Bearer {self._token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                content = resp.read(max(0, int(max_bytes)) + 1)
+        except urllib.error.HTTPError as exc:
+            status_code = int(exc.code)
+            error = AccessPointTransportError(
+                f"slack file download http error: {status_code}",
+                retryable=status_code == 429 or 500 <= status_code < 600,
+                error_class=type(exc).__name__,
+                retry_after_sec=_slack_retry_after_sec(exc.headers),
+                status_code=status_code,
+            )
+            exc.close()
+            raise error from exc
+        except urllib.error.URLError as exc:
+            raise AccessPointTransportError(
+                f"slack file download network error: {exc.reason}",
+                retryable=True,
+                error_class=type(exc).__name__,
+            ) from exc
+        if len(content) > int(max_bytes):
+            raise ValueError("slack file exceeds download limit")
+        return content
 
     def conversations_history(
         self,
@@ -48,12 +84,15 @@ class SlackApi:
         text: str,
         thread_ts: str | None = None,
         blocks: list[dict] | None = None,
+        mrkdwn: bool | None = None,
     ) -> dict:
         payload: dict[str, object] = {"channel": channel_id, "text": text}
         if thread_ts:
             payload["thread_ts"] = thread_ts
         if isinstance(blocks, list) and blocks:
             payload["blocks"] = blocks
+        if mrkdwn is not None:
+            payload["mrkdwn"] = mrkdwn
         response = self._post_json("chat.postMessage", payload)
         message = response.get("message")
         if isinstance(message, dict):
@@ -67,10 +106,13 @@ class SlackApi:
         ts: str,
         text: str,
         blocks: list[dict] | None = None,
+        parse: str | None = None,
     ) -> dict:
         payload: dict[str, object] = {"channel": channel_id, "ts": ts, "text": text}
         if isinstance(blocks, list):
             payload["blocks"] = blocks
+        if parse is not None:
+            payload["parse"] = parse
         response = self._post_json("chat.update", payload)
         message = response.get("message")
         if isinstance(message, dict):
@@ -101,17 +143,53 @@ class SlackApi:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"slack {method} http error: {exc.code}") from exc
+            status_code = int(exc.code)
+            error = AccessPointTransportError(
+                f"slack {method} http error: {status_code}",
+                retryable=status_code == 429 or 500 <= status_code < 600,
+                error_class=type(exc).__name__,
+                retry_after_sec=_slack_retry_after_sec(exc.headers),
+                status_code=status_code,
+            )
+            exc.close()
+            raise error from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"slack {method} network error: {exc.reason}") from exc
+            reason = exc.reason
+            raise AccessPointTransportError(
+                f"slack {method} network error: {reason}",
+                retryable=True,
+                error_class=type(reason).__name__ if isinstance(reason, BaseException) else type(exc).__name__,
+            ) from exc
         try:
             response = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"slack {method} invalid json response") from exc
         if response.get("ok") is not True:
             error_text = str(response.get("error", "unknown_error"))
-            raise RuntimeError(f"slack {method} failed: {error_text}")
+            raise AccessPointTransportError(
+                f"slack {method} failed: {error_text}",
+                retryable=error_text
+                in {
+                    "fatal_error",
+                    "internal_error",
+                    "ratelimited",
+                    "request_timeout",
+                    "service_unavailable",
+                    "temporarily_unavailable",
+                },
+                error_class="SlackApiError",
+            )
         return response
+
+
+def _slack_retry_after_sec(headers: object) -> float | None:
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    raw = headers.get("Retry-After")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def run_slack_smoke(

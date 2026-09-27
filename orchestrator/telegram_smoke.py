@@ -11,6 +11,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
+from orchestrator.access_point_common import AccessPointTransportError
 from orchestrator.processes import LifecycleLogger
 
 
@@ -29,6 +30,7 @@ class TelegramApi:
         self._token = token
         base_root = (api_base_url or "https://api.telegram.org").rstrip("/")
         self._base = f"{base_root}/bot{token}"
+        self._file_base = f"{base_root}/file/bot{token}"
         self._ssl_context = (
             ssl._create_unverified_context() if insecure_skip_verify else ssl.create_default_context()
         )
@@ -98,6 +100,38 @@ class TelegramApi:
             payload["text"] = text
         self._post_json("answerCallbackQuery", payload)
 
+    def get_file(self, file_id: str) -> dict:
+        payload = self._post_json("getFile", {"file_id": file_id})
+        result = payload.get("result")
+        return result if isinstance(result, dict) else {}
+
+    def download_file(self, file_path: str, *, max_bytes: int) -> bytes:
+        normalized_path = str(file_path or "").lstrip("/")
+        if not normalized_path:
+            raise ValueError("telegram file path is empty")
+        req = urllib.request.Request(f"{self._file_base}/{normalized_path}", method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=self._ssl_context) as resp:
+                content = resp.read(max(0, int(max_bytes)) + 1)
+        except urllib.error.HTTPError as exc:
+            status_code = int(exc.code)
+            exc.close()
+            raise AccessPointTransportError(
+                f"telegram file download http error: {status_code}",
+                retryable=status_code == 429 or 500 <= status_code < 600,
+                error_class=type(exc).__name__,
+                status_code=status_code,
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise AccessPointTransportError(
+                f"telegram file download network error: {exc.reason}",
+                retryable=True,
+                error_class=type(exc).__name__,
+            ) from exc
+        if len(content) > int(max_bytes):
+            raise ValueError("telegram file exceeds download limit")
+        return content
+
     def _post_json(self, method: str, params: dict) -> dict:
         normalized: dict[str, str] = {}
         for key, value in params.items():
@@ -117,6 +151,7 @@ class TelegramApi:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = ""
+            retry_after_sec: float | None = None
             try:
                 body = exc.read().decode("utf-8")
             except Exception:
@@ -125,22 +160,59 @@ class TelegramApi:
                 try:
                     payload = json.loads(body)
                     desc = payload.get("description")
+                    retry_after_sec = _telegram_retry_after_sec(payload)
                     if isinstance(desc, str) and desc.strip():
                         detail = f": {desc.strip()}"
                     else:
                         detail = f": {body[:240]}"
                 except Exception:
                     detail = f": {body[:240]}"
-            raise RuntimeError(f"telegram {method} http error: {exc.code}{detail}") from exc
+            status_code = int(exc.code)
+            error = AccessPointTransportError(
+                f"telegram {method} http error: {status_code}{detail}",
+                retryable=status_code == 429 or 500 <= status_code < 600,
+                error_class=type(exc).__name__,
+                retry_after_sec=retry_after_sec,
+                status_code=status_code,
+            )
+            exc.close()
+            raise error from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"telegram {method} network error: {exc.reason}") from exc
+            reason = exc.reason
+            raise AccessPointTransportError(
+                f"telegram {method} network error: {reason}",
+                retryable=True,
+                error_class=type(reason).__name__ if isinstance(reason, BaseException) else type(exc).__name__,
+            ) from exc
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"telegram {method} invalid json response") from exc
         if payload.get("ok") is not True:
-            raise RuntimeError(f"telegram {method} failed: {payload}")
+            status_code = payload.get("error_code")
+            status_code = int(status_code) if isinstance(status_code, int) else None
+            raise AccessPointTransportError(
+                f"telegram {method} failed: {payload}",
+                retryable=status_code == 429
+                or (status_code is not None and 500 <= status_code < 600),
+                error_class="TelegramApiError",
+                retry_after_sec=_telegram_retry_after_sec(payload),
+                status_code=status_code,
+            )
         return payload
+
+
+def _telegram_retry_after_sec(payload: object) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    parameters = payload.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    raw = parameters.get("retry_after")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def run_telegram_smoke(

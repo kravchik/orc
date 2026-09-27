@@ -13,13 +13,16 @@ from orchestrator.approval import (
     ApprovalPolicy,
     ApprovalRequest,
     COMMAND_APPROVAL_METHOD,
+    approval_response_decision_name,
     build_session_approval_response,
     supports_session_approval,
 )
 from orchestrator.approval_runtime import (
     ApprovalServerRequest,
     _log_regex_allowlist_trace,
+    build_always_allow_cached_response_plan,
     build_approval_response_plan,
+    log_session_approval_applied,
     parse_server_request,
 )
 from orchestrator.context_window import compaction_matches_thread, parse_context_usage
@@ -626,7 +629,7 @@ class CodexJsonRpcSession:
         if always_allow and session_result is None:
             raise RuntimeError("session approval is unavailable for this request")
         resolved_decision = (
-            str(session_result["decision"])
+            approval_response_decision_name(session_result)
             if session_result is not None
             else normalized
         )
@@ -647,21 +650,13 @@ class CodexJsonRpcSession:
                 and command
             ):
                 self._always_allow_commands.add(command)
-            accept_settings = result.get("acceptSettings")
-            if isinstance(accept_settings, dict):
-                self._logger.event(
-                    "approval_accept_settings_applied",
-                    role=self._role,
-                    id=pending.server_request.req_id,
-                    accept_settings=accept_settings,
-                )
-            elif result.get("decision") == "acceptForSession":
-                self._logger.event(
-                    "approval_session_accept_applied",
-                    role=self._role,
-                    id=pending.server_request.req_id,
-                    method=pending.server_request.method,
-                )
+            log_session_approval_applied(
+                logger=self._logger,
+                role=self._role,
+                req_id=pending.server_request.req_id,
+                method=pending.server_request.method,
+                result=result,
+            )
         self._send_response(req_id=pending.server_request.req_id, result=result)
         state.pending_approval = None
         state.pending_approval_emitted = False
@@ -986,6 +981,15 @@ class CodexJsonRpcSession:
         state: InteractiveTurnState,
         request: ApprovalServerRequest,
     ) -> InteractiveTurnProgress | None:
+        cached_plan = build_always_allow_cached_response_plan(
+            request=request,
+            logger=self._logger,
+            role=self._role,
+            always_allow_commands=self._always_allow_commands,
+        )
+        if cached_plan is not None:
+            self._send_response(req_id=cached_plan.req_id, result=cached_plan.result)
+            return None
         decision_trace = self._approval_policy.decide_with_trace(method=request.method, params=request.params) if self._approval_policy is not None else None
         decision = decision_trace.decision if decision_trace is not None else "human"
         if decision == "human" and decision_trace is not None:
@@ -1617,8 +1621,25 @@ class CodexJsonRpcSession:
     def _emit_protocol_status(self, method: str, params: dict) -> None:
         self._update_context_usage(method=method, params=params)
         changed_item_id = self._item_tracker.apply(method=method, params=params)
+        apply_info = self._item_tracker.last_apply_info() or {}
+        forgotten_turn_reasons = apply_info.get("forgotten_turn_reasons")
+        if isinstance(forgotten_turn_reasons, dict):
+            for turn_id, reason in forgotten_turn_reasons.items():
+                self._logger.event(
+                    "protocol_turn_evicted",
+                    role=self._role,
+                    turn_id=turn_id,
+                    reason=reason,
+                )
+        if apply_info.get("kind") == "item_ignored_forgotten_turn":
+            self._logger.event(
+                "protocol_item_forgotten_turn_update_ignored",
+                role=self._role,
+                method=method,
+                turn_id=apply_info.get("turn_id"),
+                current_turn_distance=apply_info.get("late_distance"),
+            )
         if changed_item_id is not None:
-            apply_info = self._item_tracker.last_apply_info() or {}
             self._logger.event(
                 "protocol_item_changed",
                 role=self._role,

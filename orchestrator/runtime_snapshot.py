@@ -7,6 +7,9 @@ from typing import Any, Iterable
 from orchestrator.access_point_common import AccessPointKey
 
 
+ORC_RUNTIME_ID_LABEL = "ORC runtime id"
+
+
 @dataclass(frozen=True)
 class RuntimeNodeSnapshot:
     role: str
@@ -19,6 +22,7 @@ class RuntimeNodeSnapshot:
     thread_name: str = ""
     configured_model: str = ""
     effective_model: str = ""
+    approval_target: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         row: dict[str, Any] = {
@@ -34,9 +38,11 @@ class RuntimeNodeSnapshot:
             "thread_name": self.thread_name,
         }
         row.update({key: value for key, value in optional.items() if value})
-        if self.role == "agent":
+        if self.role in {"agent", "steward"}:
             row["configured_model"] = self.configured_model or "default"
             row["effective_model"] = self.effective_model or "pending"
+        if self.approval_target and self.approval_target != "human":
+            row["approval_target"] = self.approval_target
         return row
 
 
@@ -132,12 +138,17 @@ def format_status_text(
     if binding is not None:
         lines.extend(
             [
-                f"agent_id: {binding.agent_id}",
+                f"{ORC_RUNTIME_ID_LABEL}: {binding.agent_id}",
                 *([f"session: {binding.thread_name}"] if binding.thread_name else []),
                 f"cwd: {binding.cwd}",
                 f"mode: {binding.mode}",
                 f"configured_model: {binding.configured_model or 'default'}",
                 f"effective_model: {binding.effective_model or 'pending'}",
+                *(
+                    [f"approver: {binding.approval_target}"]
+                    if binding.approval_target and binding.approval_target != "human"
+                    else []
+                ),
             ]
         )
     return "\n".join(lines)
@@ -170,4 +181,5 @@ def _node_from_row(
         thread_name=str(row.get("thread_name") or "").strip(),
         configured_model=configured_model,
         effective_model=effective_model,
+        approval_target=str(row.get("approval_target") or "").strip(),
     )

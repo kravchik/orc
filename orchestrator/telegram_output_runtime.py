@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import html
-import re
 from dataclasses import dataclass
 from typing import Callable
 
 from orchestrator import clock
+from orchestrator.access_point_common import access_point_retry_after_seconds
+from orchestrator.status_output_runtime import MAX_IN_PROGRESS_STATUS_WINDOWS
 from orchestrator.steward_restore_notice_rendering import render_session_references_html
-from orchestrator.telegram_status import TelegramStatusClearPlan, TelegramStatusConfig, TelegramStatusWindow
+from orchestrator.telegram_status import TelegramStatusConfig, TelegramStatusWindow
 
 
 def split_telegram_message(text: str, limit: int = 3900) -> list[str]:
@@ -45,16 +46,6 @@ class TelegramDueStatusCandidate:
     thread_id: int | None
     last_flush_ts: float | None
     delivery_kind: str
-
-
-@dataclass(frozen=True)
-class TelegramQueuedStatusDelete:
-    source: str
-    status_key: str
-    chat_id: int
-    message_id: int
-    thread_id: int | None
-    dropped_pending_lines: int
 
 
 class TelegramBotStatusBudget:
@@ -177,7 +168,7 @@ class _StatusTelemetryClient:
             result = self._base.send_message(chat_id=chat_id, text=payload_text, **payload_kwargs)
         except Exception as exc:
             if self._rate_limit_notifier is not None:
-                self._rate_limit_notifier(_extract_retry_after_sec(exc))
+                self._rate_limit_notifier(access_point_retry_after_seconds(exc))
             raise
         message_id = result.get("message_id") if isinstance(result, dict) else None
         self._logger.event(
@@ -208,7 +199,7 @@ class _StatusTelemetryClient:
             )
         except Exception as exc:
             if self._rate_limit_notifier is not None:
-                self._rate_limit_notifier(_extract_retry_after_sec(exc))
+                self._rate_limit_notifier(access_point_retry_after_seconds(exc))
             raise
         self._logger.event(
             "telegram_op",
@@ -227,7 +218,7 @@ class _StatusTelemetryClient:
             self._base.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception as exc:
             if self._rate_limit_notifier is not None:
-                self._rate_limit_notifier(_extract_retry_after_sec(exc))
+                self._rate_limit_notifier(access_point_retry_after_seconds(exc))
             raise
         self._logger.event(
             "telegram_op",
@@ -269,6 +260,8 @@ class TelegramOutputRuntime:
         self._status_config = status_config
         self._status_monotonic_now = status_monotonic_now
         self._status_windows: dict[str, TelegramStatusWindow] = {}
+        self._in_progress_status_keys: dict[str, None] = {}
+        self._release_after_flush_status_keys: set[str] = set()
         self._latest_status_key: str | None = None
 
     def append_status(
@@ -300,51 +293,34 @@ class TelegramOutputRuntime:
         self._latest_status_key = key
 
     def clear_status(self) -> None:
-        for window in self._status_windows.values():
-            window.clear()
         self._status_windows.clear()
+        self._in_progress_status_keys.clear()
+        self._release_after_flush_status_keys.clear()
         self._latest_status_key = None
-
-    def take_clear_deletes(self) -> list[TelegramQueuedStatusDelete]:
-        deletes: list[TelegramQueuedStatusDelete] = []
-        target_fields = self._target_fields()
-        thread_id = target_fields.get("thread_id")
-        normalized_thread_id = thread_id if isinstance(thread_id, int) else None
-        for window in self._status_windows.values():
-            plan = window.take_clear_plan()
-            if plan is None:
-                continue
-            self._logger.event(
-                "telegram_status_clear_queued",
-                source=self._source,
-                status_key=plan.status_key,
-                chat_id=plan.chat_id,
-                message_id=plan.message_ids[0],
-                message_count=len(plan.message_ids),
-                dropped_pending_lines=plan.dropped_pending_lines,
-                **target_fields,
-            )
-            for message_id in plan.message_ids:
-                deletes.append(
-                    TelegramQueuedStatusDelete(
-                        source=self._source,
-                        status_key=plan.status_key,
-                        chat_id=plan.chat_id,
-                        message_id=message_id,
-                        thread_id=normalized_thread_id,
-                        dropped_pending_lines=plan.dropped_pending_lines,
-                    )
-                )
-        self._status_windows.clear()
-        self._latest_status_key = None
-        return deletes
 
     def status_keys(self) -> list[str]:
         return list(self._status_windows.keys())
 
+    def set_status_in_progress(self, *, status_key: str, in_progress: bool) -> None:
+        if in_progress:
+            self._release_after_flush_status_keys.discard(status_key)
+            self._in_progress_status_keys.setdefault(status_key, None)
+            self._enforce_in_progress_retention()
+            self._prune_status_windows()
+            return
+        if status_key not in self._in_progress_status_keys:
+            return
+        window = self._status_windows.get(status_key)
+        if window is not None and window.pending_delivery_kind() is not None:
+            self._release_after_flush_status_keys.add(status_key)
+            return
+        self._release_status_key(status_key)
+
     def discard_pending_status_updates(self) -> None:
         for window in self._status_windows.values():
             window.discard_pending()
+        for status_key in list(self._release_after_flush_status_keys):
+            self._release_status_key(status_key)
 
     def flush_status(self, *, status_key: str | None = None) -> bool:
         key = status_key if status_key is not None else self._latest_status_key
@@ -354,12 +330,14 @@ class TelegramOutputRuntime:
         if window is None:
             return False
         window.flush_pending(reason="manual")
+        self._release_status_key_after_flush(key)
         return True
 
     def flush_due_statuses(self) -> bool:
         progressed = False
-        for window in self._status_windows.values():
+        for status_key, window in self._status_windows.items():
             if window.flush_due(reason="due"):
+                self._release_status_key_after_flush(status_key)
                 progressed = True
         return progressed
 
@@ -420,7 +398,63 @@ class TelegramOutputRuntime:
             monotonic_now=self._status_monotonic_now or clock.monotonic,
         )
         self._status_windows[key] = window
+        self._prune_status_windows()
         return window
+
+    def _prune_status_windows(self) -> None:
+        retention_limit = max(1, int(self._status_config.max_tracked_windows))
+        evictable = [
+            key for key in self._status_windows if key not in self._in_progress_status_keys
+        ]
+        while len(evictable) > retention_limit:
+            status_key = evictable.pop(0)
+            self._evict_status_window(
+                status_key=status_key,
+                reason="completed_retention_limit",
+                retention_limit=retention_limit,
+            )
+
+    def _enforce_in_progress_retention(self) -> None:
+        retention_limit = MAX_IN_PROGRESS_STATUS_WINDOWS
+        while len(self._in_progress_status_keys) > retention_limit:
+            status_key = next(iter(self._in_progress_status_keys))
+            self._evict_status_window(
+                status_key=status_key,
+                reason="in_progress_retention_limit",
+                retention_limit=retention_limit,
+            )
+
+    def _evict_status_window(
+        self,
+        *,
+        status_key: str,
+        reason: str,
+        retention_limit: int,
+    ) -> None:
+        self._status_windows.pop(status_key, None)
+        self._in_progress_status_keys.pop(status_key, None)
+        self._release_after_flush_status_keys.discard(status_key)
+        if self._latest_status_key == status_key:
+            self._latest_status_key = None
+        self._logger.event(
+            "telegram_status_window_evicted",
+            source=self._source,
+            status_key=status_key,
+            chat_id=self._chat_id_getter(),
+            tracked_windows=len(self._status_windows),
+            in_progress_windows=len(self._in_progress_status_keys),
+            retention_limit=retention_limit,
+            reason=reason,
+            **self._target_fields(),
+        )
+
+    def _release_status_key_after_flush(self, status_key: str) -> None:
+        if status_key in self._release_after_flush_status_keys:
+            self._release_status_key(status_key)
+
+    def _release_status_key(self, status_key: str) -> None:
+        self._release_after_flush_status_keys.discard(status_key)
+        self._in_progress_status_keys.pop(status_key, None)
 
     def _resolve_status_key(
         self,
@@ -485,7 +519,7 @@ class TelegramOutputRuntime:
             try:
                 sent = self._client.send_message(chat_id=target_chat_id, text=chunk, **kwargs)
             except Exception as exc:
-                retry_after_sec = _extract_retry_after_sec(exc)
+                retry_after_sec = access_point_retry_after_seconds(exc)
                 self._note_rate_limited(retry_after_sec)
                 self._logger.event(
                     "telegram_response_error",
@@ -642,13 +676,3 @@ def _render_expandable_block_message(*, title: str, body_text: str) -> str:
 
 def _escape_html(value: str) -> str:
     return html.escape(value, quote=False)
-
-
-def _extract_retry_after_sec(exc: Exception) -> int | None:
-    match = re.search(r"retry after (\d+)", str(exc), flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None

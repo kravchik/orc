@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 import html
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class SlackRenderedMessage:
+    text: str
+    blocks: list[dict[str, object]] | None = None
+    plain_fallback: bool = False
 
 
 def render_session_references_html(text: str) -> str:
@@ -21,6 +29,51 @@ def render_session_references_slack(text: str) -> str:
     return "\n".join(line for line, _changed in rendered)
 
 
+def render_session_references_slack_payload(
+    text: str,
+) -> SlackRenderedMessage:
+    rendered_text = render_session_references_slack(text)
+    lines = str(text).splitlines()
+    restore_list = _is_restore_notice(text)
+    if not any(_line_requires_rich_text(line, restore_list=restore_list) for line in lines):
+        return SlackRenderedMessage(text=rendered_text)
+
+    elements: list[dict[str, object]] = []
+    for index, line in enumerate(lines):
+        prefix, label, suffix = _split_session_reference_line(
+            line,
+            restore_list=restore_list,
+        )
+        name = (
+            _extract_thread_name(label, prefix=prefix, restore_list=restore_list)
+            if prefix is not None
+            else None
+        )
+        if prefix is None or name is None:
+            _append_rich_text(elements, line)
+        else:
+            _append_rich_text(elements, prefix)
+            elements.append({"type": "text", "text": name, "style": {"bold": True}})
+            _append_rich_text(elements, label[len(name) :] + suffix)
+        if index + 1 < len(lines):
+            _append_rich_text(elements, "\n")
+    return SlackRenderedMessage(
+        text=str(text),
+        blocks=[
+            {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": elements,
+                    }
+                ],
+            }
+        ],
+        plain_fallback=True,
+    )
+
+
 def render_restore_notice_html(text: str) -> str:
     return render_session_references_html(text)
 
@@ -33,7 +86,7 @@ def _render_line_html(line: str, *, restore_list: bool) -> tuple[str, bool]:
     prefix, label, suffix = _split_session_reference_line(line, restore_list=restore_list)
     if prefix is None:
         return html.escape(line), False
-    name = _extract_thread_name(label)
+    name = _extract_thread_name(label, prefix=prefix, restore_list=restore_list)
     if name is None:
         return html.escape(line), False
     label_suffix = label[len(name) :]
@@ -48,11 +101,32 @@ def _render_line_slack(line: str, *, restore_list: bool) -> tuple[str, bool]:
     prefix, label, suffix = _split_session_reference_line(line, restore_list=restore_list)
     if prefix is None:
         return line, False
-    name = _extract_thread_name(label)
+    name = _extract_thread_name(label, prefix=prefix, restore_list=restore_list)
     if name is None:
         return line, False
     label_suffix = label[len(name) :]
-    return f"{prefix}*{name}*{label_suffix}{suffix}", True
+    return f"{prefix}*{_escape_slack_mrkdwn(name)}*{label_suffix}{suffix}", True
+
+
+def _escape_slack_mrkdwn(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _line_requires_rich_text(line: str, *, restore_list: bool) -> bool:
+    prefix, label, _suffix = _split_session_reference_line(line, restore_list=restore_list)
+    if prefix is None:
+        return False
+    name = _extract_thread_name(label, prefix=prefix, restore_list=restore_list)
+    return name is not None and any(marker in name for marker in ("*", "_", "~", "`"))
+
+
+def _append_rich_text(elements: list[dict[str, object]], text: str) -> None:
+    if not text:
+        return
+    if elements and elements[-1].get("type") == "text" and "style" not in elements[-1]:
+        elements[-1]["text"] = str(elements[-1].get("text") or "") + text
+        return
+    elements.append({"type": "text", "text": text})
 
 
 def _split_session_reference_line(
@@ -83,10 +157,20 @@ def _split_session_reference_line(
     return None, line, ""
 
 
-def _extract_thread_name(label: str) -> str | None:
+def _extract_thread_name(
+    label: str,
+    *,
+    prefix: str,
+    restore_list: bool,
+) -> str | None:
     text = str(label).strip()
     if text in {"", "none", "not selected"}:
         return None
+    if not (prefix.endswith("Current session: ") or (restore_list and prefix.endswith("- "))):
+        if text.startswith("[") and text.endswith("]"):
+            return None
+        return text
+
     bracket_start = text.rfind(" [")
     session_id = ""
     prefix = text

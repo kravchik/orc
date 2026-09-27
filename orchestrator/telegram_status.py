@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import re
 import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
 from orchestrator import clock
+from orchestrator.access_point_common import access_point_retry_after_seconds
 
 
 @dataclass(frozen=True)
@@ -17,14 +17,7 @@ class TelegramStatusConfig:
     max_lines: int | None = None
     max_new_lines_per_flush: int = 5
     max_payload_chars: int = 3900
-
-
-@dataclass(frozen=True)
-class TelegramStatusClearPlan:
-    status_key: str
-    chat_id: int
-    message_ids: tuple[int, ...]
-    dropped_pending_lines: int
+    max_tracked_windows: int = 5
 
 
 class TelegramStatusWindow:
@@ -168,7 +161,7 @@ class TelegramStatusWindow:
                     )
                 except Exception as exc:
                     self._last_flush_ts = now
-                    retry_after_sec = _extract_retry_after_sec(exc)
+                    retry_after_sec = access_point_retry_after_seconds(exc)
                     self._logger.event(
                         "telegram_status_snapshot_error",
                         source=self._source,
@@ -184,60 +177,6 @@ class TelegramStatusWindow:
                         self._rate_limit_notifier(retry_after_sec)
             else:
                 self._window.clear()
-
-    def clear(self) -> None:
-        plan = self.take_clear_plan()
-        if plan is None:
-            return
-        for message_id in plan.message_ids:
-            try:
-                self._client.delete_message(chat_id=plan.chat_id, message_id=message_id)
-            except Exception as exc:
-                retry_after_sec = _extract_retry_after_sec(exc)
-                self._logger.event(
-                    "telegram_status_delete_error",
-                    source=self._source,
-                    status_key=self._status_key,
-                    chat_id=plan.chat_id,
-                    message_id=message_id,
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                    retry_after_sec=retry_after_sec,
-                    **self._target_fields_getter(),
-                )
-                if self._rate_limit_notifier is not None:
-                    self._rate_limit_notifier(retry_after_sec)
-        self._logger.event(
-            "telegram_status_cleared",
-            source=self._source,
-            status_key=self._status_key,
-            chat_id=plan.chat_id,
-            message_id=plan.message_ids[0],
-            message_count=len(plan.message_ids),
-            dropped_pending_lines=plan.dropped_pending_lines,
-            **self._target_fields_getter(),
-        )
-
-    def take_clear_plan(self) -> TelegramStatusClearPlan | None:
-        with self._lock:
-            dropped_pending = len(self._pending)
-            self._pending.clear()
-            self._pending_snapshot_lines = None
-            self._window.clear()
-            self._last_flush_ts = None
-            message_ids = list(self._message_ids)
-            message_chat_id = self._message_chat_id
-            self._message_ids = []
-            self._message_chat_id = None
-            self._last_payload_chunks = []
-            if not message_ids or message_chat_id is None:
-                return None
-            return TelegramStatusClearPlan(
-                status_key=self._status_key,
-                chat_id=message_chat_id,
-                message_ids=tuple(message_ids),
-                dropped_pending_lines=dropped_pending,
-            )
 
     def discard_pending(self) -> None:
         with self._lock:
@@ -392,7 +331,10 @@ class TelegramStatusWindow:
             )
         except Exception as exc:
             self._last_flush_ts = now
-            retry_after_sec = _extract_retry_after_sec(exc)
+            retry_after_sec = access_point_retry_after_seconds(exc)
+            if retry_after_sec is None:
+                self._pending.clear()
+                self._pending_snapshot_lines = None
             self._logger.event(
                 "telegram_status_update_error",
                 source=self._source,
@@ -484,7 +426,10 @@ class TelegramStatusWindow:
             )
         except Exception as exc:
             self._last_flush_ts = now
-            retry_after_sec = _extract_retry_after_sec(exc)
+            retry_after_sec = access_point_retry_after_seconds(exc)
+            if retry_after_sec is None:
+                self._pending.clear()
+                self._pending_snapshot_lines = None
             self._logger.event(
                 "telegram_status_snapshot_error",
                 source=self._source,
@@ -584,13 +529,3 @@ def _split_payload(payload: str, limit: int) -> list[str]:
     if rest:
         parts.append(rest)
     return parts if parts else [payload]
-
-
-def _extract_retry_after_sec(exc: Exception) -> int | None:
-    match = re.search(r"retry after (\d+)", str(exc), flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None

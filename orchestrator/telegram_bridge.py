@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from threading import Lock
-from typing import Callable
+from typing import Any, Callable
 
 from orchestrator.processes import LifecycleLogger
 from orchestrator.telegram_smoke import HARD_ALLOWED_CHAT_IDS, TelegramApi
+from orchestrator.uploads import IncomingUpload
 
 
 def truncate_telegram_echo(text: str, limit: int = 3500) -> str:
@@ -46,6 +47,16 @@ class TelegramTextUpdate:
     message_id: int | None
     thread_id: int | None
     text: str
+
+
+@dataclass(frozen=True)
+class TelegramMessageUpdate:
+    update_id: int | None
+    chat_id: int
+    message_id: int | None
+    thread_id: int | None
+    text: str | None
+    attachments: tuple[IncomingUpload, ...]
 
 
 @dataclass(frozen=True)
@@ -137,6 +148,7 @@ def process_telegram_updates(
     chat_state: TelegramChatState,
     on_text_update: Callable[[TelegramTextUpdate], None],
     on_callback_update: Callable[[TelegramCallbackUpdate], None] | None = None,
+    on_message_update: Callable[[TelegramMessageUpdate], None] | None = None,
 ) -> None:
     if not updates:
         return
@@ -204,8 +216,14 @@ def process_telegram_updates(
         if not isinstance(message, dict):
             continue
         chat = message.get("chat")
-        text = message.get("text")
-        if not isinstance(chat, dict) or not isinstance(text, str):
+        if not isinstance(chat, dict):
+            continue
+        text_raw = message.get("text")
+        if not isinstance(text_raw, str):
+            text_raw = message.get("caption")
+        text = text_raw if isinstance(text_raw, str) else None
+        attachments = _telegram_attachments(message)
+        if text is None and not attachments:
             continue
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
@@ -221,6 +239,7 @@ def process_telegram_updates(
             chat_id=chat_id,
             message_id=message_id,
             text=text,
+            attachment_count=len(attachments),
         )
         if allowed_chat_ids is not None and chat_id not in allowed_chat_ids:
             logger.event(
@@ -231,15 +250,66 @@ def process_telegram_updates(
             )
             continue
         chat_state.set_current(chat_id)
-        on_text_update(
-            TelegramTextUpdate(
+        if on_message_update is not None:
+            on_message_update(
+                TelegramMessageUpdate(
+                    update_id=upd_id if isinstance(upd_id, int) else None,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    thread_id=thread_id,
+                    text=text,
+                    attachments=attachments,
+                )
+            )
+        elif text is not None:
+            on_text_update(TelegramTextUpdate(
                 update_id=upd_id if isinstance(upd_id, int) else None,
                 chat_id=chat_id,
                 message_id=message_id,
                 thread_id=thread_id,
                 text=text,
-            )
+            ))
+
+
+def _telegram_attachments(message: dict[str, Any]) -> tuple[IncomingUpload, ...]:
+    document = message.get("document")
+    if isinstance(document, dict) and str(document.get("file_id") or "").strip():
+        return (
+            IncomingUpload(
+                source_id=str(document["file_id"]),
+                preferred_name=str(document.get("file_name") or "document"),
+                declared_size=(
+                    int(document["file_size"])
+                    if isinstance(document.get("file_size"), int)
+                    else None
+                ),
+                download_ref=str(document["file_id"]),
+            ),
         )
+    photos = [item for item in message.get("photo", []) if isinstance(item, dict)]
+    photos = [item for item in photos if str(item.get("file_id") or "").strip()]
+    if not photos:
+        return ()
+    largest = max(
+        photos,
+        key=lambda item: (
+            int(item.get("width") or 0) * int(item.get("height") or 0),
+            int(item.get("file_size") or 0),
+        ),
+    )
+    unique_id = str(largest.get("file_unique_id") or largest["file_id"])
+    return (
+        IncomingUpload(
+            source_id=str(largest["file_id"]),
+            preferred_name=f"photo-{unique_id}.jpg",
+            declared_size=(
+                int(largest["file_size"])
+                if isinstance(largest.get("file_size"), int)
+                else None
+            ),
+            download_ref=str(largest["file_id"]),
+        ),
+    )
 
 
 def extract_telegram_http_code(exc: Exception) -> int | None:

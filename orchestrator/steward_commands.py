@@ -30,14 +30,55 @@ class ApproverCommand:
     usage_error: str = ""
 
 
+@dataclass(frozen=True)
+class AgentsCommand:
+    scope: str = "here"
+    usage_error: str = ""
+
+
+@dataclass(frozen=True)
+class ResumeCommand:
+    scope: str = "here"
+    selector: str = ""
+    usage_error: str = ""
+
+
+@dataclass(frozen=True)
+class InspectCommand:
+    scope: str = "here"
+    usage_error: str = ""
+
+
+@dataclass(frozen=True)
+class StewardHelpContext:
+    project_cwd: str = ""
+    has_binding: bool = False
+    auto_start: bool = False
+
+
 SHAMAN_USAGE = "/shaman [show|assign <address>|rename <address>|remove]"
 GRUNT_USAGE = "/grunt [show|assign <address>|rename <address>|remove]"
-APPROVER_USAGE = "/approver [show|assign <address>|change <address>|clear]"
+APPROVER_USAGE = "/approver [show|assign <address|human>]"
+AGENTS_USAGE = "/agents [here|all]"
+RESUME_USAGE = "/resume [here|all] <name|uuid>"
+INSPECT_USAGE = "/inspect [all]"
 
 
 STEWARD_COMMANDS = (
     StewardCommandSpec("bind", "start and bind a runtime agent to this access point."),
     StewardCommandSpec("help", "show this help.", local_immediate=True),
+    StewardCommandSpec(
+        "agents",
+        "show Codex sessions and their ORC access points.",
+        local_immediate=True,
+        usage=AGENTS_USAGE,
+    ),
+    StewardCommandSpec(
+        "resume",
+        "continue a Codex session in this access point.",
+        local_immediate=True,
+        usage=RESUME_USAGE,
+    ),
     StewardCommandSpec(
         "approver",
         "show or change who approves this agent.",
@@ -65,6 +106,7 @@ STEWARD_COMMANDS = (
         "inspect",
         "show current API-backed session summary and tracked active work.",
         local_immediate=True,
+        usage=INSPECT_USAGE,
     ),
     StewardCommandSpec(
         "interrupt",
@@ -136,18 +178,48 @@ def parse_approver_command(raw_text: str) -> ApproverCommand:
         if operation_args:
             return ApproverCommand(operation=operation, usage_error="usage: /approver show")
         return ApproverCommand(operation=operation)
-    if operation in {"assign", "change"}:
+    if operation == "assign":
         if len(operation_args) != 1:
             return ApproverCommand(
                 operation=operation,
-                usage_error=f"usage: /approver {operation} <address>",
+                usage_error="usage: /approver assign <address|human>",
             )
         return ApproverCommand(operation=operation, address=operation_args[0])
-    if operation == "clear":
-        if operation_args:
-            return ApproverCommand(operation=operation, usage_error="usage: /approver clear")
-        return ApproverCommand(operation=operation)
     return ApproverCommand(operation=operation, usage_error=f"usage: {APPROVER_USAGE}")
+
+
+def parse_agents_command(raw_text: str) -> AgentsCommand:
+    parts = str(raw_text or "").strip().split()
+    args = parts[1:]
+    if not args:
+        return AgentsCommand()
+    if len(args) == 1 and args[0].lower() in {"here", "all"}:
+        return AgentsCommand(scope=args[0].lower())
+    return AgentsCommand(usage_error=f"usage: {AGENTS_USAGE}")
+
+
+def parse_resume_command(raw_text: str) -> ResumeCommand:
+    parts = str(raw_text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return ResumeCommand(usage_error=f"usage: {RESUME_USAGE}")
+    remainder = parts[1].strip()
+    scope_parts = remainder.split(maxsplit=1)
+    explicit_scope = scope_parts[0].lower()
+    if explicit_scope not in {"here", "all"}:
+        return ResumeCommand(selector=remainder)
+    if len(scope_parts) < 2 or not scope_parts[1].strip():
+        return ResumeCommand(scope=explicit_scope, usage_error=f"usage: {RESUME_USAGE}")
+    return ResumeCommand(scope=explicit_scope, selector=scope_parts[1].strip())
+
+
+def parse_inspect_command(raw_text: str) -> InspectCommand:
+    parts = str(raw_text or "").strip().split()
+    args = parts[1:]
+    if not args:
+        return InspectCommand()
+    if len(args) == 1 and args[0].lower() == "all":
+        return InspectCommand(scope="all")
+    return InspectCommand(usage_error=f"usage: {INSPECT_USAGE}")
 
 
 def _parse_routing_identity_command(
@@ -182,8 +254,46 @@ def _parse_routing_identity_command(
     return RoutingIdentityCommand(operation=operation, usage_error=f"usage: {usage}")
 
 
-def build_steward_help_text(*, state: str) -> str:
-    lines = [f"access point state: {state}", "", "fallback commands:"]
+def build_steward_help_text(
+    *,
+    state: str,
+    startup: StewardHelpContext,
+) -> str:
+    lines = [f"access point state: {state}"]
+    if state == "BOUND_IDLE" and startup.has_binding:
+        lines.extend(["", "startup:"])
+        if startup.auto_start:
+            lines.extend(
+                [
+                    "Runtime agent is waiting for automatic startup after ORC restart.",
+                    "An ordinary message, routed request, or approval will start it.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "Runtime agent is bound but stopped.",
+                    "Ordinary messages go to Keeper. Use /start to start the agent.",
+                ]
+            )
+    elif state == "UNBOUND":
+        lines.extend(["", "startup:"])
+        if startup.project_cwd:
+            lines.extend(
+                [
+                    "No runtime agent is bound.",
+                    f"Folder: {startup.project_cwd}",
+                    "Use /bind or /resume here <name|uuid>.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "No runtime agent or folder is bound.",
+                    "Use /bind or /resume all <name|uuid>.",
+                ]
+            )
+    lines.extend(["", "fallback commands:"])
     lines.extend(
         f"{spec.usage or f'/{spec.name}'} - {spec.description}"
         for spec in STEWARD_COMMANDS

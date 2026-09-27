@@ -26,6 +26,12 @@ class SlackApiThreadDriver:
     def auth_test(self) -> dict:
         return self._call("auth_test")
 
+    def download_file(self, url: str, *, max_bytes: int) -> bytes:
+        result = self._call("download_file", url=url, max_bytes=max_bytes)
+        if not isinstance(result, bytes):
+            raise RuntimeError("slack download_file did not return bytes")
+        return result
+
     def conversations_history(
         self,
         *,
@@ -47,13 +53,19 @@ class SlackApiThreadDriver:
         text: str,
         thread_ts: str | None = None,
         blocks: list[dict] | None = None,
+        mrkdwn: bool | None = None,
     ) -> dict:
+        kwargs: dict[str, Any] = {
+            "channel_id": channel_id,
+            "text": text,
+            "thread_ts": thread_ts,
+            "blocks": blocks,
+        }
+        if mrkdwn is not None:
+            kwargs["mrkdwn"] = mrkdwn
         return self._call(
             "post_message",
-            channel_id=channel_id,
-            text=text,
-            thread_ts=thread_ts,
-            blocks=blocks,
+            **kwargs,
         )
 
     def update_message(
@@ -63,13 +75,19 @@ class SlackApiThreadDriver:
         ts: str,
         text: str,
         blocks: list[dict] | None = None,
+        parse: str | None = None,
     ) -> dict:
+        kwargs: dict[str, Any] = {
+            "channel_id": channel_id,
+            "ts": ts,
+            "text": text,
+            "blocks": blocks,
+        }
+        if parse is not None:
+            kwargs["parse"] = parse
         return self._call(
             "update_message",
-            channel_id=channel_id,
-            ts=ts,
-            text=text,
-            blocks=blocks,
+            **kwargs,
         )
 
     def delete_message(

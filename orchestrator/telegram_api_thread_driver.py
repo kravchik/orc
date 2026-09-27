@@ -67,6 +67,16 @@ class TelegramApiThreadDriver:
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
         self._call("answer_callback_query", callback_query_id, text=text)
 
+    def get_file(self, file_id: str) -> dict[str, Any]:
+        result = self._call("get_file", file_id)
+        return result if isinstance(result, dict) else {}
+
+    def download_file(self, file_path: str, *, max_bytes: int) -> bytes:
+        result = self._call("download_file", file_path, max_bytes=max_bytes)
+        if not isinstance(result, bytes):
+            raise RuntimeError("telegram download_file did not return bytes")
+        return result
+
     @property
     def poll_cycles(self) -> int:
         return self._poll_cycles

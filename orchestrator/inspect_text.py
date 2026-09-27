@@ -10,6 +10,7 @@ def format_thread_metadata_lines(
     thread_id_fallback: str = "",
     thread_name_fallback: str = "",
     model_fallback: str = "",
+    include_model: bool = True,
 ) -> list[str]:
     raw = dict(metadata or {})
     lines: list[str] = []
@@ -56,9 +57,10 @@ def format_thread_metadata_lines(
     if preview:
         lines.append(f"preview: {preview}")
 
-    model = _normalize_text(raw.get("model")) or model_fallback.strip()
-    if model:
-        lines.append(f"model: {model}")
+    if include_model:
+        model = _normalize_text(raw.get("model")) or model_fallback.strip()
+        if model:
+            lines.append(f"model: {model}")
 
     return lines
 
@@ -67,9 +69,8 @@ def append_active_work_lines(lines: list[str], rows: list[dict[str, str]]) -> No
     active_rows = [row for row in rows if str(row.get("status", "")).strip() == "in_progress"]
     lines.append(f"open items tracked by ORC: {len(active_rows)}")
     if not active_rows:
-        lines.append("active work: none")
+        lines.append("none")
         return
-    lines.append("active work:")
     for row in active_rows:
         item_type = str(row.get("type", "item") or "item").strip() or "item"
         item_id = str(row.get("id", "") or "").strip()
