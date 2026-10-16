@@ -34,7 +34,7 @@ Normally you talk directly to the Codex agent. If the agent is stopped, ordinary
 
 ## Agent Providers
 
-Orc Master supports Codex, Claude, and OpenCode through named runtime profiles.
+Orc Master supports Codex, Claude, OpenCode, and general ACP protocol for any agent that supports it.
 The default provider is Codex. Use `/providers` to see configured profiles and
 whether their local commands and dependencies are available.
 
