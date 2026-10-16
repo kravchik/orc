@@ -4,41 +4,33 @@
   <img src="friendly-orc-warden-with-lantern.png" alt="friendly orc master" width="180">
 </p>
 
-Orc Master connects local coding-agent sessions to Telegram and Slack. It is a
-chat control plane for individual sessions and, when addresses are assigned, a
-router for multi-agent work.
+Orc Master is a chat control plane and a network router for local agent sessions.
 
-## Chat Control Plane
+## Chat control plane
+Do all the work via the chats, not only alerts and statuses. Talk to an agent, review approvals, see the reasoning process, control binding via commands, or via talking to a Steward session, upload images, set up regex auto-approvals, etc.
 
-Use the chat for the work itself, not only for alerts and status updates. You
-can talk to an agent, follow progress, review approvals, upload files, inspect
-session state, and control the binding without returning to the local terminal.
+## Sessions network
+An agent session can have an assigned address, so it is able to talk to other sessions. For example - prompt a session to be a "lead" and to lead another session throughout the long list of tasks. Or one session can do the job, consult with another about some domain-specific knowledge, and ask another session to review a plan, or diff. No network layout is imposed; any setup is doable with an address assigned and a prompt describing the network.
 
-Two participants can answer in a connected chat:
+## What Is In A Chat
 
-- the **runtime agent** reads and edits the project, runs commands, and handles
-  the task;
-- **Steward** manages directories, sessions, providers, bindings, and other ORC
-  control-plane operations.
+Do all the job via the chats, not only alerts and statuses. Though I am not planning to support all the provider-specific system stuff (like selecting /fast mode, or switching to /planning).
 
-Ordinary messages normally go to the runtime agent. If no agent is running,
-they go to Steward. Use `/steward <message>` when you explicitly want Steward
-while an agent is running.
+Orc Master forwards:
 
-When another message arrives during an active turn, Orc Master normally steers
-it into that turn as additional guidance. If the agent is waiting for approval,
-resolve or interrupt the approval first.
+- reasoning and progress updates;
+- final answers;
+- command and file-change approval requests;
+- session state, model, active turn, and context-window information.
 
-## Agent Networks
+If send another message while the agent is still working, Orc Master normally steers it into the agent's active turn as additional guidance. If the agent is waiting for approval, resolve or interrupt the approval first.
 
-Assign addresses to agent sessions and they can pass tasks and results directly
-to one another. A lead can coordinate workers through a long plan, an agent can
-consult a specialist, or one session can ask another to review a plan or diff.
-Orc Master does not impose a network layout: the addresses and the agents'
-prompts define how the network works.
+There are two participants behind the bot:
 
-See [Setting Up An Agent Network](#setting-up-an-agent-network) for the routing
-roles and a minimal lead/worker example.
+- **coding agent** talks to you, reads and edits the project, runs commands, etc;
+- **Steward** manages Orc Master as an alternative to /commands;
+
+Normally you talk directly to the Codex agent. If the agent is stopped, ordinary messages go to Steward instead. Use `/steward <message>` when you explicitly want to ask Steward something while an agent is running.
 
 ## Agent Providers
 
