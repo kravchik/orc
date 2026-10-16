@@ -46,6 +46,27 @@ def find_latest_codex_cli_session_id(
     return sessions[0].session_id
 
 
+def resolve_codex_resume_session_id(
+    *,
+    resume: bool,
+    project_cwd: str,
+    sessions_root: str | Path | None,
+) -> str | None:
+    """Resolve the latest matching Codex CLI session without protocol I/O."""
+
+    if not resume:
+        return None
+    session_id = find_latest_codex_cli_session_id(
+        project_cwd=project_cwd,
+        sessions_root=sessions_root,
+    )
+    if not session_id:
+        raise RuntimeError(
+            "resume requested but no Codex CLI session found in ~/.codex/sessions for current cwd"
+        )
+    return session_id
+
+
 def find_codex_cli_thread_name(
     session_id: str,
     *,

@@ -2,6 +2,9 @@
 
 This guide covers the practical setup for `telegram-steward`.
 
+Install and authenticate agent runtimes separately; see
+[Agent Provider Setup](SETUP.providers.md).
+
 ## Bot Setup
 
 1. Create or manage the bot in Telegram `@BotFather`.
@@ -37,6 +40,13 @@ Notes:
 - supergroups and channels ids usually start with `-100`;
 - topic ids cannot be allowlisted separately;
 - allowing a supergroup allows all topics in that supergroup.
+
+When Telegram Steward gets the effective allowlist from `--env-file`, it
+reloads `TELEGRAM_ALLOWED_CHAT_IDS` after that file changes. Added and removed
+chat ids apply to the next incoming Telegram batch without restarting Orc
+Master. An invalid, empty, or temporarily unavailable file leaves the last
+valid allowlist active and records a warning. A CLI value or process environment
+value has higher priority and remains static for the lifetime of the process.
 
 ### Connecting in a Private Chat
 
@@ -89,10 +99,10 @@ Shared:
   - path to the persistent bot state file
   - default: `state/telegram-steward-access-points.json`
 - `--sessions-root`
-  - override the directory where Codex sessions are stored
+  - override the directory where `codex-native` sessions are stored
   - default: `~/.codex/sessions`
 - `--steward-command`
-  - command used to launch the steward agent
+  - command used to launch the Codex-based Steward and default Codex runtime
   - default: `codex app-server`
 - `--steward-prompt-file`
   - startup prompt file
@@ -110,10 +120,10 @@ Shared:
   - one of `accept`, `decline`, `human`
   - default: `human`
 - `--thread-approval-policy`
-  - approval policy used for Codex worker threads
+  - default launch approval policy for profiles that support this setting
   - default: `on-request`
 - `--thread-sandbox`
-  - sandbox mode used for Codex worker threads
+  - default launch sandbox for profiles that support this setting
   - default: `workspace-write`
 
 Telegram-specific:
@@ -134,14 +144,11 @@ Telegram-specific:
 - `--telegram-insecure-skip-verify`
   - disable TLS verification for the Telegram API client
   - default: off
-- `--request-timeout-sec`
-  - steward request timeout
-  - default: `0`
 - `--rpc-timeout-sec`
-  - timeout for requests to the local Codex process
+  - timeout for local runtime control requests
   - default: `5`
 - `--rpc-retries`
-  - retry count for requests to the local Codex process
+  - retry count for local runtime control requests
   - default: `3`
 
 ## Security

@@ -6,7 +6,11 @@ from queue import Empty, Queue
 from typing import Any
 
 from orchestrator.serialized_call_lane import SerializedCallLane
-from orchestrator.telegram_smoke import TelegramApi
+from orchestrator.telegram_smoke import TelegramApi, TELEGRAM_LONG_POLL_HTTP_GRACE_SEC
+
+
+TELEGRAM_POLL_SERVER_TIMEOUT_SEC = 1
+TELEGRAM_POLL_STOP_SCHEDULING_GRACE_SEC = 1.0
 
 
 class TelegramApiThreadDriver:
@@ -112,9 +116,17 @@ class TelegramApiThreadDriver:
         if thread is None:
             return
         self._poll_loop_stop.set()
-        thread.join(timeout=2.0)
+        stop_timeout_sec = (
+            TELEGRAM_POLL_SERVER_TIMEOUT_SEC
+            + TELEGRAM_LONG_POLL_HTTP_GRACE_SEC
+            + TELEGRAM_POLL_STOP_SCHEDULING_GRACE_SEC
+        )
+        thread.join(timeout=stop_timeout_sec)
         if thread.is_alive():
-            raise RuntimeError("telegram-api-longpoll-thread did not stop within 2.00s")
+            raise RuntimeError(
+                "telegram-api-longpoll-thread did not stop within "
+                f"{stop_timeout_sec:.2f}s"
+            )
         self._poll_loop_thread = None
 
     def drain_updates(self) -> list[dict[str, Any]]:
@@ -138,7 +150,7 @@ class TelegramApiThreadDriver:
         return self._ops_lane.call(method, *args, **kwargs)
 
     def _poll_loop(self) -> None:
-        timeout_sec = min(self._poll_timeout_sec, 1)
+        timeout_sec = min(self._poll_timeout_sec, TELEGRAM_POLL_SERVER_TIMEOUT_SEC)
         while not self._poll_loop_stop.is_set():
             self._poll_cycles += 1
             try:

@@ -32,7 +32,7 @@ from orchestrator.approval_details_formatter import (
     build_approval_details_lines,
     build_approval_prompt_detail_lines,
 )
-from orchestrator.approval import ApprovalRequest, supports_session_approval
+from orchestrator.agent_session import AgentApprovalRequest
 from orchestrator.processes import LifecycleLogger
 from orchestrator.runtime_snapshot import AccessPointRuntimeSnapshot, format_status_text
 from orchestrator.steward_restore_notice_rendering import render_session_references_html
@@ -58,7 +58,7 @@ from orchestrator.telegram_bridge import TelegramCallbackUpdate, TelegramTextUpd
 class PendingTelegramStewardApproval:
     access_point: AccessPointKey
     source: str
-    request: ApprovalRequest
+    request: AgentApprovalRequest
     prompt_state: AccessPointDeliveryState
     prompt_queue_token: int | None
     prompt_message_id: int | None
@@ -71,14 +71,14 @@ class _TelegramOutboundExecutionResult:
     sent_chunks: int = 0
 
 
-def _format_steward_approval_prompt(request: ApprovalRequest) -> str:
+def _format_steward_approval_prompt(request: AgentApprovalRequest) -> str:
     header = f"{approval_source_icon(request)} approval needed"
     lines = [header]
     lines.extend(build_approval_prompt_detail_lines(request, string_limit=220))
     return "\n".join(lines)
 
 
-def _format_steward_approval_details(request: ApprovalRequest) -> str:
+def _format_steward_approval_details(request: AgentApprovalRequest) -> str:
     return "\n".join(
         build_approval_details_lines(
             request,
@@ -159,7 +159,11 @@ class TelegramStewardAccessPointAdapter:
             status_config=self._status_config,
             status_monotonic_now=self._status_monotonic_now,
         )
-        status_store = TurnStatusStore(output_runtime=output_runtime)
+        status_store = TurnStatusStore(
+            output_runtime=output_runtime,
+            access_point=(access_point.chat_id, access_point.thread_id),
+            semantic_source=source,
+        )
         pair = (output_runtime, status_store)
         mapping[access_point] = pair
         return pair
@@ -294,12 +298,9 @@ class TelegramStewardAccessPointAdapter:
         *,
         access_point: AccessPointKey,
         source: str,
-        request: ApprovalRequest,
+        request: AgentApprovalRequest,
     ) -> PendingTelegramStewardApproval:
-        allow_always = supports_session_approval(
-            method=request.method,
-            params=request.params,
-        )
+        allow_always = request.supports_decision("always_allow")
         buttons = [
             {"text": "Accept", "callback_data": "approval:accept"},
             {"text": "Decline", "callback_data": "approval:decline"},
@@ -331,14 +332,14 @@ class TelegramStewardAccessPointAdapter:
             on_success=lambda result, p=pending, req=request, ap=access_point, src=source: self._on_approval_prompt_sent(
                 pending=p,
                 send_result=result,
-                req_id=req.req_id,
+                approval_ref=req.approval_ref.value,
                 access_point=ap,
                 source=src,
             ),
             on_failure=lambda exc, p=pending, req=request, ap=access_point, src=source: self._on_approval_prompt_failed(
                 pending=p,
                 exc=exc,
-                req_id=req.req_id,
+                approval_ref=req.approval_ref.value,
                 access_point=ap,
                 source=src,
             ),
@@ -389,10 +390,19 @@ class TelegramStewardAccessPointAdapter:
         if update.data not in ("approval:accept", "approval:decline", "approval:always_allow"):
             return None
         decision = update.data.split(":", 1)[1]
-        if decision == "always_allow" and not supports_session_approval(
-            method=pending.request.method,
-            params=pending.request.params,
+        if decision == "always_allow" and not pending.request.supports_decision(
+            "always_allow"
         ):
+            self._logger.event(
+                "steward_approval_preflight_rejected",
+                access_point_type=pending.access_point.type,
+                chat_id=pending.access_point.chat_id,
+                thread_id=pending.access_point.thread_id,
+                approval_ref=pending.request.approval_ref.value,
+                decision=decision,
+                reason="unsupported_decision",
+                via="button",
+            )
             return None
         if isinstance(update.callback_query_id, str):
             self._enqueue_answer_callback_query(
@@ -423,10 +433,7 @@ class TelegramStewardAccessPointAdapter:
         raw = inbound.text.strip().lower()
         if raw in ("accept", "decline") or (
             raw == "always_allow"
-            and supports_session_approval(
-                method=pending.request.method,
-                params=pending.request.params,
-            )
+            and pending.request.supports_decision("always_allow")
         ):
             return handle_approval_action(
                 StewardApprovalDecision(access_point=inbound.access_point, decision=raw, via="text")
@@ -451,10 +458,7 @@ class TelegramStewardAccessPointAdapter:
             access_point=pending_approval.access_point,
             source="agent" if pending_approval.source == "agent" else "steward",
         )
-        allow_always = supports_session_approval(
-            method=pending_approval.request.method,
-            params=pending_approval.request.params,
-        )
+        allow_always = pending_approval.request.supports_decision("always_allow")
         self._enqueue_send_text(
             output_runtime=output_runtime,
             text=(
@@ -507,7 +511,7 @@ class TelegramStewardAccessPointAdapter:
                 "telegram_approval_prompt_cancelled",
                 chat_id=pending_approval.access_point.chat_id,
                 thread_id=pending_approval.access_point.thread_id,
-                id=pending_approval.request.req_id,
+                approval_ref=pending_approval.request.approval_ref.value,
                 route_target=pending_approval.source,
             )
             return
@@ -535,6 +539,25 @@ class TelegramStewardAccessPointAdapter:
             on_success=lambda _result: on_sent(),
             on_failure=on_failed,
             ordering_key=access_point,
+        )
+
+    def queue_turn_failure(
+        self,
+        *,
+        access_point: AccessPointKey,
+        error: str,
+        source: str,
+        kind: TelegramKind,
+        on_sent: Callable[[], None],
+        on_failed: Callable[[Exception], None],
+    ) -> None:
+        self.queue_text_reply(
+            access_point=access_point,
+            text=f"agent error: {error}",
+            source=source,
+            kind=kind,
+            on_sent=on_sent,
+            on_failed=on_failed,
         )
 
     def queue_routing_copy(
@@ -1117,7 +1140,7 @@ class TelegramStewardAccessPointAdapter:
         *,
         pending: PendingTelegramStewardApproval,
         send_result: _TelegramOutboundExecutionResult,
-        req_id: str,
+        approval_ref: str,
         access_point: AccessPointKey,
         source: str,
     ) -> None:
@@ -1128,7 +1151,7 @@ class TelegramStewardAccessPointAdapter:
             "telegram_approval_prompt_sent",
             chat_id=access_point.chat_id,
             thread_id=access_point.thread_id,
-            id=req_id,
+            approval_ref=approval_ref,
             route_target=source,
             message_id=send_result.first_message_id,
         )
@@ -1138,7 +1161,7 @@ class TelegramStewardAccessPointAdapter:
         *,
         pending: PendingTelegramStewardApproval,
         exc: Exception,
-        req_id: str,
+        approval_ref: str,
         access_point: AccessPointKey,
         source: str,
     ) -> None:
@@ -1149,7 +1172,7 @@ class TelegramStewardAccessPointAdapter:
             "telegram_approval_prompt_error",
             chat_id=access_point.chat_id,
             thread_id=access_point.thread_id,
-            id=req_id,
+            approval_ref=approval_ref,
             route_target=source,
             error=str(exc),
             error_type=type(exc).__name__,

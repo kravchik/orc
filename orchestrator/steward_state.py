@@ -6,6 +6,16 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from orchestrator.access_point_common import AccessPointKey
+from orchestrator.agent_identity import (
+    ProviderExecutionProfile,
+    ProviderKind,
+    ProviderProfileId,
+    ProviderSessionRef,
+)
+from orchestrator.runtime_profile_catalog import (
+    BUILTIN_RUNTIME_PROFILE_CATALOG,
+    RuntimeProfileCatalog,
+)
 from orchestrator.approval_target import (
     HUMAN_APPROVAL_TARGET,
     sanitize_approval_targets,
@@ -23,6 +33,9 @@ from orchestrator.uploads import (
 
 RUNTIME_INTENT_BOUND_IDLE = "BOUND_IDLE"
 RUNTIME_INTENT_RUNNING = "RUNNING"
+LEGACY_REGISTRY_SCHEMA_VERSION = 1
+PROVIDER_REGISTRY_SCHEMA_VERSION = 2
+CURRENT_REGISTRY_SCHEMA_VERSION = 3
 
 
 def normalize_runtime_intent(value: object) -> str:
@@ -35,13 +48,237 @@ def normalize_runtime_intent(value: object) -> str:
 @dataclass
 class PersistedAccessPointState:
     project_cwd: str
-    agent: dict[str, Any] | None
+    agent: PersistedAgentBinding | None
     runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE
     address: str = ""
     routing_mode: str = ""
     approval_target: str = HUMAN_APPROVAL_TARGET
     local_command_journal: LocalCommandJournal = field(default_factory=LocalCommandJournal)
     pending_uploads: tuple[PendingUpload, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConfiguredProviderFields:
+    cwd: str
+    model: str = ""
+    backend: str = ""
+    mode: str = "proxy"
+    approval_policy: str = ""
+    sandbox: str = ""
+    args: tuple[str, ...] = ()
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "cwd": self.cwd,
+            "model": self.model,
+            "backend": self.backend,
+            "mode": self.mode,
+            "approval_policy": self.approval_policy,
+            "sandbox": self.sandbox,
+            "args": list(self.args),
+        }
+
+
+@dataclass(frozen=True)
+class PersistedAgentBinding:
+    agent_id: str
+    provider: ProviderKind
+    profile: ProviderProfileId
+    session: ProviderSessionRef | None
+    session_name: str
+    configured: ConfiguredProviderFields
+    adapter_name: str = ""
+    adapter_version: str = ""
+    runtime_name: str = ""
+    runtime_version: str = ""
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "provider": self.provider.value,
+            "profile": self.profile.value,
+            "session_name": self.session_name,
+            "configured": self.configured.to_payload(),
+            "components": {
+                "adapter": self.adapter_name,
+                "adapter_version": self.adapter_version,
+                "runtime": self.runtime_name,
+                "runtime_version": self.runtime_version,
+            },
+        }
+        if self.session is not None:
+            payload["session"] = {
+                "provider": self.session.provider.value,
+                "profile": self.session.profile.value,
+                "id": self.session.native_id,
+            }
+        return payload
+
+    def to_runtime_spec(self) -> dict[str, Any]:
+        spec: dict[str, Any] = {
+            "provider": self.provider.value,
+            "profile": self.profile.value,
+            "cwd": self.configured.cwd,
+            "model": self.configured.model,
+            "backend": self.configured.backend,
+            "mode": self.configured.mode,
+            "approval_policy": self.configured.approval_policy,
+            "sandbox": self.configured.sandbox,
+            "args": list(self.configured.args),
+        }
+        if self.session is not None:
+            spec["thread_id"] = self.session.native_id
+        if self.session_name:
+            spec["thread_name"] = self.session_name
+        return spec
+
+
+def parse_registry_schema_version(value: object) -> int:
+    if value is None:
+        return LEGACY_REGISTRY_SCHEMA_VERSION
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in {
+            LEGACY_REGISTRY_SCHEMA_VERSION,
+            PROVIDER_REGISTRY_SCHEMA_VERSION,
+            CURRENT_REGISTRY_SCHEMA_VERSION,
+        }
+    ):
+        raise ValueError(f"unsupported registry schema version: {value!r}")
+    return value
+
+
+def parse_persisted_agent_binding(
+    raw: object,
+    *,
+    project_cwd: str,
+    schema_version: int,
+    profile_catalog: RuntimeProfileCatalog = BUILTIN_RUNTIME_PROFILE_CATALOG,
+) -> PersistedAgentBinding | None:
+    if not isinstance(raw, dict):
+        return None
+    resolved_version = parse_registry_schema_version(schema_version)
+    if resolved_version in {
+        PROVIDER_REGISTRY_SCHEMA_VERSION,
+        CURRENT_REGISTRY_SCHEMA_VERSION,
+    }:
+        configured_raw = raw.get("configured")
+        if not isinstance(configured_raw, dict):
+            raise ValueError("agent.configured must be an object")
+        provider = profile_catalog.require_provider(raw.get("provider"))
+        if (
+            resolved_version == PROVIDER_REGISTRY_SCHEMA_VERSION
+            and provider != ProviderKind.CODEX
+        ):
+            raise ValueError(
+                "schema version 2 supports implicit profile only for provider=codex"
+            )
+        profile = profile_catalog.resolve(
+            provider,
+            raw.get("profile")
+            if resolved_version == CURRENT_REGISTRY_SCHEMA_VERSION
+            else None,
+        ).profile
+        if resolved_version == CURRENT_REGISTRY_SCHEMA_VERSION and "profile" not in raw:
+            raise ValueError("agent.profile is required")
+        launch = profile_catalog.normalize_launch_configuration(
+            profile_catalog.resolve(provider, profile),
+            args=configured_raw.get("args"),
+            provider_approval_policy=configured_raw.get("approval_policy"),
+            sandbox=configured_raw.get("sandbox"),
+        )
+        configured = ConfiguredProviderFields(
+            cwd=str(configured_raw.get("cwd") or project_cwd or ""),
+            model=str(configured_raw.get("model") or "").strip(),
+            backend=str(configured_raw.get("backend") or "").strip(),
+            mode=str(configured_raw.get("mode") or "proxy").strip() or "proxy",
+            approval_policy=launch.provider_approval_policy,
+            sandbox=launch.sandbox,
+            args=launch.args,
+        )
+        components_raw = raw.get("components")
+        if components_raw is not None and not isinstance(components_raw, dict):
+            raise ValueError("agent.components must be an object")
+        components = components_raw if isinstance(components_raw, dict) else {}
+        session_raw = raw.get("session")
+        session: ProviderSessionRef | None = None
+        if session_raw is not None:
+            if not isinstance(session_raw, dict):
+                raise ValueError("agent.session must be an object")
+            session_provider = profile_catalog.require_provider(
+                session_raw.get("provider")
+            )
+            if session_provider != provider:
+                raise ValueError("agent.session provider must match agent provider")
+            session_profile = profile_catalog.resolve(
+                session_provider,
+                session_raw.get("profile")
+                if resolved_version == CURRENT_REGISTRY_SCHEMA_VERSION
+                else profile,
+            ).profile
+            if (
+                resolved_version == CURRENT_REGISTRY_SCHEMA_VERSION
+                and "profile" not in session_raw
+            ):
+                raise ValueError("agent.session.profile is required")
+            if session_profile != profile:
+                raise ValueError("agent.session profile must match agent profile")
+            session = ProviderSessionRef(
+                session_provider,
+                str(session_raw.get("id") or ""),
+                session_profile,
+            )
+        return PersistedAgentBinding(
+            agent_id=str(raw.get("agent_id") or "").strip(),
+            provider=provider,
+            profile=profile,
+            session=session,
+            session_name=str(raw.get("session_name") or "").strip(),
+            configured=configured,
+            adapter_name=str(components.get("adapter") or "").strip(),
+            adapter_version=str(components.get("adapter_version") or "").strip(),
+            runtime_name=str(components.get("runtime") or "").strip(),
+            runtime_version=str(components.get("runtime_version") or "").strip(),
+        )
+
+    # Version 1 had no provider namespace and stored an open-ended runtime spec.
+    spec = raw.get("spec") if isinstance(raw.get("spec"), dict) else {}
+    provider = ProviderKind.CODEX
+    profile = ProviderProfileId.CODEX_NATIVE
+    native_session_id = str(raw.get("thread_id") or spec.get("thread_id") or "").strip()
+    session = (
+        ProviderSessionRef(provider, native_session_id, profile)
+        if native_session_id
+        else None
+    )
+    launch = profile_catalog.normalize_launch_configuration(
+        ProviderExecutionProfile(provider, profile),
+        args=spec.get("args"),
+        provider_approval_policy=spec.get("approval_policy"),
+        sandbox=spec.get("sandbox"),
+    )
+    return PersistedAgentBinding(
+        agent_id=str(raw.get("agent_id") or "").strip(),
+        provider=provider,
+        profile=profile,
+        session=session,
+        session_name=str(raw.get("thread_name") or spec.get("thread_name") or "").strip(),
+        configured=ConfiguredProviderFields(
+            cwd=str(spec.get("cwd") or raw.get("cwd") or project_cwd or ""),
+            model=str(spec.get("model") or raw.get("model") or "").strip(),
+            backend=str(
+                spec.get("backend")
+                or raw.get("configured_backend")
+                or raw.get("backend")
+                or ""
+            ).strip(),
+            mode=str(spec.get("mode") or raw.get("mode") or "proxy").strip() or "proxy",
+            approval_policy=launch.provider_approval_policy,
+            sandbox=launch.sandbox,
+            args=launch.args,
+        ),
+    )
 
 
 def merge_runtime_persisted_state(
@@ -64,9 +301,16 @@ def _is_access_point_id(value: object) -> bool:
 class AccessPointStateStore:
     """Persist Access Point -> runtime binding metadata for lazy restore."""
 
-    def __init__(self, *, path: Path, logger: LifecycleLogger) -> None:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        logger: LifecycleLogger,
+        profile_catalog: RuntimeProfileCatalog = BUILTIN_RUNTIME_PROFILE_CATALOG,
+    ) -> None:
         self._path = path
         self._logger = logger
+        self._profile_catalog = profile_catalog
 
     @property
     def path(self) -> Path:
@@ -100,6 +344,16 @@ class AccessPointStateStore:
                 error_type="ValueError",
             )
             return {}
+        try:
+            schema_version = parse_registry_schema_version(payload.get("version"))
+        except ValueError as exc:
+            self._logger.event(
+                "registry_load_failed",
+                registry_path=str(self._path),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return {}
         entries = payload.get("access_points")
         if not isinstance(entries, list):
             self._logger.event(
@@ -125,8 +379,22 @@ class AccessPointStateStore:
                 continue
             project_cwd_raw = item.get("project_cwd")
             project_cwd = project_cwd_raw.strip() if isinstance(project_cwd_raw, str) else ""
-            agent_raw = item.get("agent")
-            agent = dict(agent_raw) if isinstance(agent_raw, dict) else None
+            try:
+                agent = parse_persisted_agent_binding(
+                    item.get("agent"),
+                    project_cwd=project_cwd,
+                    schema_version=schema_version,
+                    profile_catalog=self._profile_catalog,
+                )
+            except ValueError as exc:
+                self._logger.event(
+                    "agent_binding_restore_discarded",
+                    access_point_type=ap_type,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    error=str(exc),
+                )
+                agent = None
             runtime_intent = normalize_runtime_intent(item.get("runtime_intent"))
             address_raw = item.get("address")
             address = address_raw.strip() if isinstance(address_raw, str) else ""
@@ -262,7 +530,7 @@ class AccessPointStateStore:
                 "project_cwd": state.project_cwd,
             }
             if state.agent is not None:
-                entry["agent"] = dict(state.agent)
+                entry["agent"] = state.agent.to_payload()
                 entry["runtime_intent"] = normalize_runtime_intent(state.runtime_intent)
             if state.address:
                 entry["address"] = state.address
@@ -275,7 +543,7 @@ class AccessPointStateStore:
                 entry["pending_uploads"] = [item.to_payload() for item in state.pending_uploads]
             access_points.append(entry)
         payload = {
-            "version": 1,
+            "version": CURRENT_REGISTRY_SCHEMA_VERSION,
             "access_points": access_points,
         }
         write_text_atomic(
@@ -297,10 +565,11 @@ class PersistedAgentRuntime(Protocol):
         self,
         access_point: AccessPointKey,
         *,
-        spec: dict[str, Any],
-        agent_id: str,
-        thread_id: str,
+        binding: PersistedAgentBinding,
         runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE,
+        address: str = "",
+        routing_mode: str = "",
+        approval_target: str = HUMAN_APPROVAL_TARGET,
     ) -> dict[str, Any]: ...
 
 @dataclass
@@ -319,7 +588,7 @@ class StewardRegistryContext:
             merged[key] = merge_runtime_persisted_state(merged.get(key), runtime_state)
         pruned: dict[AccessPointKey, PersistedAccessPointState] = {}
         for key, value in merged.items():
-            has_agent = isinstance(value.agent, dict) and bool(value.agent)
+            has_agent = value.agent is not None
             has_cwd = bool((value.project_cwd or "").strip())
             has_local_commands = value.local_command_journal.has_state()
             has_pending_uploads = bool(value.pending_uploads)
@@ -368,44 +637,31 @@ def build_steward_registry_context(
     agent_runtime: PersistedAgentRuntime,
     state_path: str | Path | None,
     sort_key: Callable[[AccessPointKey], tuple[str, str, str]],
+    profile_catalog: RuntimeProfileCatalog = BUILTIN_RUNTIME_PROFILE_CATALOG,
 ) -> StewardRegistryContext:
     state_store: AccessPointStateStore | None = None
     persisted_state_by_access_point: dict[AccessPointKey, PersistedAccessPointState] = {}
     if state_path is not None and str(state_path).strip():
-        state_store = AccessPointStateStore(path=Path(str(state_path)).expanduser(), logger=logger)
+        state_store = AccessPointStateStore(
+            path=Path(str(state_path)).expanduser(),
+            logger=logger,
+            profile_catalog=profile_catalog,
+        )
         persisted_state_by_access_point = state_store.load()
         for access_point, state in list(persisted_state_by_access_point.items()):
-            agent_payload = state.agent
-            if not isinstance(agent_payload, dict):
+            agent_binding = state.agent
+            if agent_binding is None:
                 continue
-            spec_payload = agent_payload.get("spec")
-            if isinstance(spec_payload, dict):
-                spec = dict(spec_payload)
-            else:
-                spec = {
-                    "cwd": str(agent_payload.get("cwd") or state.project_cwd or ""),
-                    "mode": str(agent_payload.get("mode") or "proxy"),
-                }
-                model = str(agent_payload.get("model") or "").strip()
-                if model:
-                    spec["model"] = model
-            if not str(spec.get("cwd") or "").strip():
+            if not agent_binding.configured.cwd.strip():
                 continue
-            thread_name = str(agent_payload.get("thread_name") or "").strip()
-            if thread_name and not str(spec.get("thread_name") or "").strip():
-                spec["thread_name"] = thread_name
-            if state.address:
-                spec["address"] = state.address
-                spec["routing_mode"] = state.routing_mode
-            if state.approval_target:
-                spec["approval_target"] = state.approval_target
             try:
                 agent_runtime.restore_binding(
                     access_point,
-                    spec=spec,
-                    agent_id=str(agent_payload.get("agent_id") or ""),
-                    thread_id=str(agent_payload.get("thread_id") or ""),
+                    binding=agent_binding,
                     runtime_intent=state.runtime_intent,
+                    address=state.address,
+                    routing_mode=state.routing_mode,
+                    approval_target=state.approval_target,
                 )
             except Exception as exc:
                 logger.event(

@@ -6,7 +6,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar, Protocol
 
 from orchestrator.access_point_common import AccessPointKey
-from orchestrator.approval import ApprovalRequest
+from orchestrator.agent_identity import TurnRef
+from orchestrator.agent_io import AgentInput, AgentInputOrigin
+from orchestrator.agent_session import (
+    AgentApprovalRequest,
+    RawProviderErrorPayload,
+    raw_provider_error_lifecycle_fields,
+)
 from orchestrator.binding_address import ROUTING_MODE_SHAMAN, ResolvedRoutingIdentity
 from orchestrator.interactive_driver_events import InteractiveAgentResult
 from orchestrator.routing_decision import (
@@ -30,7 +36,7 @@ from orchestrator.steward_runtime_support import PendingInterruptRequest
 class RoutedHandoff:
     sender_address: str
     target_address: str
-    source_turn_id: str
+    source_turn_ref: TurnRef
     target_turn_started: bool = False
 
 
@@ -38,20 +44,25 @@ class RoutedHandoff:
 class RoutingResponseState:
     sender_address: str = ""
     target_address: str = ""
-    turn_id: str = ""
+    turn_ref: TurnRef | None = None
     repair_attempt: int = 0
 
 
 @dataclass(frozen=True)
 class PendingSteerInput:
-    prompt: str
+    agent_input: AgentInput
     source_text: str
 
 
 class AgentConversationRuntime(Protocol):
     def agent_result_suppressed(self, conversation: AgentConversation, preview: str) -> None: ...
     def agent_result_received(self, conversation: AgentConversation, preview: str) -> None: ...
-    def agent_turn_error(self, conversation: AgentConversation, error: str) -> None: ...
+    def agent_turn_error(
+        self,
+        conversation: AgentConversation,
+        error: str,
+        raw_provider_error: RawProviderErrorPayload | None,
+    ) -> None: ...
     def agent_shaman_address(self, access_point: AccessPointKey) -> str: ...
     def agent_grunt_address(self, access_point: AccessPointKey) -> str: ...
     def agent_resolve_target(self, address: str) -> ResolvedRoutingIdentity | None: ...
@@ -62,7 +73,7 @@ class AgentConversationRuntime(Protocol):
     ) -> None: ...
     def agent_escalate_routing_failure(
         self, conversation: AgentConversation, *, sender_address: str,
-        target_address: str, error_code: str, details: str, turn_id: str,
+        target_address: str, error_code: str, details: str, turn_ref: TurnRef,
         target_access_point: AccessPointKey | None = None, target_state: str = "",
     ) -> None: ...
     def agent_deliver_to_human(
@@ -74,7 +85,8 @@ class AgentConversationRuntime(Protocol):
         reply_text: str, decision: RoutingDispatch,
     ) -> None: ...
     def agent_send_reply(self, conversation: AgentConversation, text: str) -> None: ...
-    def agent_submit_request(self, access_point: AccessPointKey, prompt: str) -> None: ...
+    def agent_send_failure(self, conversation: AgentConversation, error: str) -> None: ...
+    def agent_submit_request(self, access_point: AccessPointKey, agent_input: AgentInput) -> None: ...
     def agent_send_notice(self, conversation: AgentConversation, text: str) -> None: ...
 
 
@@ -89,7 +101,7 @@ class AgentConversation:
     routed_handoff: RoutedHandoff | None = None
     routed_reply_to: RoutedReplyTo | None = None
     interrupt_notice: PendingInterruptRequest | None = None
-    pending_approval_request: ApprovalRequest | None = None
+    pending_approval_request: AgentApprovalRequest | None = None
     pending_steer_inputs: list[PendingSteerInput] = field(default_factory=list)
     steer_inputs: list[str] = field(default_factory=list)
     finished: bool = False
@@ -99,18 +111,18 @@ class AgentConversation:
         return "agent"
 
     def handle_result(self, runtime: AgentConversationRuntime, result: InteractiveAgentResult) -> None:
-        reply_text = str(result.reply or "")
-        preview = reply_text.strip()[:200]
+        reply_text = "" if result.failed else result.require_output().text
+        provider_error = result.rendered_error if result.failed else ""
+        preview = (provider_error if result.failed else reply_text).strip()[:200]
         if self.interrupt_notice is not None:
             runtime.agent_result_suppressed(self, preview)
             self.finish()
             return
 
         runtime.agent_result_received(self, preview)
-        turn_id = str(result.turn_id or "")
-        if reply_text.startswith("agent error: "):
-            error = reply_text[len("agent error: "):]
-            runtime.agent_turn_error(self, error)
+        turn_ref = result.turn_ref
+        if result.failed:
+            runtime.agent_turn_error(self, result.error, result.raw_provider_error)
             handoff = self.routed_handoff
             sender = handoff.sender_address if handoff is not None else runtime.agent_shaman_address(self.access_point)
             if sender:
@@ -120,25 +132,31 @@ class AgentConversation:
                         prefix="target",
                         sender_address=handoff.sender_address,
                         target_address=handoff.target_address,
-                        source_turn_id=handoff.source_turn_id,
-                        error=error,
+                        source_turn_ref_sequence=handoff.source_turn_ref.sequence,
+                        error=result.error,
+                        **raw_provider_error_lifecycle_fields(
+                            result.raw_provider_error
+                        ),
                     )
                 self.finish()
                 runtime.agent_escalate_routing_failure(
                     self, sender_address=sender,
                     target_address=handoff.target_address if handoff is not None else "unknown",
-                    error_code="agent_backend_failure", details=error,
-                    turn_id=handoff.source_turn_id if handoff is not None else turn_id,
+                    error_code="agent_backend_failure", details=provider_error,
+                    turn_ref=handoff.source_turn_ref if handoff is not None else turn_ref,
                 )
                 return
+            self.phase = "waiting_reply_delivery"
+            runtime.agent_send_failure(self, provider_error)
+            return
 
         shaman = runtime.agent_shaman_address(self.access_point)
         if shaman:
-            self._handle_shaman_result(runtime, reply_text, turn_id, shaman)
+            self._handle_shaman_result(runtime, reply_text, turn_ref, shaman)
             return
         grunt = runtime.agent_grunt_address(self.access_point)
         if grunt:
-            self._handle_grunt_result(runtime, reply_text, turn_id, grunt)
+            self._handle_grunt_result(runtime, reply_text, turn_ref, grunt)
             return
         if not preview:
             self.finish()
@@ -147,9 +165,9 @@ class AgentConversation:
         runtime.agent_send_reply(self, reply_text)
 
     def _handle_shaman_result(
-        self, runtime: AgentConversationRuntime, reply_text: str, turn_id: str, sender: str,
+        self, runtime: AgentConversationRuntime, reply_text: str, turn_ref: TurnRef, sender: str,
     ) -> None:
-        self.routing.turn_id = turn_id
+        self.routing.turn_ref = turn_ref
         decision = decide_routing_response(
             sender_address=sender,
             reply_text=reply_text,
@@ -162,7 +180,7 @@ class AgentConversation:
                 sender_address=sender,
                 envelope_from=envelope.sender,
                 target_address=envelope.target,
-                turn_id=self.routing.turn_id,
+                turn_ref_sequence=turn_ref.sequence,
                 repair_attempt=self.routing.repair_attempt,
             )
         if isinstance(decision, RoutingReject):
@@ -177,26 +195,26 @@ class AgentConversation:
         runtime.agent_dispatch_routing(self, sender_address=sender, reply_text=reply_text, decision=decision)
 
     def _handle_grunt_result(
-        self, runtime: AgentConversationRuntime, reply_text: str, turn_id: str, sender: str,
+        self, runtime: AgentConversationRuntime, reply_text: str, turn_ref: TurnRef, sender: str,
     ) -> None:
         reply_to = self.routed_reply_to
         if reply_to is None:
             runtime.agent_routing_event(
                 "routing_grunt_reply_target_missing", self.access_point,
-                sender_address=sender, turn_id=turn_id,
+                sender_address=sender, turn_ref_sequence=turn_ref.sequence,
             )
             self.finish()
             runtime.agent_escalate_routing_failure(
                 self, sender_address=sender, target_address="unknown",
                 error_code="reply_target_missing", details="the Grunt operation has no one-hop reply target",
-                turn_id=turn_id,
+                turn_ref=turn_ref,
             )
             return
         if not reply_text.strip():
             self.finish()
             return
 
-        self.routing.turn_id = turn_id
+        self.routing.turn_ref = turn_ref
         if reply_to.address == HUMAN_ADDRESS:
             self._deliver_human(runtime, reply_to.access_point, sender, reply_text)
             return
@@ -209,7 +227,7 @@ class AgentConversation:
                 error_code="reply_target_not_shaman",
                 details="the original caller no longer has a Shaman routing identity",
                 target_access_point=reply_to.access_point,
-                turn_id=turn_id,
+                turn_ref=turn_ref,
             )
             return
 
@@ -219,7 +237,7 @@ class AgentConversation:
             "routing_grunt_reply_envelope_created", self.access_point,
             target_access_point=reply_to.access_point,
             sender_address=sender, target_address=caller,
-            original_target_address=reply_to.address, turn_id=turn_id,
+            original_target_address=reply_to.address, turn_ref_sequence=turn_ref.sequence,
         )
         self.finish()
         runtime.agent_dispatch_routing(
@@ -252,18 +270,27 @@ class AgentConversation:
             "routing_envelope_rejected", self.access_point,
             sender_address=sender, target_address=target,
             error_code=error.code, error=str(error),
-            turn_id=self.routing.turn_id, repair_attempt=self.routing.repair_attempt,
+            turn_ref_sequence=self.routing_turn_ref().sequence,
+            repair_attempt=self.routing.repair_attempt,
         )
         if self.routing.repair_attempt < self.MAX_ROUTING_REPAIR_ATTEMPTS:
             self.routing.repair_attempt += 1
             self.phase = "routing_repair"
             try:
-                runtime.agent_submit_request(self.access_point, self._build_routing_repair_prompt(sender, error))
+                runtime.agent_submit_request(
+                    self.access_point,
+                    AgentInput(
+                        text=self._build_routing_repair_prompt(sender, error),
+                        origin=AgentInputOrigin.ROUTING,
+                        verbatim=True,
+                    ),
+                )
             except Exception as exc:
                 self.finish()
                 runtime.agent_escalate_routing_failure(
                     self, sender_address=sender, target_address=target,
-                    error_code="repair_submit_failed", details=str(exc), turn_id=self.routing.turn_id,
+                    error_code="repair_submit_failed", details=str(exc),
+                    turn_ref=self.routing_turn_ref(),
                 )
                 return
             runtime.agent_send_notice(
@@ -273,7 +300,8 @@ class AgentConversation:
                 runtime.agent_routing_event(
                     event, self.access_point,
                     sender_address=sender, target_address=target,
-                    error_code=error.code, turn_id=self.routing.turn_id,
+                    error_code=error.code,
+                    turn_ref_sequence=self.routing_turn_ref().sequence,
                     repair_attempt=self.routing.repair_attempt,
                 )
             return
@@ -282,14 +310,21 @@ class AgentConversation:
         runtime.agent_routing_event(
             "routing_repair_exhausted", self.access_point,
             sender_address=sender, target_address=target,
-            error_code=error.code, turn_id=self.routing.turn_id,
+            error_code=error.code,
+            turn_ref_sequence=self.routing_turn_ref().sequence,
             repair_attempt=self.routing.repair_attempt,
         )
         runtime.agent_escalate_routing_failure(
             self, sender_address=sender, target_address=target,
             error_code="repair_exhausted", details=self._format_routing_error(error),
-            turn_id=self.routing.turn_id,
+            turn_ref=self.routing_turn_ref(),
         )
+
+    def routing_turn_ref(self) -> TurnRef:
+        turn_ref = self.routing.turn_ref
+        if turn_ref is None:
+            raise RuntimeError("routing response has no TurnRef")
+        return turn_ref
 
     @staticmethod
     def _build_routing_repair_prompt(sender: str, error: RoutingEnvelopeError) -> str:
@@ -312,27 +347,32 @@ class AgentConversation:
             return detail
         return f"{error.code}: {detail}"
 
-    def steer(
+    def queue_steer(
         self,
-        prompt: str,
-        submit: Callable[[AccessPointKey, str], None],
+        agent_input: AgentInput,
         *,
         source_text: str | None = None,
     ) -> bool:
         if self.finished or self.phase != "initial":
             return False
-        submit(self.access_point, prompt)
         self.pending_steer_inputs.append(
             PendingSteerInput(
-                prompt=prompt,
-                source_text=prompt if source_text is None else source_text,
+                agent_input=agent_input,
+                source_text=agent_input.text if source_text is None else source_text,
             )
         )
         return True
 
-    def confirm_steer(self, prompt: str) -> bool:
+    def discard_steer(self, agent_input: AgentInput) -> bool:
         for index, pending in enumerate(self.pending_steer_inputs):
-            if pending.prompt != prompt:
+            if pending.agent_input == agent_input:
+                self.pending_steer_inputs.pop(index)
+                return True
+        return False
+
+    def confirm_steer(self, agent_input: AgentInput) -> bool:
+        for index, pending in enumerate(self.pending_steer_inputs):
+            if pending.agent_input != agent_input:
                 continue
             self.pending_steer_inputs.pop(index)
             self.steer_inputs.append(pending.source_text)

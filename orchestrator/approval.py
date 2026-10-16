@@ -1,4 +1,4 @@
-"""Shared approval policy and decision provider primitives."""
+"""Provider-neutral approval policy primitives."""
 
 from __future__ import annotations
 
@@ -7,26 +7,11 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Callable
 
 from orchestrator.bounded_regex import search_regex_with_timeout
-from orchestrator.file_change_approval import extract_normalized_file_change_paths
-
-
-COMMAND_APPROVAL_METHOD = "item/commandExecution/requestApproval"
-FILE_CHANGE_APPROVAL_METHOD = "item/fileChange/requestApproval"
-
-
-@dataclass(frozen=True)
-class ApprovalRequest:
-    req_id: int
-    method: str
-    params: dict
-    role: str
-
-
-class ApprovalDecisionProvider(Protocol):
-    def decide(self, request: ApprovalRequest) -> str: ...
+from orchestrator.agent_session import AgentApprovalKind, AgentApprovalRequest
+from orchestrator.processes import LifecycleLogger
 
 
 @dataclass(frozen=True)
@@ -113,16 +98,12 @@ class ApprovalPolicy:
             regex_total_budget_sec=total_budget_sec,
         )
 
-    def decide(self, method: str, params: dict) -> str:
-        return self.decide_with_trace(method=method, params=params).decision
+    def decide(self, request: AgentApprovalRequest) -> str:
+        return self.decide_with_trace(request).decision
 
-    def decide_with_trace(self, method: str, params: dict) -> ApprovalDecisionTrace:
-        command = self._extract_command(method=method, params=params)
-        affected_paths = (
-            extract_normalized_file_change_paths(params)
-            if method == FILE_CHANGE_APPROVAL_METHOD
-            else ()
-        )
+    def decide_with_trace(self, request: AgentApprovalRequest) -> ApprovalDecisionTrace:
+        command = request.command
+        affected_paths = request.affected_paths
         if command in self.deny_commands:
             return ApprovalDecisionTrace(
                 decision="decline",
@@ -137,7 +118,11 @@ class ApprovalPolicy:
                 command=command,
                 affected_paths=affected_paths,
             )
-        regex_values = affected_paths if method == FILE_CHANGE_APPROVAL_METHOD else (command,)
+        regex_values = (
+            affected_paths
+            if request.kind is AgentApprovalKind.FILE_CHANGE
+            else (command,)
+        )
         regex_trace = self._match_allow_regex_values(regex_values)
         if regex_trace is not None and regex_trace.matched:
             return ApprovalDecisionTrace(
@@ -176,10 +161,6 @@ class ApprovalPolicy:
         )
 
     @staticmethod
-    def is_approval_method(method: str) -> bool:
-        return method in (COMMAND_APPROVAL_METHOD, FILE_CHANGE_APPROVAL_METHOD)
-
-    @staticmethod
     def normalize_human_decision(raw: str) -> str:
         decision = raw.strip().lower()
         if decision not in ("accept", "decline"):
@@ -197,16 +178,6 @@ class ApprovalPolicy:
                 raise ValueError("approval decision must be accept, decline, or always_allow")
             raise ValueError("approval decision must be accept or decline")
         return decision
-
-    @staticmethod
-    def _extract_command(method: str, params: dict) -> str:
-        if method == COMMAND_APPROVAL_METHOD:
-            cmd = params.get("command")
-            return cmd if isinstance(cmd, str) else ""
-        if method == FILE_CHANGE_APPROVAL_METHOD:
-            tool = params.get("tool")
-            return tool if isinstance(tool, str) else ""
-        return ""
 
     def _match_allow_regex_values(
         self,
@@ -319,50 +290,6 @@ class ApprovalPolicy:
         )
 
 
-def build_execpolicy_amendment_decision(params: dict) -> dict | None:
-    amendment = params.get("proposedExecpolicyAmendment")
-    if not isinstance(amendment, list):
-        return None
-    tokens: list[str] = []
-    for item in amendment:
-        if not isinstance(item, str):
-            return None
-        tokens.append(item)
-    if not tokens:
-        return None
-    return {
-        "acceptWithExecpolicyAmendment": {
-            "execpolicy_amendment": tokens,
-        }
-    }
-
-
-def build_session_approval_response(*, method: str, params: dict) -> dict | None:
-    if method == FILE_CHANGE_APPROVAL_METHOD:
-        return {"decision": "acceptForSession"}
-    if method != COMMAND_APPROVAL_METHOD:
-        return None
-    decision = build_execpolicy_amendment_decision(params=params)
-    if decision is None:
-        return None
-    return {"decision": decision}
-
-
-def approval_response_decision_name(result: dict) -> str:
-    decision = result.get("decision")
-    if isinstance(decision, str) and decision:
-        return decision
-    if isinstance(decision, dict) and len(decision) == 1:
-        name = next(iter(decision))
-        if isinstance(name, str) and name:
-            return name
-    raise ValueError(f"invalid approval response decision: {decision!r}")
-
-
-def supports_session_approval(*, method: str, params: dict) -> bool:
-    return build_session_approval_response(method=method, params=params) is not None
-
-
 def format_regex_auto_approval_notification(
     *,
     command: str,
@@ -411,7 +338,7 @@ def format_regex_timeout_notification(
     *,
     file_path: str,
     timeout: ApprovalRegexTimeout,
-    method: str,
+    approval_kind: str,
     command: str = "",
     affected_paths: tuple[str, ...] = (),
 ) -> str:
@@ -420,7 +347,7 @@ def format_regex_timeout_notification(
         f"file: {file_path}",
         f"line: {timeout.line_number}",
         f"duration: {timeout.duration_sec:.3f}s",
-        f"request: {method}",
+        f"kind: {approval_kind}",
     ]
     if affected_paths:
         lines.append("paths:")
@@ -437,14 +364,14 @@ def format_regex_budget_exhausted_notification(
     *,
     file_path: str,
     budget: ApprovalRegexBudgetExhausted,
-    method: str,
+    approval_kind: str,
     command: str = "",
     affected_paths: tuple[str, ...] = (),
 ) -> str:
     lines = [
         "[AUTO-APPROVAL][REGEX] total budget exhausted",
         f"file: {file_path}",
-        f"request: {method}",
+        f"kind: {approval_kind}",
         f"budget: {budget.budget_sec:.3f}s",
         f"duration: {budget.duration_sec:.3f}s",
     ]
@@ -457,3 +384,206 @@ def format_regex_budget_exhausted_notification(
         "action: fix slow regexes; no regex auto-approval was applied"
     )
     return "\n".join(lines)
+
+
+def _event(
+    *,
+    logger: LifecycleLogger,
+    role: str | None,
+    name: str,
+    **kwargs,
+) -> None:
+    payload = dict(kwargs)
+    if role is not None:
+        payload["role"] = role
+    logger.event(name, **payload)
+
+
+def log_approval_policy_trace(
+    *,
+    logger: LifecycleLogger,
+    role: str | None,
+    approval_ref: str,
+    approval_kind: AgentApprovalKind,
+    decision: str,
+    decision_source: str,
+    command: str,
+    affected_paths: tuple[str, ...],
+    regex_trace: ApprovalRegexAllowlistTrace | None,
+    approval_notify: Callable[[str], None] | None,
+) -> None:
+    if regex_trace is None:
+        return
+    for timeout in regex_trace.timed_out_patterns:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_timeout",
+            approval_ref=approval_ref,
+            approval_kind=approval_kind.value,
+            file_path=regex_trace.file_path,
+            line_number=timeout.line_number,
+            pattern=timeout.pattern,
+            duration_sec=timeout.duration_sec,
+            severity="warning",
+            warning="approval regex timed out and requires correction",
+            action_required="fix_regex",
+            command=command,
+            affected_paths=list(affected_paths),
+        )
+        if approval_notify is not None and regex_trace.budget_exhausted is None:
+            approval_notify(
+                format_regex_timeout_notification(
+                    file_path=regex_trace.file_path,
+                    timeout=timeout,
+                    approval_kind=approval_kind.value,
+                    command=command,
+                    affected_paths=affected_paths,
+                )
+            )
+            _event(
+                logger=logger,
+                role=role,
+                name="approval_regex_timeout_warning_sent",
+                approval_ref=approval_ref,
+                approval_kind=approval_kind.value,
+                file_path=regex_trace.file_path,
+                line_number=timeout.line_number,
+                duration_sec=timeout.duration_sec,
+                command=command,
+                affected_paths=list(affected_paths),
+            )
+    budget_exhausted = regex_trace.budget_exhausted
+    if budget_exhausted is not None:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_budget_exhausted",
+            approval_ref=approval_ref,
+            approval_kind=approval_kind.value,
+            file_path=regex_trace.file_path,
+            budget_sec=budget_exhausted.budget_sec,
+            duration_sec=budget_exhausted.duration_sec,
+            severity="warning",
+            warning="approval regex total budget exhausted and requires correction",
+            action_required="fix_regex",
+            command=command,
+            affected_paths=list(affected_paths),
+        )
+        if approval_notify is not None:
+            approval_notify(
+                format_regex_budget_exhausted_notification(
+                    file_path=regex_trace.file_path,
+                    budget=budget_exhausted,
+                    approval_kind=approval_kind.value,
+                    command=command,
+                    affected_paths=affected_paths,
+                )
+            )
+            _event(
+                logger=logger,
+                role=role,
+                name="approval_regex_budget_warning_sent",
+                approval_ref=approval_ref,
+                approval_kind=approval_kind.value,
+                file_path=regex_trace.file_path,
+                budget_sec=budget_exhausted.budget_sec,
+                duration_sec=budget_exhausted.duration_sec,
+                command=command,
+                affected_paths=list(affected_paths),
+            )
+    if regex_trace.matched:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_match",
+            approval_ref=approval_ref,
+            approval_kind=approval_kind.value,
+            command=command,
+            affected_paths=list(affected_paths),
+            file_path=regex_trace.file_path,
+            matched_pattern=regex_trace.matched_pattern,
+            matched_patterns=list(regex_trace.matched_patterns),
+        )
+        if (
+            decision == "accept"
+            and decision_source == "allow_regex"
+            and isinstance(regex_trace.matched_pattern, str)
+            and approval_notify is not None
+        ):
+            note = format_regex_auto_approval_notification(
+                command=command,
+                matched_pattern=regex_trace.matched_pattern,
+                file_path=regex_trace.file_path,
+                affected_paths=affected_paths,
+                matched_patterns=regex_trace.matched_patterns,
+            )
+            approval_notify(note)
+            _event(
+                logger=logger,
+                role=role,
+                name="approval_auto_notify_sent",
+                approval_ref=approval_ref,
+                source=decision_source,
+                command=command,
+                affected_paths=list(affected_paths),
+                matched_pattern=regex_trace.matched_pattern,
+            )
+    else:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_not_matched",
+            approval_ref=approval_ref,
+            approval_kind=approval_kind.value,
+            command=command,
+            affected_paths=list(affected_paths),
+            unmatched_values=list(regex_trace.unmatched_values),
+            file_path=regex_trace.file_path,
+        )
+        if (
+            decision == "human"
+            and decision_source == "regex_fallback_human"
+            and regex_trace.budget_exhausted is None
+            and (regex_trace.parse_errors or regex_trace.match_errors)
+            and approval_notify is not None
+        ):
+            note = format_regex_fallback_human_notification(
+                command=command,
+                file_path=regex_trace.file_path,
+                parse_errors=regex_trace.parse_errors,
+                match_errors=regex_trace.match_errors,
+                affected_paths=affected_paths,
+            )
+            approval_notify(note)
+            _event(
+                logger=logger,
+                role=role,
+                name="approval_auto_notify_sent",
+                approval_ref=approval_ref,
+                source=decision_source,
+                command=command,
+                affected_paths=list(affected_paths),
+            )
+    for parse_error in regex_trace.parse_errors:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_invalid_pattern",
+            approval_ref=approval_ref,
+            approval_kind=approval_kind.value,
+            file_path=regex_trace.file_path,
+            error=parse_error,
+        )
+    for match_error in regex_trace.match_errors:
+        _event(
+            logger=logger,
+            role=role,
+            name="approval_regex_allowlist_match_error",
+            approval_ref=approval_ref,
+            approval_kind=approval_kind.value,
+            file_path=regex_trace.file_path,
+            error=match_error,
+            command=command,
+            affected_paths=list(affected_paths),
+        )

@@ -66,5 +66,7 @@ def run_steward_runtime(
     except Exception as exc:
         return transport.handle_error(exc)
     finally:
-        transport.stop_resources()
-        logger.event(transport.stopped_event_name)
+        try:
+            transport.stop_resources()
+        finally:
+            logger.event(transport.stopped_event_name)

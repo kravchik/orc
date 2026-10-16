@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from orchestrator.access_point_common import AccessPointKey, access_point_sort_key
+from orchestrator.agent_identity import (
+    ProviderExecutionProfile,
+    ProviderKind,
+    ProviderProfileId,
+)
+from orchestrator.agent_provider import ProviderHostRootSettings
 from orchestrator.approval import ApprovalPolicy
-from orchestrator.interactive_driver_events import RuntimeDriverFactory, StewardDriverFactory
-from orchestrator.processes import LifecycleLogger
+from orchestrator.interactive_driver_events import (
+    RuntimeDeliveryDriverFactory,
+    StewardDeliveryDriverFactory,
+)
+from orchestrator.processes import CleanupStep, LifecycleLogger, cleanup_owned_resources
+from orchestrator.provider_composition import (
+    ProductionProviderComposition,
+    resolve_production_session_catalog_roots,
+)
+from orchestrator.runtime_profile_catalog import (
+    DEFAULT_RUNTIME_LAUNCH_DEFAULTS,
+    RuntimeLaunchDefaults,
+    RuntimeProfileCatalog,
+    load_runtime_profile_catalog_from_environment,
+)
 from orchestrator.slack_api_thread_driver import SlackApiThreadDriver
 from orchestrator.slack_interactivity import SlackInboundSource, SlackInteractivityAction
 from orchestrator.slack_smoke import SlackApi
@@ -59,6 +78,9 @@ class _SlackStewardTransport(StewardTransportAdapter):
         on_interactive_action: Callable[[SlackInteractivityAction], None],
         agent_runtime: InteractiveAgentRuntime,
         runtime: InteractiveStewardRuntime,
+        provider_composition: ProductionProviderComposition,
+        cancel_catalog_operations: Callable[[], None],
+        close_catalog_operations: Callable[[], None],
     ) -> None:
         self._client = client
         self._logger = logger
@@ -72,6 +94,9 @@ class _SlackStewardTransport(StewardTransportAdapter):
         self._on_interactive_action = on_interactive_action
         self._agent_runtime = agent_runtime
         self._runtime = runtime
+        self._provider_composition = provider_composition
+        self._cancel_catalog_operations = cancel_catalog_operations
+        self._close_catalog_operations = close_catalog_operations
         self._poll_cycles = 0
         self._last_seen_ts: str | None = None
 
@@ -162,11 +187,34 @@ class _SlackStewardTransport(StewardTransportAdapter):
         raise exc
 
     def stop_resources(self) -> None:
+        steps: list[CleanupStep] = []
         if self._interactivity_source is not None:
-            self._interactivity_source.stop()
-        self._agent_runtime.close()
-        self._runtime.close()
-        self._client.stop()
+            steps.append(
+                CleanupStep(
+                    owner="slack interactivity",
+                    cleanup=self._interactivity_source.stop,
+                )
+            )
+        steps.extend(
+            [
+                CleanupStep(owner="runtime agent drivers", cleanup=self._agent_runtime.close),
+                CleanupStep(owner="steward drivers", cleanup=self._runtime.close),
+                CleanupStep(
+                    owner="pending catalog operations",
+                    cleanup=self._cancel_catalog_operations,
+                ),
+                CleanupStep(
+                    owner="shared provider hosts",
+                    cleanup=self._provider_composition.close,
+                ),
+                CleanupStep(
+                    owner="catalog operations",
+                    cleanup=self._close_catalog_operations,
+                ),
+                CleanupStep(owner="slack client", cleanup=self._client.stop),
+            ]
+        )
+        cleanup_owned_resources(steps)
 
 
 def _normalized_ts(value: object) -> str | None:
@@ -205,7 +253,6 @@ def run_slack_steward(
     steward_command: list[str],
     agent_command: list[str],
     poll_interval_sec: float = 2.0,
-    request_timeout_sec: float = 0.0,
     startup_timeout_sec: float = 120.0,
     rpc_timeout_sec: float = 5.0,
     rpc_retries: int = 3,
@@ -213,60 +260,135 @@ def run_slack_steward(
     writer: Writer = print,
     max_poll_cycles: int | None = None,
     approval_policy: Optional[ApprovalPolicy] = None,
-    thread_approval_policy: str = "on-request",
-    thread_sandbox: str = "workspace-write",
+    thread_approval_policy: str = DEFAULT_RUNTIME_LAUNCH_DEFAULTS.provider_approval_policy,
+    thread_sandbox: str = DEFAULT_RUNTIME_LAUNCH_DEFAULTS.sandbox,
     steward_prompt: str | None = None,
-    steward_driver_factory: StewardDriverFactory | None = None,
-    runtime_driver_factory: RuntimeDriverFactory | None = None,
+    steward_driver_factory: StewardDeliveryDriverFactory | None = None,
+    runtime_driver_factory: RuntimeDeliveryDriverFactory | None = None,
     steward_client_factory: Callable[..., Any] | None = None,
     runtime_client_factory: Callable[..., Any] | None = None,
     state_path: str | None = "state/slack-steward-access-points.json",
     sessions_root: str | Path | None = None,
+    session_catalog_roots: Mapping[
+        ProviderExecutionProfile, str | Path
+    ] | None = None,
     slack_status_config: TelegramStatusConfig | None = None,
     interactivity_source: SlackInboundSource | None = None,
     consume_control_events: Callable[[], bool] | None = None,
     idle_sleep_fn: Callable[[float], None] = time.sleep,
     routing_queue_capacity: int = StewardCore._DEFAULT_ROUTING_QUEUE_CAPACITY,
+    provider_cli_paths: Mapping[ProviderKind, str | Path] | None = None,
+    profile_cli_paths: Mapping[ProviderExecutionProfile, str | Path] | None = None,
+    provider_environments: Mapping[ProviderKind, Mapping[str, str]] | None = None,
+    profile_catalog: RuntimeProfileCatalog | None = None,
 ) -> int:
+    resolved_profile_catalog = (
+        profile_catalog
+        if profile_catalog is not None
+        else load_runtime_profile_catalog_from_environment()
+    )
     logger = LifecycleLogger(Path(log_path))
+    if not agent_command:
+        raise ValueError("agent_command must not be empty")
+    codex_profile = ProviderExecutionProfile(
+        ProviderKind.CODEX,
+        ProviderProfileId.CODEX_NATIVE,
+    )
+    provider_composition = ProductionProviderComposition(
+        provider_cli_paths=provider_cli_paths,
+        profile_cli_paths=profile_cli_paths,
+        profile_runtime_commands={codex_profile: agent_command},
+        provider_environments=provider_environments,
+        session_catalog_roots=resolve_production_session_catalog_roots(
+            explicit_roots=session_catalog_roots,
+            state_path=state_path,
+            codex_sessions_root=sessions_root,
+        ),
+        profile_catalog=resolved_profile_catalog,
+        shared_host_settings=ProviderHostRootSettings(
+            logger=logger,
+            startup_timeout_sec=startup_timeout_sec,
+            role="agent",
+            rpc_timeout_sec=rpc_timeout_sec,
+            edge_thread_name="slack-runtime-jsonrpc-client-thread",
+        ),
+    )
     raw_client = api if api is not None else SlackApi(token, api_base_url=slack_api_base_url)
     client = SlackApiThreadDriver(raw_client)
     client.start()
     resolved_policy = approval_policy or ApprovalPolicy.from_csv("", "", default_decision="human")
+    launch_defaults = RuntimeLaunchDefaults(thread_approval_policy, thread_sandbox)
     status_config = slack_status_config or TelegramStatusConfig()
+    def default_steward_driver_factory(
+        _access_point: AccessPointKey,
+        driver_logger: LifecycleLogger,
+    ):
+        return provider_composition.create_delivery_driver(
+            command=list(steward_command),
+            logger=driver_logger,
+            rpc_timeout_sec=rpc_timeout_sec,
+            rpc_retries=rpc_retries,
+            approval_policy=resolved_policy,
+            thread_approval_policy=thread_approval_policy,
+            thread_sandbox=thread_sandbox,
+            resume_session_id=None,
+            client_factory=steward_client_factory,
+            edge_thread_name="slack-steward-jsonrpc-client-thread",
+            status_source="steward",
+        )
+
+    def default_runtime_driver_factory(
+        _access_point: AccessPointKey,
+        spec: dict[str, Any],
+        driver_logger: LifecycleLogger,
+    ):
+        execution_profile = provider_composition.require_provider(
+            spec.get("provider") or ProviderKind.CODEX,
+            str(spec.get("profile") or "").strip() or None,
+        )
+        return provider_composition.create_delivery_driver(
+            provider=execution_profile,
+            profile=None,
+            command=(
+                agent_command
+                if execution_profile == codex_profile
+                else None
+            ),
+            runtime_args=spec.get("args"),
+            logger=driver_logger,
+            rpc_timeout_sec=rpc_timeout_sec,
+            rpc_retries=rpc_retries,
+            approval_policy=resolved_policy,
+            thread_approval_policy=str(spec.get("approval_policy") or ""),
+            thread_sandbox=str(spec.get("sandbox") or ""),
+            resume_session_id=(str(spec.get("thread_id") or "").strip() or None),
+            working_dir=str(spec.get("cwd") or ""),
+            initial_model=(str(spec.get("model") or "").strip() or None),
+            initial_backend=(str(spec.get("backend") or "").strip() or None),
+            client_factory=runtime_client_factory,
+            edge_thread_name="slack-runtime-jsonrpc-client-thread",
+            startup_timeout_sec=startup_timeout_sec,
+        )
+
     runtime = InteractiveStewardRuntime(
         logger=logger,
-        agent_command=list(steward_command),
-        request_timeout_sec=request_timeout_sec,
-        rpc_timeout_sec=rpc_timeout_sec,
-        rpc_retries=rpc_retries,
-        approval_policy=resolved_policy,
-        thread_approval_policy=thread_approval_policy,
-        thread_sandbox=thread_sandbox,
         steward_prompt=steward_prompt,
-        client_factory=steward_client_factory,
-        driver_factory=steward_driver_factory,
-        edge_thread_name="slack-steward-jsonrpc-client-thread",
+        driver_factory=steward_driver_factory or default_steward_driver_factory,
     )
     agent_runtime = InteractiveAgentRuntime(
         logger=logger,
-        agent_command=list(agent_command),
-        request_timeout_sec=request_timeout_sec,
-        rpc_timeout_sec=rpc_timeout_sec,
-        rpc_retries=rpc_retries,
-        approval_policy=resolved_policy,
-        default_thread_approval_policy=thread_approval_policy,
-        default_thread_sandbox=thread_sandbox,
-        client_factory=runtime_client_factory,
-        driver_factory=runtime_driver_factory,
-        edge_thread_name="slack-runtime-jsonrpc-client-thread",
+        driver_factory=runtime_driver_factory or default_runtime_driver_factory,
+        provider_validator=provider_composition.require_provider,
         startup_timeout_sec=startup_timeout_sec,
+        profile_catalog=resolved_profile_catalog,
+        launch_defaults=launch_defaults,
     )
     registry = build_steward_registry_context(
         logger=logger,
         agent_runtime=agent_runtime,
         state_path=state_path,
         sort_key=access_point_sort_key,
+        profile_catalog=resolved_profile_catalog,
     )
 
     bot_user_id: str | None = None
@@ -275,7 +397,6 @@ def run_slack_steward(
         "slack_steward_started",
         configured_channel_id=channel_id or None,
         poll_interval_sec=float(poll_interval_sec),
-        request_timeout_sec=float(request_timeout_sec),
         mode="real_steward",
     )
     try:
@@ -305,7 +426,9 @@ def run_slack_steward(
         runtime=runtime,
         agent_runtime=agent_runtime,
         access_point_adapter=access_point_adapter,
-        sessions_root=sessions_root,
+        list_provider_sessions=provider_composition.list_sessions,
+        list_agent_sessions=provider_composition.list_agent_sessions,
+        provider_installation_status=provider_composition.installation_status,
         persisted_state_by_access_point=registry.persisted_state_by_access_point,
         persist_registry=lambda reason, access_point=None: registry.persist(reason=reason, access_point=access_point),
         drop_persisted_state=registry.drop,
@@ -339,6 +462,7 @@ def run_slack_steward(
             on_pre_approval_decision=access_point_adapter.clear_approval_blocks,
         ),
         routing_queue_capacity=routing_queue_capacity,
+        profile_catalog=resolved_profile_catalog,
     )
 
     def _handle_message(message: dict[str, Any]) -> None:
@@ -449,9 +573,11 @@ def run_slack_steward(
         on_interactive_action=_handle_interactive_action,
         agent_runtime=agent_runtime,
         runtime=runtime,
+        provider_composition=provider_composition,
+        cancel_catalog_operations=core.cancel_catalog_operations,
+        close_catalog_operations=core.close_catalog_operations,
     )
     loop = StewardTickLoop(
-        request_timeout_sec=request_timeout_sec,
         drain_driver_events=core.drain_driver_events,
         tick_interactions=core.tick_interactions,
         flush_due_status_runtimes=_flush_due_status_runtimes,
@@ -460,6 +586,8 @@ def run_slack_steward(
         is_idle=core.is_idle,
         consume_control_events=consume_control_events,
         sleep_fn=idle_sleep_fn,
+        lifecycle_logger=logger,
+        phase_context=core.tick_diagnostic_context,
     )
 
     loop.drain_until_idle(consume_transport=False)

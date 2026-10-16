@@ -18,6 +18,8 @@ from orchestrator.processes import LifecycleLogger
 Writer = Callable[[str], None]
 MINDWARP_CHAT_ID = 298525854
 HARD_ALLOWED_CHAT_IDS = {MINDWARP_CHAT_ID}
+TELEGRAM_API_REQUEST_TIMEOUT_SEC = 60.0
+TELEGRAM_LONG_POLL_HTTP_GRACE_SEC = 5.0
 
 
 class TelegramApi:
@@ -39,7 +41,14 @@ class TelegramApi:
         params = {"timeout": timeout_sec}
         if offset is not None:
             params["offset"] = offset
-        payload = self._post_json("getUpdates", params)
+        payload = self._post_json(
+            "getUpdates",
+            params,
+            request_timeout_sec=max(
+                1.0,
+                float(timeout_sec) + TELEGRAM_LONG_POLL_HTTP_GRACE_SEC,
+            ),
+        )
         result = payload.get("result")
         if not isinstance(result, list):
             return []
@@ -132,7 +141,13 @@ class TelegramApi:
             raise ValueError("telegram file exceeds download limit")
         return content
 
-    def _post_json(self, method: str, params: dict) -> dict:
+    def _post_json(
+        self,
+        method: str,
+        params: dict,
+        *,
+        request_timeout_sec: float = TELEGRAM_API_REQUEST_TIMEOUT_SEC,
+    ) -> dict:
         normalized: dict[str, str] = {}
         for key, value in params.items():
             if isinstance(value, (dict, list)):
@@ -147,7 +162,11 @@ class TelegramApi:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60, context=self._ssl_context) as resp:
+            with urllib.request.urlopen(
+                req,
+                timeout=request_timeout_sec,
+                context=self._ssl_context,
+            ) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = ""

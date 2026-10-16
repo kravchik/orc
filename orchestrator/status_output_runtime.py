@@ -8,6 +8,20 @@ from typing import Protocol
 MAX_IN_PROGRESS_STATUS_WINDOWS = 10
 
 
+def status_ref_log_fields(status_key: str) -> dict[str, object]:
+    parts = str(status_key or "").split(":")
+    if len(parts) >= 4 and parts[0] == "turn" and parts[1] in {"orc", "work"}:
+        try:
+            sequence = int(parts[3])
+        except ValueError:
+            return {}
+        return {
+            "status_ref_kind": "turn" if parts[1] == "orc" else "work",
+            "status_ref_sequence": sequence,
+        }
+    return {}
+
+
 class StatusOutputRuntime(Protocol):
     def append_status(
         self,

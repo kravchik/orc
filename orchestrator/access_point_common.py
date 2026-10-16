@@ -90,6 +90,7 @@ class AccessPointDeliveryReceipt:
     error_type: str | None = None
 
     def mark_sent(self, *, message_id: int | None = None, message_ts: str | None = None) -> None:
+        self._require_pending()
         self.state = AccessPointDeliveryState.SENT
         if message_id is not None:
             self.message_id = int(message_id)
@@ -99,12 +100,94 @@ class AccessPointDeliveryReceipt:
         self.error_type = None
 
     def mark_failed(self, exc: Exception) -> None:
+        self._require_pending()
         self.state = AccessPointDeliveryState.FAILED
         self.error = str(exc)
         self.error_type = type(exc).__name__
 
     def mark_cancelled(self) -> None:
+        self._require_pending()
         self.state = AccessPointDeliveryState.CANCELLED
+
+    def _require_pending(self) -> None:
+        if self.state is not AccessPointDeliveryState.PENDING:
+            raise RuntimeError(f"delivery receipt {self.receipt_id} is already terminal")
+
+
+class AccessPointDeliveryReceipts:
+    """Own pending receipts and retain only a bounded terminal history."""
+
+    def __init__(self, *, terminal_capacity: int = 64) -> None:
+        if (
+            not isinstance(terminal_capacity, int)
+            or isinstance(terminal_capacity, bool)
+            or terminal_capacity <= 0
+        ):
+            raise ValueError("terminal receipt capacity must be a positive integer")
+        self._terminal_capacity = terminal_capacity
+        self._receipts: dict[int, AccessPointDeliveryReceipt] = {}
+        self._terminal_ids: list[int] = []
+
+    def __len__(self) -> int:
+        return len(self._receipts)
+
+    def create(self, receipt_id: int) -> AccessPointDeliveryReceipt:
+        if not isinstance(receipt_id, int) or isinstance(receipt_id, bool) or receipt_id <= 0:
+            raise ValueError("delivery receipt id must be a positive integer")
+        if receipt_id in self._receipts:
+            raise ValueError(f"delivery receipt {receipt_id} already exists")
+        receipt = AccessPointDeliveryReceipt(receipt_id=receipt_id)
+        self._receipts[receipt_id] = receipt
+        return receipt
+
+    def get(self, receipt_id: int) -> AccessPointDeliveryReceipt | None:
+        return self._receipts.get(receipt_id)
+
+    def consume(self, receipt_id: int) -> AccessPointDeliveryReceipt | None:
+        receipt = self._receipts.pop(receipt_id, None)
+        if receipt_id in self._terminal_ids:
+            self._terminal_ids.remove(receipt_id)
+        return receipt
+
+    def mark_sent(
+        self,
+        receipt_id: int,
+        *,
+        message_id: int | None = None,
+        message_ts: str | None = None,
+    ) -> AccessPointDeliveryReceipt:
+        receipt = self._require(receipt_id)
+        receipt.mark_sent(message_id=message_id, message_ts=message_ts)
+        self._remember_terminal(receipt_id)
+        return receipt
+
+    def mark_failed(
+        self,
+        receipt_id: int,
+        exc: Exception,
+    ) -> AccessPointDeliveryReceipt:
+        receipt = self._require(receipt_id)
+        receipt.mark_failed(exc)
+        self._remember_terminal(receipt_id)
+        return receipt
+
+    def mark_cancelled(self, receipt_id: int) -> AccessPointDeliveryReceipt:
+        receipt = self._require(receipt_id)
+        receipt.mark_cancelled()
+        self._remember_terminal(receipt_id)
+        return receipt
+
+    def _require(self, receipt_id: int) -> AccessPointDeliveryReceipt:
+        receipt = self._receipts.get(receipt_id)
+        if receipt is None:
+            raise KeyError(f"unknown or expired delivery receipt {receipt_id}")
+        return receipt
+
+    def _remember_terminal(self, receipt_id: int) -> None:
+        self._terminal_ids.append(receipt_id)
+        while len(self._terminal_ids) > self._terminal_capacity:
+            expired_id = self._terminal_ids.pop(0)
+            self._receipts.pop(expired_id, None)
 
 
 DeliveryResultT = TypeVar("DeliveryResultT")
@@ -585,6 +668,5 @@ def _http_retry_after_sec(exc: urllib.error.HTTPError) -> float | None:
 
 
 class AccessPointStatusSurface(Protocol):
-    def apply_protocol_event(self, *, method: str, params: dict) -> None: ...
     def flush_due_statuses(self) -> bool: ...
     def split_current_turn(self) -> None: ...

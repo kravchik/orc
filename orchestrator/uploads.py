@@ -5,13 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import mimetypes
 import os
 from pathlib import Path, PurePosixPath
 import re
 import tempfile
 
+from orchestrator.agent_io import (
+    UPLOADS_RELATIVE_DIR,
+    AgentAttachmentRef,
+    AgentInput,
+    AgentInputOrigin,
+    normalize_orc_upload_path,
+)
 
-UPLOADS_RELATIVE_DIR = PurePosixPath(".orc/uploads")
+
 MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024
 MAX_PENDING_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PENDING_UPLOADS = 100
@@ -30,6 +38,9 @@ class PendingUpload:
     relative_path: str
     size_bytes: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "relative_path", normalize_orc_upload_path(self.relative_path))
+
     @property
     def name(self) -> str:
         return PurePosixPath(self.relative_path).name
@@ -39,6 +50,15 @@ class PendingUpload:
             "relative_path": self.relative_path,
             "size_bytes": self.size_bytes,
         }
+
+    def to_attachment(self) -> AgentAttachmentRef:
+        media_type, _encoding = mimetypes.guess_type(self.name)
+        return AgentAttachmentRef(
+            relative_path=self.relative_path,
+            display_name=self.name,
+            media_type=media_type or "application/octet-stream",
+            size_bytes=self.size_bytes,
+        )
 
 
 @dataclass(frozen=True)
@@ -81,13 +101,24 @@ class PendingUploadStore:
         self._pending = updated
         return (len(updated), saved)
 
-    def consume(self, *, text: str) -> str:
+    def consume(
+        self,
+        *,
+        text: str,
+        origin: AgentInputOrigin = AgentInputOrigin.HUMAN,
+        verbatim: bool = False,
+    ) -> AgentInput:
         if not self._pending:
-            return text
+            return AgentInput(text=text, origin=origin, verbatim=verbatim)
         reserved = self._pending
         self._persist(())
         self._pending = ()
-        return format_upload_prompt(uploads=reserved, text=text)
+        return agent_input_from_uploads(
+            uploads=reserved,
+            text=text,
+            origin=origin,
+            verbatim=verbatim,
+        )
 
     def _manifest_path(self, *, create_directory: bool) -> Path:
         uploads_dir = _resolve_uploads_dir(
@@ -190,16 +221,12 @@ def pending_upload_from_payload(value: object) -> PendingUpload | None:
         size_bytes = int(value.get("size_bytes") or 0)
     except (TypeError, ValueError):
         return None
-    path = PurePosixPath(relative_path)
-    if (
-        size_bytes < 0
-        or path.is_absolute()
-        or ".." in path.parts
-        or tuple(path.parts[:2]) != tuple(UPLOADS_RELATIVE_DIR.parts)
-        or len(path.parts) != 3
-    ):
+    if size_bytes < 0:
         return None
-    return PendingUpload(relative_path=path.as_posix(), size_bytes=size_bytes)
+    try:
+        return PendingUpload(relative_path=relative_path, size_bytes=size_bytes)
+    except ValueError:
+        return None
 
 
 def validate_pending_capacity(
@@ -274,7 +301,7 @@ def sanitize_upload_name(value: str) -> str:
     return name
 
 
-def format_upload_prompt(*, uploads: tuple[PendingUpload, ...], text: str) -> str:
+def _format_upload_prompt(*, uploads: tuple[PendingUpload, ...], text: str) -> str:
     if not uploads:
         return text
     lines = [
@@ -285,6 +312,21 @@ def format_upload_prompt(*, uploads: tuple[PendingUpload, ...], text: str) -> st
         text,
     ]
     return "\n".join(lines)
+
+
+def agent_input_from_uploads(
+    *,
+    uploads: tuple[PendingUpload, ...],
+    text: str,
+    origin: AgentInputOrigin,
+    verbatim: bool = False,
+) -> AgentInput:
+    return AgentInput(
+        text=_format_upload_prompt(uploads=uploads, text=text),
+        origin=origin,
+        verbatim=verbatim,
+        attachments=tuple(item.to_attachment() for item in uploads),
+    )
 
 
 def _unique_destination(directory: Path, name: str) -> Path:

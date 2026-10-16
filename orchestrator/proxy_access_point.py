@@ -7,36 +7,53 @@ from typing import Generic, Hashable, Protocol, TypeAlias, TypeVar
 
 from orchestrator.access_point_common import (
     AccessPointApprovalDecision,
-    AccessPointTextInput,
 )
-from orchestrator.context_window import format_context_window_remaining
-from orchestrator.inspect_text import append_active_work_lines, format_thread_metadata_lines
+from orchestrator.agent_capabilities import (
+    AgentCapability,
+    AgentCapabilitySnapshot,
+)
+from orchestrator.agent_identity import InspectionRef
+from orchestrator.agent_inspection import AgentRuntimeProjection
+from orchestrator.agent_session import AgentApprovalRequest
+from orchestrator.agent_io import AgentInput
+from orchestrator.agent_identity import TurnRef
+from orchestrator.agent_session import AgentEffectResult
+from orchestrator.interactive_driver_events import (
+    AgentEffortSelection,
+    AgentModelSelection,
+    ApprovalDeliveryReceipt,
+    InteractiveAgentResult,
+    InteractiveApprovalPromptEvent,
+    InteractiveEffortApplyResult,
+    InteractiveModelApplyResult,
+    InteractiveOutboundNote,
+    InteractiveStatusEvent,
+)
+from orchestrator.inspect_text import (
+    append_background_snapshot_lines,
+    append_work_snapshot_lines,
+    format_context_snapshot,
+    format_session_snapshot_lines,
+)
+from orchestrator.runtime_profile_catalog import ProviderSessionProjector
+from orchestrator.proxy_model_choices import format_effort_inspect_lines
 from orchestrator.turn_status_store import TurnStatusStore
 
 
 AccessPointKeyT = TypeVar("AccessPointKeyT", bound=Hashable)
 OutputRuntimeT = TypeVar("OutputRuntimeT")
-ResultT = TypeVar("ResultT")
-ApprovalEventT = TypeVar("ApprovalEventT")
-OutboundNoteT = TypeVar("OutboundNoteT")
-StatusEventT = TypeVar("StatusEventT")
 PendingApprovalT = TypeVar("PendingApprovalT")
 
 
-class ProxySubmitPrompt(AccessPointTextInput[AccessPointKeyT]):
-    @property
-    def prompt(self) -> str:
-        return self.text
-
-
-class ProxyApprovalDecision(AccessPointApprovalDecision[AccessPointKeyT]):
-    pass
+@dataclass(frozen=True)
+class ProxySubmitPrompt(Generic[AccessPointKeyT]):
+    access_point: AccessPointKeyT
+    agent_input: AgentInput
 
 
 @dataclass(frozen=True)
-class ProxyModelSelection(Generic[AccessPointKeyT]):
-    access_point: AccessPointKeyT
-    selected_model: str
+class ProxyApprovalDecision(AccessPointApprovalDecision[AccessPointKeyT]):
+    expected_request: AgentApprovalRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -47,31 +64,44 @@ class ProxyLocalActionHandled:
 ProxyAction: TypeAlias = (
     ProxySubmitPrompt[AccessPointKeyT]
     | ProxyApprovalDecision[AccessPointKeyT]
-    | ProxyModelSelection[AccessPointKeyT]
+    | AgentModelSelection[AccessPointKeyT]
+    | AgentEffortSelection[AccessPointKeyT]
     | ProxyLocalActionHandled
 )
 
 
 class ProxyActionDriver(Protocol[AccessPointKeyT]):
-    def submit_request(self, request: ProxySubmitPrompt[AccessPointKeyT]) -> None: ...
+    def start_turn(
+        self, request: ProxySubmitPrompt[AccessPointKeyT], turn_ref: TurnRef,
+    ) -> AgentEffectResult: ...
+    def steer_wait_reason(self, expected_turn_ref: TurnRef) -> str: ...
+    def try_steer_turn(
+        self,
+        request: ProxySubmitPrompt[AccessPointKeyT],
+        expected_turn_ref: TurnRef,
+    ) -> AgentEffectResult: ...
 
-    def submit_approval_decision(self, decision: str) -> None: ...
+    def submit_approval_decision(
+        self,
+        decision: str,
+        *,
+        expected_request: AgentApprovalRequest,
+    ) -> ApprovalDeliveryReceipt: ...
 
-    def submit_model_selection(self, selection: ProxyModelSelection[AccessPointKeyT]) -> None: ...
-
-    def get_thread_id(self) -> str: ...
-
-    def get_actual_thread_model(self) -> str: ...
+    def submit_model_selection(self, selection: AgentModelSelection[AccessPointKeyT]) -> None: ...
+    def submit_effort_selection(self, selection: AgentEffortSelection[AccessPointKeyT]) -> None: ...
 
     def has_active_turn(self) -> bool: ...
-
-    def get_active_turn_id(self) -> str: ...
-
-    def get_item_status_snapshot(self) -> list[dict[str, str]]: ...
-
-    def get_last_item_apply_info(self) -> dict | None: ...
-
-    def get_context_usage(self) -> dict[str, object]: ...
+    def has_busy_work(self) -> bool: ...
+    def interrupt_active_turn(self) -> None: ...
+    def get_capability_snapshot(self) -> AgentCapabilitySnapshot: ...
+    def get_local_projection(self) -> AgentRuntimeProjection: ...
+    def request_inspection(
+        self,
+        inspection_ref: InspectionRef,
+        timeout_sec: float,
+        access_point: AccessPointKeyT,
+    ) -> AgentEffectResult: ...
 
 
 class ProxyApprovalState(Protocol[AccessPointKeyT]):
@@ -87,30 +117,29 @@ class ProxyAccessPointAdapter(
     Protocol[
         AccessPointKeyT,
         OutputRuntimeT,
-        ResultT,
-        ApprovalEventT,
-        OutboundNoteT,
-        StatusEventT,
         PendingApprovalT,
     ]
 ):
-    def send_result(self, result: ResultT) -> None: ...
+    def send_result(self, result: InteractiveAgentResult) -> None: ...
 
-    def after_record_result(self, result: ResultT) -> None: ...
+    def after_record_result(self, result: InteractiveAgentResult) -> None: ...
 
-    def format_result_log(self, result: ResultT) -> str: ...
+    def format_result_log(self, result: InteractiveAgentResult) -> str: ...
 
-    def record_model_apply_result(self, result: object) -> None: ...
+    def record_model_apply_result(self, result: InteractiveModelApplyResult) -> None: ...
+    def record_effort_apply_result(self, result: InteractiveEffortApplyResult) -> None: ...
 
-    def send_approval_prompt(self, event: ApprovalEventT) -> PendingApprovalT: ...
+    def send_approval_prompt(self, event: InteractiveApprovalPromptEvent) -> PendingApprovalT: ...
 
-    def send_outbound_note(self, note: OutboundNoteT) -> None: ...
+    def send_outbound_note(self, note: InteractiveOutboundNote) -> None: ...
+
+    def send_inspect(self, access_point: AccessPointKeyT, text: str) -> None: ...
 
     def flush_delivery_lane(self) -> bool: ...
 
-    def access_point_for_status_event(self, event: StatusEventT) -> AccessPointKeyT: ...
+    def access_point_for_status_event(self, event: InteractiveStatusEvent) -> AccessPointKeyT: ...
 
-    def status_text_for_event(self, event: StatusEventT) -> str: ...
+    def status_text_for_event(self, event: InteractiveStatusEvent) -> str: ...
 
     def build_status_runtime(
         self,
@@ -125,20 +154,28 @@ def dispatch_proxy_action(
     approval_state: ProxyApprovalState[AccessPointKeyT] | None = None,
 ) -> None:
     if isinstance(action, ProxySubmitPrompt):
-        driver.submit_request(action)
-        return
-    if isinstance(action, ProxyModelSelection):
+        raise AssertionError("ProxySubmitPrompt must be queued by ProxyCore")
+    if isinstance(action, AgentModelSelection):
         driver.submit_model_selection(action)
+        return
+    if isinstance(action, AgentEffortSelection):
+        driver.submit_effort_selection(action)
         return
     if isinstance(action, ProxyLocalActionHandled):
         return
     if isinstance(action, ProxyApprovalDecision):
         if action.decision == "details":
             return
+        expected_request = action.expected_request
+        if not isinstance(expected_request, AgentApprovalRequest):
+            raise RuntimeError("approval decision has no normalized pending request")
+        driver.submit_approval_decision(
+            action.decision,
+            expected_request=expected_request,
+        )
         if approval_state is not None:
             approval_state.split_status_after_approval(access_point=action.access_point)
             approval_state.clear_pending_approval()
-        driver.submit_approval_decision(action.decision)
         return
     raise AssertionError(f"unsupported proxy action: {action!r}")
 
@@ -146,32 +183,35 @@ def dispatch_proxy_action(
 def build_proxy_inspect_text(
     *,
     mode: str,
-    thread_metadata: dict[str, object] | None,
-    thread_id: str,
-    model: str,
-    active_turn_id: str,
+    projection: AgentRuntimeProjection,
     pending_approval: object | None,
     approval_command: str | None,
     approval_cwd: str | None,
-    rows: list[dict[str, str]],
-    context_usage: dict[str, object] | None,
+    session_projector: ProviderSessionProjector,
 ) -> str:
-    resolved_active_turn_id = str(active_turn_id or "").strip()
-    if not resolved_active_turn_id:
-        resolved_active_turn_id = _approval_turn_id(pending_approval) or "none"
+    active_turn_ref = projection.work.active_turn_ref
+    resolved_active_turn_id = (
+        f"turn:{active_turn_ref.sequence}"
+        if active_turn_ref is not None
+        else (_approval_turn_id(pending_approval) or "none")
+    )
 
     lines = [
         "inspect",
         f"mode: {mode}",
     ]
     lines.extend(
-        format_thread_metadata_lines(
-            dict(thread_metadata or {}),
-            thread_id_fallback=str(thread_id or "").strip(),
-            model_fallback=str(model or "").strip(),
+        format_session_snapshot_lines(
+            projection.session,
+            session_projector=session_projector,
         )
     )
-    lines.append(format_context_window_remaining(context_usage))
+    lines.append(format_context_snapshot(projection.context))
+    if (
+        projection.capabilities is not None
+        and projection.capabilities.supports(AgentCapability.READ_EFFORT)
+    ):
+        lines.extend(format_effort_inspect_lines(projection))
     lines.append(f"active turn: {resolved_active_turn_id}")
     lines.append(f"pending approval: {'yes' if pending_approval is not None else 'no'}")
     if approval_command:
@@ -179,7 +219,8 @@ def build_proxy_inspect_text(
     if approval_cwd:
         lines.append(f"approval cwd: {approval_cwd}")
     lines.append("active work:")
-    append_active_work_lines(lines, rows)
+    append_work_snapshot_lines(lines, projection.work)
+    append_background_snapshot_lines(lines, projection.background)
     return "\n".join(lines)
 
 
@@ -187,13 +228,9 @@ def extract_proxy_pending_approval_command(pending_approval: object | None) -> s
     request = getattr(pending_approval, "request", None)
     if request is None and isinstance(pending_approval, dict):
         request = pending_approval.get("request")
-    params = getattr(request, "params", None)
-    if not isinstance(params, dict):
+    if not isinstance(request, AgentApprovalRequest):
         return None
-    command = params.get("command")
-    if not isinstance(command, str):
-        return None
-    normalized = command.strip()
+    normalized = request.command.strip()
     return normalized or None
 
 
@@ -201,13 +238,9 @@ def extract_proxy_pending_approval_cwd(pending_approval: object | None) -> str |
     request = getattr(pending_approval, "request", None)
     if request is None and isinstance(pending_approval, dict):
         request = pending_approval.get("request")
-    params = getattr(request, "params", None)
-    if not isinstance(params, dict):
+    if not isinstance(request, AgentApprovalRequest):
         return None
-    cwd = params.get("cwd")
-    if not isinstance(cwd, str):
-        return None
-    normalized = cwd.strip()
+    normalized = request.cwd.strip()
     return normalized or None
 
 
@@ -215,11 +248,6 @@ def _approval_turn_id(pending_approval: object | None) -> str | None:
     request = getattr(pending_approval, "request", None)
     if request is None and isinstance(pending_approval, dict):
         request = pending_approval.get("request")
-    params = getattr(request, "params", None)
-    if not isinstance(params, dict):
+    if not isinstance(request, AgentApprovalRequest):
         return None
-    raw_turn_id = params.get("turnId")
-    if not isinstance(raw_turn_id, str):
-        return None
-    normalized = raw_turn_id.strip()
-    return normalized or None
+    return str(request.turn_ref.sequence)

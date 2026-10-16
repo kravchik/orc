@@ -8,22 +8,27 @@ import time
 from typing import Any, Callable, Mapping, Optional
 
 from orchestrator import clock
-from orchestrator.approval import (
-    ApprovalDecisionProvider,
-    ApprovalPolicy,
-    ApprovalRequest,
-    COMMAND_APPROVAL_METHOD,
-    approval_response_decision_name,
-    build_session_approval_response,
-    supports_session_approval,
+from orchestrator.agent_capabilities import (
+    AgentCapability,
+    AgentCapabilitySnapshot,
+    codex_capability_snapshot,
 )
-from orchestrator.approval_runtime import (
+from orchestrator.agent_io import AgentInput, AgentOutput
+from orchestrator.agent_session import RawProviderErrorPayload
+from orchestrator.approval import ApprovalPolicy
+from orchestrator.codex_approval_runtime import (
     ApprovalServerRequest,
-    _log_regex_allowlist_trace,
     build_always_allow_cached_response_plan,
-    build_approval_response_plan,
     log_session_approval_applied,
     parse_server_request,
+)
+from orchestrator.codex_approval import (
+    COMMAND_APPROVAL_METHOD,
+    NativeApprovalRequest,
+    approval_response_decision_name,
+    build_session_approval_response,
+    is_codex_approval_method,
+    supports_session_approval,
 )
 from orchestrator.context_window import compaction_matches_thread, parse_context_usage
 from orchestrator.file_change_approval import enrich_file_change_approval_params_from_item
@@ -44,6 +49,25 @@ from orchestrator.thread_resume import (
 )
 
 
+class JsonRpcRemoteError(RuntimeError):
+    """A correlated JSON-RPC error proves that the remote rejected the request."""
+
+    def __init__(self, req_id: int, error: object) -> None:
+        self.req_id = int(req_id)
+        self.error = dict(error) if isinstance(error, dict) else {"message": str(error)}
+        raw_code = self.error.get("code")
+        self.code = int(raw_code) if isinstance(raw_code, int) and not isinstance(raw_code, bool) else None
+        super().__init__(f"protocol error for request {self.req_id}: {error}")
+
+
+class JsonRpcDeliveryUncertain(RuntimeError):
+    """The client cannot prove whether a sent request reached the provider."""
+
+
+class JsonRpcTransportTerminal(RuntimeError):
+    """The JSON-RPC transport reached a terminal read boundary."""
+
+
 def protocol_raw_capture_enabled() -> bool:
     return os.getenv("ORC_PROTOCOL_LOG_RAW", "0").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -51,19 +75,20 @@ def protocol_raw_capture_enabled() -> bool:
 @dataclass
 class InteractiveApprovalPending:
     server_request: ApprovalServerRequest
-    approval_request: ApprovalRequest
+    approval_request: NativeApprovalRequest
 
 
 @dataclass
 class InteractiveTurnState:
     start_req_id: int
     turn_id: str | None
-    prompt: str
+    agent_input: AgentInput
     approval_notify_callback: Optional[Callable[[str], None]]
     deltas: list[str]
     final_deltas: list[str]
     final_answer_text: Optional[str]
     agent_message_phase_by_item_id: dict[str, str]
+    ordered_output_deltas: list[str] = field(default_factory=list)
     raw_item_by_item_id: dict[str, dict[str, Any]] = field(default_factory=dict)
     deferred_pre_start_messages: list[dict] = field(default_factory=list)
     terminal_error: Optional[str] = None
@@ -74,9 +99,33 @@ class InteractiveTurnState:
 @dataclass(frozen=True)
 class InteractiveTurnProgress:
     kind: str
-    text: str | None = None
-    approval_request: ApprovalRequest | None = None
+    output: AgentOutput | None = None
+    approval_request: NativeApprovalRequest | None = None
     error: str | None = None
+    raw_provider_error: RawProviderErrorPayload | None = None
+
+    def require_completed_output(self) -> AgentOutput:
+        if self.kind != "completed":
+            raise ValueError(f"turn progress is not completed: {self.kind}")
+        if self.output is None:
+            raise RuntimeError("completed turn progress is missing AgentOutput")
+        return self.output
+
+
+@dataclass
+class CodexInspectionState:
+    thread_id: str
+    metadata_req_id: int
+    loaded_req_id: int | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class CodexInspectionProgress:
+    completed: bool
+    metadata: dict[str, Any] | None = None
+    loaded: bool | None = None
+    error: str = ""
 
 
 @dataclass
@@ -107,14 +156,11 @@ class CodexJsonRpcSession:
         logger: LifecycleLogger,
         cwd: Optional[str],
         env: Optional[Mapping[str, str]],
-        request_timeout_sec: float,
+        startup_timeout_sec: float,
         rpc_timeout_sec: float,
         rpc_retries: int,
-        approval_policy: Optional[ApprovalPolicy],
         thread_approval_policy: str,
         thread_sandbox: str,
-        approval_decision_provider: Optional[ApprovalDecisionProvider],
-        approval_notify_callback: Optional[Callable[[str], None]],
         protocol_status_callback: Optional[Callable[[str, str, dict], None]],
         protocol_log_include_params: bool,
         client_factory: Optional[Callable[..., Any]] = None,
@@ -124,14 +170,11 @@ class CodexJsonRpcSession:
         self._logger = logger
         self._cwd = cwd
         self._env = env
-        self._request_timeout_sec = request_timeout_sec
+        self._startup_timeout_sec = float(startup_timeout_sec)
         self._rpc_timeout_sec = max(0.1, float(rpc_timeout_sec))
         self._rpc_retries = max(0, int(rpc_retries))
-        self._approval_policy = approval_policy
         self._thread_approval_policy = thread_approval_policy
         self._thread_sandbox = thread_sandbox
-        self._approval_decision_provider = approval_decision_provider
-        self._approval_notify_callback = approval_notify_callback
         self._protocol_status_callback = protocol_status_callback
         self._protocol_log_include_params = protocol_log_include_params
         self._protocol_item_callback: Optional[Callable[[str, str], None]] = None
@@ -147,11 +190,15 @@ class CodexJsonRpcSession:
         self._thread_model: Optional[str] = None
         self._thread_metadata: dict[str, Any] = {}
         self._context_usage: dict[str, object] = {}
+        self._runtime_name = "codex-app-server"
+        self._runtime_version = "unknown"
         self._pending_messages: list[dict] = []
         self._always_allow_commands: set[str] = set()
         self._item_tracker = ProtocolItemTracker()
         self._transport_progressed = False
         self._request_started: dict[int, tuple[str, float]] = {}
+        self._ignored_response_ids: set[int] = set()
+        self._inspection_response_ids: set[int] = set()
         self._startup_started_at: float | None = None
         self._startup_last_waiting_at: float | None = None
 
@@ -191,28 +238,119 @@ class CodexJsonRpcSession:
     def get_last_item_apply_info(self) -> dict | None:
         return self._item_tracker.last_apply_info()
 
-    def request(self, method: str, params: dict) -> dict:
-        req_id = self._send_request(method=method, params=params)
-        return self._wait_for_response(req_id=req_id)
-
-    def get_thread_metadata(self) -> dict[str, Any]:
+    def begin_thread_inspection(self) -> CodexInspectionState:
         thread_id = str(self._thread_id or "").strip()
         if not thread_id:
-            return {}
-        metadata: dict[str, Any] = dict(self._thread_metadata)
-        read_payload = self._request_thread_read(thread_id)
-        if read_payload:
-            metadata.update(read_payload)
-        if "loaded" not in metadata:
-            loaded = self._request_loaded_state(thread_id)
-            if loaded is not None:
-                metadata["loaded"] = loaded
-        if "model" not in metadata and isinstance(self._thread_model, str) and self._thread_model.strip():
-            metadata["model"] = self._thread_model.strip()
-        return metadata
+            raise RuntimeError("agent session has no provider session id")
+        state = CodexInspectionState(
+            thread_id=thread_id,
+            metadata_req_id=self._send_request(
+                method="thread/read",
+                params={"threadId": thread_id},
+            ),
+        )
+        self._inspection_response_ids.add(state.metadata_req_id)
+        return state
 
-    def get_context_usage(self) -> dict[str, object]:
+    def poll_thread_inspection(
+        self,
+        state: CodexInspectionState,
+    ) -> CodexInspectionProgress | None:
+        if state.metadata is None:
+            response = self._poll_correlated_response(state.metadata_req_id)
+            if response is None:
+                return None
+            if "error" in response:
+                return CodexInspectionProgress(
+                    completed=True,
+                    error=_jsonrpc_error_message(response.get("error")),
+                )
+            result = response.get("result") if isinstance(response.get("result"), dict) else {}
+            raw_thread = result.get("thread")
+            if isinstance(raw_thread, dict):
+                state.metadata = dict(raw_thread)
+            elif any(key in result for key in ("id", "status", "preview", "ephemeral")):
+                state.metadata = dict(result)
+            else:
+                state.metadata = dict(self._thread_metadata)
+            state.loaded_req_id = self._send_request(method="thread/loaded/list", params={})
+            self._inspection_response_ids.add(state.loaded_req_id)
+            return None
+
+        if state.loaded_req_id is None:
+            raise AssertionError("Codex inspection lost loaded-state request")
+        response = self._poll_correlated_response(state.loaded_req_id)
+        if response is None:
+            return None
+        loaded: bool | None = None
+        if "error" not in response:
+            result = response.get("result") if isinstance(response.get("result"), dict) else {}
+            raw_items = result.get("data")
+            if not isinstance(raw_items, list):
+                raw_items = result.get("threads")
+            if not isinstance(raw_items, list):
+                raw_items = result.get("threadIds")
+            if isinstance(raw_items, list):
+                loaded = any(
+                    (isinstance(item, str) and item.strip() == state.thread_id)
+                    or (
+                        isinstance(item, dict)
+                        and str(item.get("id") or "").strip() == state.thread_id
+                    )
+                    for item in raw_items
+                )
+        metadata = dict(state.metadata)
+        metadata.setdefault("id", state.thread_id)
+        metadata.setdefault("model", str(self._thread_model or "").strip())
+        if loaded is not None:
+            metadata["loaded"] = loaded
+        self._thread_metadata.update(metadata)
+        return CodexInspectionProgress(
+            completed=True,
+            metadata=metadata,
+            loaded=loaded,
+        )
+
+    def cancel_thread_inspection(self, state: CodexInspectionState) -> None:
+        request_ids = {state.metadata_req_id}
+        if state.loaded_req_id is not None:
+            request_ids.add(state.loaded_req_id)
+        outstanding_ids = request_ids.intersection(self._inspection_response_ids)
+        self._ignored_response_ids.update(outstanding_ids)
+        self._inspection_response_ids.difference_update(request_ids)
+        self._pending_messages = [
+            message
+            for message in self._pending_messages
+            if message.get("id") not in request_ids
+        ]
+
+    def _poll_correlated_response(self, req_id: int) -> dict[str, Any] | None:
+        for index, message in enumerate(self._pending_messages):
+            if message.get("id") == req_id and ("result" in message or "error" in message):
+                self._inspection_response_ids.discard(req_id)
+                return self._pending_messages.pop(index)
+        message = self._read_message(timeout_sec=0.0)
+        if message is None:
+            return None
+        response_id = message.get("id")
+        if response_id == req_id and ("result" in message or "error" in message):
+            self._inspection_response_ids.discard(req_id)
+            return message
+        self._pending_messages.append(message)
+        return None
+
+    def get_cached_thread_metadata(self) -> dict[str, Any]:
+        return dict(self._thread_metadata)
+
+    def get_cached_context_usage(self) -> dict[str, object]:
         return dict(self._context_usage)
+
+    def get_capability_snapshot(self) -> AgentCapabilitySnapshot:
+        return codex_capability_snapshot(
+            runtime_name=self._runtime_name,
+            runtime_version=self._runtime_version,
+            backend_name=str(self._thread_metadata.get("modelProvider") or "unknown"),
+        )
 
     def start(
         self,
@@ -225,14 +363,11 @@ class CodexJsonRpcSession:
             start_params=start_params,
         )
         deadline: float | None
-        if self._request_timeout_sec > 0:
-            deadline = clock.monotonic() + self._request_timeout_sec
-        else:
-            deadline = None
+        deadline = clock.monotonic() + self._startup_timeout_sec
         while True:
             if self.poll_interactive_start(state, timeout_sec=0.05):
                 return
-            if deadline is not None and clock.monotonic() >= deadline:
+            if clock.monotonic() >= deadline:
                 raise RuntimeError("timeout waiting for interactive session start")
 
     def stop(self) -> None:
@@ -247,40 +382,9 @@ class CodexJsonRpcSession:
             )
         self._pending_messages = []
 
-    def ask(
-        self,
-        prompt: str,
-        *,
-        approval_notify_callback: Optional[Callable[[str], None]] = None,
-    ) -> str:
-        if self._thread_id is None:
-            raise RuntimeError("thread not initialized")
-        req_id = self._send_request(
-            method="turn/start",
-            params={
-                "threadId": self._thread_id,
-                "input": [{"type": "text", "text": prompt, "text_elements": []}],
-            },
-        )
-        response = self._wait_for_response(
-            req_id=req_id,
-            approval_notify_callback=approval_notify_callback,
-        )
-        turn_id = response.get("result", {}).get("turn", {}).get("id")
-        if turn_id is None:
-            raise RuntimeError("turn/start response did not contain turn id")
-
-        self._logger.event(f"{self._role}_input", prompt=prompt, turn_id=turn_id)
-        text = self._wait_for_turn_completion(
-            turn_id=turn_id,
-            approval_notify_callback=approval_notify_callback,
-        )
-        self._logger.event(f"{self._role}_output", response=text, turn_id=turn_id)
-        return text
-
     def begin_interactive_turn(
         self,
-        prompt: str,
+        agent_input: AgentInput,
         *,
         approval_notify_callback: Optional[Callable[[str], None]] = None,
     ) -> InteractiveTurnState:
@@ -290,7 +394,7 @@ class CodexJsonRpcSession:
             method="turn/start",
             params={
                 "threadId": self._thread_id,
-                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                "input": [{"type": "text", "text": agent_input.text, "text_elements": []}],
             },
         )
         self._logger.event(
@@ -298,12 +402,12 @@ class CodexJsonRpcSession:
             role=self._role,
             req_id=req_id,
             thread_id=self._thread_id,
-            prompt_preview=str(prompt).strip()[:200],
+            prompt_preview=agent_input.text.strip()[:200],
         )
         return InteractiveTurnState(
             start_req_id=req_id,
             turn_id=None,
-            prompt=prompt,
+            agent_input=agent_input,
             approval_notify_callback=approval_notify_callback,
             deltas=[],
             final_deltas=[],
@@ -322,6 +426,8 @@ class CodexJsonRpcSession:
         self._thread_model = None
         self._thread_metadata = {}
         self._context_usage = {}
+        self._runtime_name = "codex-app-server"
+        self._runtime_version = "unknown"
         self._client.start()
         self._startup_started_at = clock.monotonic()
         self._startup_last_waiting_at = self._startup_started_at
@@ -369,16 +475,16 @@ class CodexJsonRpcSession:
                 return True
             remaining = max(0.0, deadline - clock.monotonic())
             wait_timeout = 0.0 if timeout_sec <= 0 else max(0.0, remaining)
-            if self._pending_messages:
-                msg = self._pending_messages.pop(0)
-            else:
-                msg = self._read_message(timeout_sec=max(0.0, min(0.05, wait_timeout)) if timeout_sec > 0 else 0.0)
+            msg = self._take_turn_message(
+                timeout_sec=max(0.0, min(0.05, wait_timeout)) if timeout_sec > 0 else 0.0,
+            )
             if msg is None:
                 self._log_startup_waiting()
                 state.deferred_messages = deferred
                 return False
             if state.active_start_req_id is None:
                 if msg.get("id") == state.initialize_req_id and "result" in msg:
+                    self._capture_initialize_result(msg.get("result"))
                     self._log_startup_timeline(
                         "initialize_completed",
                         request_id=state.initialize_req_id,
@@ -430,6 +536,11 @@ class CodexJsonRpcSession:
                         )
                     else:
                         self._logger.event(f"{self._role}_thread_started", thread_id=thread_id, model=model)
+                    self._logger.event(
+                        "agent_capability_snapshot",
+                        role=self._role,
+                        **self.get_capability_snapshot().to_log_fields(),
+                    )
                     self._pending_messages = deferred + self._pending_messages
                     state.deferred_messages = []
                     return True
@@ -489,7 +600,7 @@ class CodexJsonRpcSession:
                 return InteractiveTurnProgress(kind="idle")
         if state.pending_approval is not None:
             if state.pending_approval_emitted:
-                return InteractiveTurnProgress(kind="idle")
+                return self._poll_pending_approval_occurrence(state)
             state.pending_approval_emitted = True
             return InteractiveTurnProgress(
                 kind="approval_required",
@@ -500,10 +611,9 @@ class CodexJsonRpcSession:
         while True:
             remaining = max(0.0, deadline - clock.monotonic())
             wait_timeout = 0.0 if timeout_sec <= 0 else max(0.0, remaining)
-            if self._pending_messages:
-                msg = self._pending_messages.pop(0)
-            else:
-                msg = self._read_message(timeout_sec=max(0.0, min(0.05, wait_timeout)) if timeout_sec > 0 else 0.0)
+            msg = self._take_turn_message(
+                timeout_sec=max(0.0, min(0.05, wait_timeout)) if timeout_sec > 0 else 0.0,
+            )
             if msg is None:
                 if timeout_sec > 0:
                     self._logger.event(
@@ -522,6 +632,77 @@ class CodexJsonRpcSession:
                 return InteractiveTurnProgress(kind="progressed")
             if remaining <= 0.0:
                 return InteractiveTurnProgress(kind="progressed")
+
+    def _poll_pending_approval_occurrence(
+        self,
+        state: InteractiveTurnState,
+    ) -> InteractiveTurnProgress:
+        occurrences = self.drain_pending_interactive_approval_occurrences(
+            state,
+            limit=1,
+        )
+        if not occurrences:
+            return InteractiveTurnProgress(kind="idle")
+        return InteractiveTurnProgress(
+            kind="approval_required",
+            approval_request=occurrences[0],
+        )
+
+    def drain_pending_interactive_approval_occurrences(
+        self,
+        state: InteractiveTurnState,
+        *,
+        limit: int = 64,
+        fail_closed_on_overflow: bool = False,
+    ) -> tuple[NativeApprovalRequest, ...]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("approval occurrence drain limit must be a positive integer")
+        occurrences: list[NativeApprovalRequest] = []
+        while len(occurrences) < limit:
+            msg = self._take_turn_message(timeout_sec=0.0)
+            if msg is None:
+                break
+            request = parse_server_request(msg)
+            if request is None or not (
+                is_codex_approval_method(request.method)
+                or request.method in self._USER_INPUT_REQUEST_METHODS
+            ):
+                self._pending_messages.insert(0, msg)
+                break
+            request = self._enrich_interactive_approval_request_from_items(
+                state=state,
+                request=request,
+            )
+            occurrences.append(
+                NativeApprovalRequest(
+                    req_id=request.req_id,
+                    method=request.method,
+                    params=request.params,
+                    role=self._role or "agent",
+                )
+            )
+        if fail_closed_on_overflow and len(occurrences) == limit:
+            overflow = self._take_turn_message(timeout_sec=0.0)
+            if overflow is not None:
+                overflow_request = parse_server_request(overflow)
+                if overflow_request is None or not (
+                    is_codex_approval_method(overflow_request.method)
+                    or overflow_request.method in self._USER_INPUT_REQUEST_METHODS
+                ):
+                    self._pending_messages.insert(0, overflow)
+                else:
+                    self.reject_concurrent_interactive_approval_request(
+                        request_token=overflow_request.req_id,
+                        reason="approval occurrence buffer capacity exceeded",
+                    )
+                    self._logger.event(
+                        "codex_approval_occurrence_capacity_exceeded",
+                        role=self._role,
+                        limit=limit,
+                        id=overflow_request.req_id,
+                    )
+                    raise RuntimeError("approval occurrence buffer capacity exceeded")
+        return tuple(occurrences)
 
     def _poll_interactive_turn_start(
         self,
@@ -554,7 +735,7 @@ class CodexJsonRpcSession:
                     raise RuntimeError("turn/start response did not contain turn id")
                 turn_id_str = str(turn_id)
                 state.turn_id = turn_id_str
-                self._logger.event(f"{self._role}_input", prompt=state.prompt, turn_id=turn_id_str)
+                self._logger.event(f"{self._role}_input", prompt=state.agent_input.text, turn_id=turn_id_str)
                 self._logger.event(
                     "interactive_turn_started",
                     role=self._role,
@@ -568,10 +749,7 @@ class CodexJsonRpcSession:
                 state.deferred_pre_start_messages = deferred
                 raise RuntimeError(f"protocol error for request {state.start_req_id}: {msg['error']}")
             approval_started_at = clock.monotonic()
-            if self._maybe_handle_server_request(
-                msg,
-                approval_notify_callback=state.approval_notify_callback,
-            ):
+            if self._maybe_handle_server_request(msg):
                 deadline += max(0.0, clock.monotonic() - approval_started_at)
                 continue
             deferred.append(msg)
@@ -583,11 +761,16 @@ class CodexJsonRpcSession:
         self,
         state: InteractiveTurnState,
         *,
+        expected_request_token: int,
         decision: str,
+        via: str = "human",
+        decision_source: str = "interactive",
     ) -> None:
         pending = state.pending_approval
         if pending is None:
             raise RuntimeError("interactive turn is not waiting for approval")
+        if pending.server_request.req_id != expected_request_token:
+            raise RuntimeError("Codex approval request token no longer matches")
         if pending.server_request.method in self._USER_INPUT_REQUEST_METHODS:
             available = self._extract_available_decisions(pending.server_request.params)
             normalized = str(decision or "").strip().lower()
@@ -612,9 +795,12 @@ class CodexJsonRpcSession:
             return
         normalized = ApprovalPolicy.normalize_human_decision_with_always(
             raw=decision,
-            allow_always=supports_session_approval(
-                method=pending.server_request.method,
-                params=pending.server_request.params,
+            allow_always=(
+                self.get_capability_snapshot().supports(AgentCapability.APPROVAL_ALWAYS)
+                and supports_session_approval(
+                    method=pending.server_request.method,
+                    params=pending.server_request.params,
+                )
             ),
         )
         always_allow = normalized == "always_allow"
@@ -633,14 +819,27 @@ class CodexJsonRpcSession:
             if session_result is not None
             else normalized
         )
-        self._logger.event(
-            "approval_human_decision",
-            role=self._role,
-            id=pending.server_request.req_id,
-            method=pending.server_request.method,
-            decision=resolved_decision,
-            always_allow=always_allow,
-        )
+        if via == "human":
+            self._logger.event(
+                "approval_human_decision",
+                role=self._role,
+                id=pending.server_request.req_id,
+                method=pending.server_request.method,
+                decision=resolved_decision,
+                always_allow=always_allow,
+            )
+        elif via == "policy_auto":
+            self._logger.event(
+                "approval_auto_decision",
+                role=self._role,
+                id=pending.server_request.req_id,
+                method=pending.server_request.method,
+                decision=resolved_decision,
+                source=decision_source,
+                command=str(pending.server_request.params.get("command") or ""),
+            )
+        else:
+            raise ValueError(f"unsupported approval decision source: {via}")
         result: dict[str, Any] = session_result or {"decision": resolved_decision}
         if always_allow:
             command = pending.server_request.params.get("command")
@@ -661,6 +860,42 @@ class CodexJsonRpcSession:
         state.pending_approval = None
         state.pending_approval_emitted = False
 
+    def reject_interactive_approval_request(
+        self,
+        state: InteractiveTurnState,
+        *,
+        expected_request_token: int,
+        reason: str,
+    ) -> None:
+        pending = state.pending_approval
+        if pending is None:
+            raise RuntimeError("interactive turn is not waiting for approval")
+        if pending.server_request.req_id != expected_request_token:
+            raise RuntimeError("Codex approval request token no longer matches")
+        message = str(reason or "").strip() or "approval request is no longer active"
+        self._send_error(
+            req_id=expected_request_token,
+            code=-32600,
+            message=message,
+            data={"reason": "approval_correlation_rejected"},
+        )
+        state.pending_approval = None
+        state.pending_approval_emitted = False
+
+    def reject_concurrent_interactive_approval_request(
+        self,
+        *,
+        request_token: int,
+        reason: str,
+    ) -> None:
+        message = str(reason or "").strip() or "approval request capacity exceeded"
+        self._send_error(
+            req_id=request_token,
+            code=-32600,
+            message=message,
+            data={"reason": "approval_occurrence_capacity"},
+        )
+
     def submit_interactive_turn_interrupt(self, state: InteractiveTurnState) -> None:
         if self._thread_id is None:
             raise RuntimeError("thread not initialized")
@@ -675,20 +910,23 @@ class CodexJsonRpcSession:
         )
         self._wait_for_response(req_id=req_id)
 
-    def submit_interactive_turn_steer(self, state: InteractiveTurnState, text: str) -> None:
+    def submit_interactive_turn_steer(self, state: InteractiveTurnState, agent_input: AgentInput) -> None:
         if self._thread_id is None:
             raise RuntimeError("thread not initialized")
         if not isinstance(state.turn_id, str) or not state.turn_id.strip():
             raise RuntimeError("interactive turn has no active turn id")
-        steer_text = str(text)
-        req_id = self._send_request(
-            method="turn/steer",
-            params={
-                "threadId": self._thread_id,
-                "expectedTurnId": state.turn_id.strip(),
-                "input": [{"type": "text", "text": steer_text, "text_elements": []}],
-            },
-        )
+        steer_text = agent_input.text
+        try:
+            req_id = self._send_request(
+                method="turn/steer",
+                params={
+                    "threadId": self._thread_id,
+                    "expectedTurnId": state.turn_id.strip(),
+                    "input": [{"type": "text", "text": steer_text, "text_elements": []}],
+                },
+            )
+        except Exception as exc:
+            raise JsonRpcDeliveryUncertain(str(exc) or type(exc).__name__) from exc
         self._logger.event(
             "interactive_turn_steer_requested",
             role=self._role,
@@ -697,7 +935,12 @@ class CodexJsonRpcSession:
             turn_id=state.turn_id.strip(),
             prompt_preview=steer_text.strip()[:200],
         )
-        self._wait_for_response(req_id=req_id)
+        try:
+            self._wait_for_response(req_id=req_id)
+        except JsonRpcRemoteError:
+            raise
+        except Exception as exc:
+            raise JsonRpcDeliveryUncertain(str(exc) or type(exc).__name__) from exc
 
     def poll_background_protocol_message(self, *, timeout_sec: float = 0.0) -> bool:
         if self._pending_messages:
@@ -718,7 +961,11 @@ class CodexJsonRpcSession:
         method = msg.get("method")
         params = msg.get("params", {})
         if isinstance(method, str) and isinstance(params, dict):
-            self._emit_protocol_status(method=method, params=params)
+            self._emit_protocol_status(
+                method=method,
+                params=params,
+                allow_terminal_status=True,
+            )
             self._logger.event(
                 "protocol_background_consumed",
                 role=self._role,
@@ -732,8 +979,29 @@ class CodexJsonRpcSession:
             method="initialize",
             params=codex_initialize_params(client_name=f"orc1-{self._role}"),
         )
-        self._wait_for_response(req_id=req_id)
+        response = self._wait_for_response(req_id=req_id)
+        self._capture_initialize_result(response.get("result"))
         self._send_notification(method="initialized", params={})
+
+    def _capture_initialize_result(self, value: object) -> None:
+        if not isinstance(value, dict):
+            return
+        raw_info = value.get("serverInfo")
+        if not isinstance(raw_info, dict):
+            raw_info = value.get("runtimeInfo")
+        if not isinstance(raw_info, dict):
+            raw_info = {}
+        name = str(raw_info.get("name") or "").strip()
+        version = str(
+            raw_info.get("version")
+            or value.get("serverVersion")
+            or value.get("version")
+            or ""
+        ).strip()
+        if name:
+            self._runtime_name = name
+        if version:
+            self._runtime_version = version
 
     def _thread_start(
         self,
@@ -778,62 +1046,12 @@ class CodexJsonRpcSession:
         self._thread_id = start_result.thread_id
         self._thread_model = start_result.model
         self._context_usage = {}
-        self._thread_metadata = {"id": self._thread_id, "model": self._thread_model}
-
-    def _request_thread_read(self, thread_id: str) -> dict[str, Any]:
-        last_error: Exception | None = None
-        for params in ({"threadId": thread_id}, {"id": thread_id}):
-            try:
-                response = self.request("thread/read", params)
-            except Exception as exc:
-                last_error = exc
-                continue
-            result = response.get("result") if isinstance(response.get("result"), dict) else {}
-            thread_payload = result.get("thread")
-            if isinstance(thread_payload, dict):
-                return dict(thread_payload)
-            if isinstance(result, dict) and any(key in result for key in ("id", "status", "preview", "ephemeral")):
-                return dict(result)
-        if last_error is not None:
-            self._logger.event(
-                "protocol_thread_read_failed",
-                role=self._role,
-                thread_id=thread_id,
-                error=str(last_error),
-                error_type=type(last_error).__name__,
-            )
-        return {}
-
-    def _request_loaded_state(self, thread_id: str) -> bool | None:
-        try:
-            response = self.request("thread/loaded/list", {})
-        except Exception as exc:
-            self._logger.event(
-                "protocol_thread_loaded_list_failed",
-                role=self._role,
-                thread_id=thread_id,
-                error=str(exc),
-                error_type=type(exc).__name__,
-            )
-            return None
-        result = response.get("result") if isinstance(response.get("result"), dict) else {}
-        raw_items = None
-        if isinstance(result.get("data"), list):
-            raw_items = result.get("data")
-        elif isinstance(result.get("threads"), list):
-            raw_items = result.get("threads")
-        elif isinstance(result.get("threadIds"), list):
-            raw_items = result.get("threadIds")
-        if not isinstance(raw_items, list):
-            return None
-        for item in raw_items:
-            if isinstance(item, str) and item.strip() == thread_id:
-                return True
-            if isinstance(item, dict):
-                item_id = item.get("id")
-                if isinstance(item_id, str) and item_id.strip() == thread_id:
-                    return True
-        return False
+        self._thread_metadata = {
+            "id": self._thread_id,
+            "model": self._thread_model,
+        }
+        if start_result.backend:
+            self._thread_metadata["modelProvider"] = start_result.backend
 
     def _consume_interactive_turn_message(
         self,
@@ -875,8 +1093,10 @@ class CodexJsonRpcSession:
                     if phase == "commentary":
                         return None
                     if phase == "final_answer":
+                        state.ordered_output_deltas.append(delta)
                         state.final_deltas.append(delta)
                         return None
+                state.ordered_output_deltas.append(delta)
                 state.deltas.append(delta)
             return None
         if method == "codex/event/agent_message" and isinstance(params, dict):
@@ -899,12 +1119,18 @@ class CodexJsonRpcSession:
                 text = joined_final if joined_final else "".join(state.deltas).strip()
             if status == "failed":
                 error_payload = params.get("turn", {}).get("error")
-                raise RuntimeError(f"turn failed: {error_payload}")
+                return InteractiveTurnProgress(
+                    kind="failed",
+                    error="Codex turn failed",
+                    raw_provider_error=RawProviderErrorPayload.from_json_object(
+                        error_payload
+                    ),
+                )
             if status == "interrupted":
                 self._logger.event(f"{self._role}_interrupted", turn_id=state.turn_id)
                 return InteractiveTurnProgress(kind="interrupted")
             self._logger.event(f"{self._role}_output", response=text, turn_id=state.turn_id)
-            return InteractiveTurnProgress(kind="completed", text=text)
+            return InteractiveTurnProgress(kind="completed", output=AgentOutput(text=text))
         if method == "error" and str(params.get("turnId")) == state.turn_id:
             state.terminal_error = params.get("error", {}).get("message") or str(params)
 
@@ -919,7 +1145,7 @@ class CodexJsonRpcSession:
                     state=state,
                     request=request,
                 )
-            if not ApprovalPolicy.is_approval_method(request.method):
+            if not is_codex_approval_method(request.method):
                 self._logger.event(
                     "server_request_unsupported_method",
                     role=self._role,
@@ -942,8 +1168,27 @@ class CodexJsonRpcSession:
             return None
 
         if isinstance(method, str):
-            self._emit_protocol_status(method=method, params=params)
+            self._emit_protocol_status(
+                method=method,
+                params=params,
+                allow_terminal_status=True,
+            )
         return None
+
+    def _take_turn_message(self, *, timeout_sec: float) -> dict[str, Any] | None:
+        if self._pending_messages:
+            response_id = self._pending_messages[0].get("id")
+            if isinstance(response_id, int) and response_id in self._inspection_response_ids:
+                return None
+            return self._pending_messages.pop(0)
+        message = self._read_message(timeout_sec=timeout_sec)
+        if message is None:
+            return None
+        response_id = message.get("id")
+        if isinstance(response_id, int) and response_id in self._inspection_response_ids:
+            self._pending_messages.append(message)
+            return None
+        return message
 
     def _prepare_interactive_user_input(
         self,
@@ -959,7 +1204,7 @@ class CodexJsonRpcSession:
             method=request.method,
             available_decisions=available,
         )
-        approval_request = ApprovalRequest(
+        approval_request = NativeApprovalRequest(
             req_id=request.req_id,
             method=request.method,
             params=request.params,
@@ -969,7 +1214,7 @@ class CodexJsonRpcSession:
             server_request=request,
             approval_request=approval_request,
         )
-        state.pending_approval_emitted = False
+        state.pending_approval_emitted = True
         return InteractiveTurnProgress(
             kind="approval_required",
             approval_request=approval_request,
@@ -981,64 +1226,20 @@ class CodexJsonRpcSession:
         state: InteractiveTurnState,
         request: ApprovalServerRequest,
     ) -> InteractiveTurnProgress | None:
-        cached_plan = build_always_allow_cached_response_plan(
-            request=request,
-            logger=self._logger,
-            role=self._role,
-            always_allow_commands=self._always_allow_commands,
+        cached_plan = (
+            build_always_allow_cached_response_plan(
+                request=request,
+                logger=self._logger,
+                role=self._role,
+                always_allow_commands=self._always_allow_commands,
+            )
+            if self.get_capability_snapshot().supports(AgentCapability.APPROVAL_ALWAYS)
+            else None
         )
         if cached_plan is not None:
             self._send_response(req_id=cached_plan.req_id, result=cached_plan.result)
             return None
-        decision_trace = self._approval_policy.decide_with_trace(method=request.method, params=request.params) if self._approval_policy is not None else None
-        decision = decision_trace.decision if decision_trace is not None else "human"
-        if decision == "human" and decision_trace is not None:
-            _log_regex_allowlist_trace(
-                logger=self._logger,
-                role=self._role,
-                request=request,
-                decision=decision_trace.decision,
-                decision_source=decision_trace.source,
-                command=decision_trace.command,
-                affected_paths=decision_trace.affected_paths,
-                regex_trace=decision_trace.regex_trace,
-                approval_notify=state.approval_notify_callback or self._approval_notify_callback,
-            )
-        if decision != "human":
-            plan = build_approval_response_plan(
-                request=request,
-                logger=self._logger,
-                role=self._role,
-                approval_policy=self._approval_policy,
-                approval_decision_provider=None,
-                approval_notify=state.approval_notify_callback or self._approval_notify_callback,
-                always_allow_commands=self._always_allow_commands,
-                before_human_required=None,
-                decide_human=None,
-                log_approval_requested=True,
-                log_human_required=True,
-                log_human_decision=True,
-                log_auto_decision=True,
-                decision_trace=decision_trace,
-            )
-            self._send_response(req_id=plan.req_id, result=plan.result)
-            return None
-
-        self._logger.event(
-            "approval_requested",
-            role=self._role,
-            id=request.req_id,
-            method=request.method,
-            params=request.params,
-        )
-        self._logger.event(
-            "approval_human_required",
-            role=self._role,
-            id=request.req_id,
-            method=request.method,
-            source=decision_trace.source if decision_trace is not None else "interactive",
-        )
-        approval_request = ApprovalRequest(
+        approval_request = NativeApprovalRequest(
             req_id=request.req_id,
             method=request.method,
             params=request.params,
@@ -1048,7 +1249,7 @@ class CodexJsonRpcSession:
             server_request=request,
             approval_request=approval_request,
         )
-        state.pending_approval_emitted = False
+        state.pending_approval_emitted = True
         return InteractiveTurnProgress(kind="approval_required", approval_request=approval_request)
 
     def _enrich_interactive_approval_request_from_items(
@@ -1098,8 +1299,6 @@ class CodexJsonRpcSession:
     def _wait_for_response(
         self,
         req_id: int,
-        *,
-        approval_notify_callback: Optional[Callable[[str], None]] = None,
     ) -> dict:
         deferred: list[dict] = []
         attempts = self._rpc_retries + 1
@@ -1117,12 +1316,9 @@ class CodexJsonRpcSession:
                     return msg
                 if msg.get("id") == req_id and "error" in msg:
                     self._pending_messages = deferred + self._pending_messages
-                    raise RuntimeError(f"protocol error for request {req_id}: {msg['error']}")
+                    raise JsonRpcRemoteError(req_id, msg["error"])
                 approval_started_at = clock.monotonic()
-                if self._maybe_handle_server_request(
-                    msg,
-                    approval_notify_callback=approval_notify_callback,
-                ):
+                if self._maybe_handle_server_request(msg):
                     deadline += max(0.0, clock.monotonic() - approval_started_at)
                     continue
                 deferred.append(msg)
@@ -1145,116 +1341,6 @@ class CodexJsonRpcSession:
             method=method,
         )
 
-    def _wait_for_turn_completion(
-        self,
-        turn_id: str,
-        *,
-        approval_notify_callback: Optional[Callable[[str], None]] = None,
-    ) -> str:
-        deadline: Optional[float]
-        if self._request_timeout_sec > 0:
-            deadline = clock.monotonic() + self._request_timeout_sec
-        else:
-            deadline = None
-        deltas: list[str] = []
-        final_deltas: list[str] = []
-        final_answer_text: Optional[str] = None
-        agent_message_phase_by_item_id: dict[str, str] = {}
-        terminal_error: Optional[str] = None
-        turn_id_str = str(turn_id)
-        deferred: list[dict] = []
-        while deadline is None or clock.monotonic() < deadline:
-            if self._pending_messages:
-                msg = self._pending_messages.pop(0)
-            else:
-                if deadline is None:
-                    wait_timeout = 0.5
-                else:
-                    wait_timeout = max(0.05, deadline - clock.monotonic())
-                msg = self._read_message(timeout_sec=wait_timeout)
-            if msg is None:
-                continue
-            method = msg.get("method")
-            params = msg.get("params", {})
-            item_obj: dict | None = None
-            if isinstance(params, dict):
-                if method in ("item/started", "item/completed"):
-                    raw_item = params.get("item")
-                    item_obj = raw_item if isinstance(raw_item, dict) else None
-                elif method in ("codex/event/item_started", "codex/event/item_completed"):
-                    raw_msg = params.get("msg")
-                    if isinstance(raw_msg, dict):
-                        nested_item = raw_msg.get("item")
-                        item_obj = nested_item if isinstance(nested_item, dict) else None
-            if isinstance(item_obj, dict):
-                item_type = str(item_obj.get("type") or "").strip()
-                item_id = str(item_obj.get("id") or "").strip()
-                if item_type and item_type.lower() == "agentmessage" and item_id:
-                    phase = str(item_obj.get("phase") or "").strip()
-                    if phase:
-                        agent_message_phase_by_item_id[item_id] = phase
-                    if phase != "commentary":
-                        text = item_obj.get("text")
-                        if isinstance(text, str) and text.strip():
-                            final_answer_text = text.strip()
-            if method == "item/agentMessage/delta" and str(params.get("turnId")) == turn_id_str:
-                delta = params.get("delta", "")
-                if isinstance(delta, str):
-                    item_id = str(params.get("itemId") or "").strip()
-                    if item_id:
-                        phase = agent_message_phase_by_item_id.get(item_id, "")
-                        if phase == "commentary":
-                            continue
-                        if phase == "final_answer":
-                            final_deltas.append(delta)
-                            continue
-                    deltas.append(delta)
-                continue
-            if method == "codex/event/agent_message" and isinstance(params, dict):
-                event_turn_id = str(params.get("id") or "").strip()
-                if event_turn_id == turn_id_str:
-                    msg_payload = params.get("msg")
-                    if isinstance(msg_payload, dict):
-                        phase = str(msg_payload.get("phase") or "").strip()
-                        text = msg_payload.get("message")
-                        if isinstance(text, str) and text.strip():
-                            if phase in ("", "final_answer"):
-                                final_answer_text = text.strip()
-                continue
-            if method == "turn/completed" and str(params.get("turn", {}).get("id")) == turn_id_str:
-                self._emit_protocol_status(method=method, params=params)
-                status = params.get("turn", {}).get("status")
-                text = final_answer_text
-                if not text:
-                    joined_final = "".join(final_deltas).strip()
-                    text = joined_final if joined_final else "".join(deltas).strip()
-                if status == "failed":
-                    error_payload = params.get("turn", {}).get("error")
-                    self._pending_messages = deferred + self._pending_messages
-                    raise RuntimeError(f"turn failed: {error_payload}")
-                if status == "interrupted":
-                    self._pending_messages = deferred + self._pending_messages
-                    return ""
-                self._pending_messages = deferred + self._pending_messages
-                return text
-            if method == "error" and str(params.get("turnId")) == turn_id_str:
-                terminal_error = params.get("error", {}).get("message") or str(params)
-            approval_started_at = clock.monotonic()
-            if self._maybe_handle_server_request(
-                msg,
-                approval_notify_callback=approval_notify_callback,
-            ):
-                elapsed = max(0.0, clock.monotonic() - approval_started_at)
-                if deadline is not None:
-                    deadline += elapsed
-                continue
-            if isinstance(method, str):
-                self._emit_protocol_status(method=method, params=params)
-        self._pending_messages = deferred + self._pending_messages
-        if terminal_error:
-            raise RuntimeError(f"turn failed: {terminal_error}")
-        raise RuntimeError("timeout waiting for turn completion")
-
     def _read_message(self, timeout_sec: float) -> Optional[dict]:
         poll_message = getattr(self._client, "poll_message", None)
         if callable(poll_message):
@@ -1274,9 +1360,11 @@ class CodexJsonRpcSession:
                     )
                 return None
             if result.terminal:
-                raise RuntimeError(result.error)
+                raise JsonRpcTransportTerminal(result.error)
             msg = result.message if result.kind == "message" else None
             if msg is not None:
+                if self._discard_ignored_response(msg):
+                    return None
                 self._on_protocol_in(
                     "",
                     msg,
@@ -1288,31 +1376,52 @@ class CodexJsonRpcSession:
         msg = self._client.read_message(timeout_sec=timeout_sec)
         if isinstance(msg, dict):
             self._transport_progressed = True
+            if self._discard_ignored_response(msg):
+                return None
             self._on_protocol_in("", msg)
             return msg
         return None
+
+    def _discard_ignored_response(self, message: dict[str, Any]) -> bool:
+        response_id = message.get("id")
+        if not isinstance(response_id, int) or response_id not in self._ignored_response_ids:
+            return False
+        self._ignored_response_ids.discard(response_id)
+        self._request_started.pop(response_id, None)
+        self._logger.event(
+            "protocol_ignored_response_discarded",
+            role=self._role,
+            response_id=response_id,
+        )
+        return True
 
     def consume_transport_progress(self) -> bool:
         progressed = self._transport_progressed
         self._transport_progressed = False
         return progressed
 
-    def _maybe_handle_server_request(
-        self,
-        msg: dict,
-        *,
-        approval_notify_callback: Optional[Callable[[str], None]] = None,
-    ) -> bool:
+    def _maybe_handle_server_request(self, msg: dict) -> bool:
         request = parse_server_request(msg)
         if request is None:
             return False
         if request.method in self._USER_INPUT_REQUEST_METHODS:
-            self._handle_user_input_request(
-                request=request,
-                approval_notify_callback=approval_notify_callback,
+            available = self._extract_available_decisions(request.params)
+            decision = (
+                "cancel"
+                if "decline" not in available and "cancel" in available
+                else "decline"
             )
+            self._logger.event(
+                "server_request_rejected_outside_agent_session_port",
+                role=self._role,
+                id=request.req_id,
+                method=request.method,
+                decision=decision,
+                available_decisions=available,
+            )
+            self._send_response(req_id=request.req_id, result={"decision": decision})
             return True
-        if not ApprovalPolicy.is_approval_method(request.method):
+        if not is_codex_approval_method(request.method):
             self._logger.event(
                 "server_request_unsupported_method",
                 role=self._role,
@@ -1326,84 +1435,15 @@ class CodexJsonRpcSession:
                 data={"method": request.method},
             )
             return True
-
-        def _decide_human(req: ApprovalRequest) -> str:
-            if self._approval_decision_provider is None:
-                raise RuntimeError("approval requires human decision but no decision provider configured")
-            return self._approval_decision_provider.decide(req)
-
-        plan = build_approval_response_plan(
-            request=request,
-            logger=self._logger,
-            role=self._role,
-            approval_policy=self._approval_policy,
-            approval_decision_provider=self._approval_decision_provider,
-            approval_notify=approval_notify_callback or self._approval_notify_callback,
-            always_allow_commands=self._always_allow_commands,
-            before_human_required=None,
-            decide_human=_decide_human,
-            log_approval_requested=True,
-            log_human_required=True,
-            log_human_decision=True,
-            log_auto_decision=True,
-        )
-
-        self._send_response(req_id=plan.req_id, result=plan.result)
-        return True
-
-    def _handle_user_input_request(
-        self,
-        *,
-        request: ApprovalServerRequest,
-        approval_notify_callback: Optional[Callable[[str], None]],
-    ) -> None:
-        preferred = "decline"
-        policy = self._approval_policy
-        if policy is not None and policy.default_decision in ("accept", "decline"):
-            preferred = policy.default_decision
-        if self._approval_decision_provider is not None:
-            raw = self._approval_decision_provider.decide(
-                ApprovalRequest(
-                    req_id=request.req_id,
-                    method=request.method,
-                    params=request.params,
-                    role=self._role,
-                )
-            )
-            decision = raw.strip().lower()
-            if decision == "always_allow":
-                decision = "accept"
-            if decision in ("accept", "decline", "cancel"):
-                preferred = decision
-            else:
-                self._logger.event(
-                    "user_input_request_invalid_decision",
-                    role=self._role,
-                    id=request.req_id,
-                    method=request.method,
-                    decision=decision,
-                )
-        available = self._extract_available_decisions(request.params)
-        decision = self._choose_server_request_decision(
-            preferred=preferred,
-            available=available,
-        )
-        notify = approval_notify_callback or self._approval_notify_callback
-        if notify is not None:
-            notify(
-                "interactive request received.\n"
-                f"method={request.method}\n"
-                f"decision={decision}"
-            )
         self._logger.event(
-            "user_input_request_decision",
+            "server_request_rejected_outside_agent_session_port",
             role=self._role,
             id=request.req_id,
             method=request.method,
-            decision=decision,
-            available_decisions=available,
+            decision="decline",
         )
-        self._send_response(req_id=request.req_id, result={"decision": decision})
+        self._send_response(req_id=request.req_id, result={"decision": "decline"})
+        return True
 
     @staticmethod
     def _extract_available_decisions(params: dict) -> list[str]:
@@ -1432,7 +1472,13 @@ class CodexJsonRpcSession:
         return available[0]
 
     def _send_response(self, req_id: int, result: dict) -> None:
-        self._client.send_response(req_id=req_id, result=result)
+        try:
+            self._client.send_response(req_id=req_id, result=result)
+        except JsonRpcDeliveryUncertain:
+            raise
+        except Exception as exc:
+            error = str(exc).strip() or type(exc).__name__
+            raise JsonRpcDeliveryUncertain(error) from exc
         self._logger.event(
             "protocol_out_response",
             role=self._role,
@@ -1618,8 +1664,15 @@ class CodexJsonRpcSession:
             startup_elapsed_ms=self._startup_elapsed_ms(),
         )
 
-    def _emit_protocol_status(self, method: str, params: dict) -> None:
+    def _emit_protocol_status(
+        self,
+        method: str,
+        params: dict,
+        *,
+        allow_terminal_status: bool = False,
+    ) -> None:
         self._update_context_usage(method=method, params=params)
+        active_turn_before = self._item_tracker.current_turn_id()
         changed_item_id = self._item_tracker.apply(method=method, params=params)
         apply_info = self._item_tracker.last_apply_info() or {}
         forgotten_turn_reasons = apply_info.get("forgotten_turn_reasons")
@@ -1667,7 +1720,16 @@ class CodexJsonRpcSession:
             return
         if is_hidden_item_status_event(method=method, params=params):
             return
-        if method in ("item/agentMessage/delta", "turn/completed"):
+        terminal_turn_id = str(apply_info.get("turn_id") or "").strip()
+        is_historical_terminal = (
+            allow_terminal_status
+            and method == "turn/completed"
+            and active_turn_before is not None
+            and terminal_turn_id != active_turn_before
+        )
+        if method == "item/agentMessage/delta" or (
+            method == "turn/completed" and not is_historical_terminal
+        ):
             return
         if not should_emit_status_method(method):
             return
@@ -1711,3 +1773,12 @@ def _summarize_protocol_response(msg: dict[str, Any]) -> dict[str, Any]:
         summary["error_code"] = error.get("code")
         summary["error_message"] = str(error.get("message") or "")[:300]
     return summary
+
+
+def _jsonrpc_error_message(value: object) -> str:
+    if isinstance(value, dict):
+        message = str(value.get("message") or "").strip()
+        if message:
+            return message
+    normalized = str(value or "").strip()
+    return normalized or "provider metadata request failed"

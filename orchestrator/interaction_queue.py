@@ -5,16 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar
 
-from orchestrator.access_point_common import AccessPointKey
-
-
 @dataclass
 class InteractionTickContext:
     runtime: Any
-    blocked_targets: set[AccessPointKey] = field(default_factory=set)
+    blocked_targets: set[object] = field(default_factory=set)
+    active_target_owners: dict[object, object] = field(default_factory=dict)
+    fifo_target_owners: dict[object, object] = field(default_factory=dict)
+    progressed: bool = False
 
 
 class Interaction(Protocol):
+    def reserve(self, context: Any) -> None: ...
     def tick(self, context: Any) -> str | None: ...
 
     def on_completed(self, context: Any, outcome: str) -> None: ...
@@ -44,7 +45,12 @@ class InteractionQueue(Generic[ItemT]):
 
     def tick(self, context: object) -> bool:
         progressed = False
-        for interaction in self.snapshot():
+        snapshot = self.snapshot()
+        for interaction in snapshot:
+            reserve = getattr(interaction, "reserve", None)
+            if callable(reserve):
+                reserve(context)
+        for interaction in snapshot:
             outcome = interaction.tick(context)
             if outcome is None:
                 continue
@@ -54,4 +60,4 @@ class InteractionQueue(Generic[ItemT]):
                     break
             interaction.on_completed(context, outcome)
             progressed = True
-        return progressed
+        return progressed or bool(getattr(context, "progressed", False))

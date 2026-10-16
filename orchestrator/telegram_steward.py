@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from orchestrator.access_point_common import AccessPointKey, access_point_sort_key
+from orchestrator.agent_identity import (
+    ProviderExecutionProfile,
+    ProviderKind,
+    ProviderProfileId,
+)
+from orchestrator.agent_provider import ProviderHostRootSettings
 from orchestrator.approval import ApprovalPolicy
-from orchestrator.interactive_driver_events import RuntimeDriverFactory, StewardDriverFactory
-from orchestrator.processes import LifecycleLogger
+from orchestrator.interactive_driver_events import (
+    RuntimeDeliveryDriverFactory,
+    StewardDeliveryDriverFactory,
+)
+from orchestrator.processes import CleanupStep, LifecycleLogger, cleanup_owned_resources
+from orchestrator.provider_composition import (
+    ProductionProviderComposition,
+    resolve_production_session_catalog_roots,
+)
+from orchestrator.runtime_profile_catalog import (
+    DEFAULT_RUNTIME_LAUNCH_DEFAULTS,
+    RuntimeLaunchDefaults,
+    RuntimeProfileCatalog,
+    load_runtime_profile_catalog_from_environment,
+)
 from orchestrator.steward_core import (
     StewardCore,
     StewardCoreHooks,
@@ -45,6 +64,7 @@ from orchestrator.telegram_bridge import (
     process_telegram_updates,
 )
 from orchestrator.telegram_api_thread_driver import TelegramApiThreadDriver
+from orchestrator.telegram_allowlist import ReloadableTelegramChatAllowlist
 from orchestrator.telegram_smoke import TelegramApi
 from orchestrator.uploads import MAX_UPLOAD_FILE_BYTES
 
@@ -64,7 +84,7 @@ class _TelegramStewardTransport(StewardTransportAdapter):
         logger: LifecycleLogger,
         writer: Writer,
         max_poll_cycles: int | None,
-        allowed_chat_ids: Optional[set[int]],
+        chat_allowlist: ReloadableTelegramChatAllowlist,
         offset_ref: list[int | None],
         chat_state: TelegramChatState,
         on_text_update: Callable[[TelegramTextUpdate], None],
@@ -72,12 +92,15 @@ class _TelegramStewardTransport(StewardTransportAdapter):
         on_callback_update: Callable[[TelegramCallbackUpdate], None],
         agent_runtime: InteractiveAgentRuntime,
         runtime: InteractiveStewardRuntime,
+        provider_composition: ProductionProviderComposition,
+        cancel_catalog_operations: Callable[[], None],
+        close_catalog_operations: Callable[[], None],
     ) -> None:
         self._client = client
         self._logger = logger
         self._writer = writer
         self._max_poll_cycles = max_poll_cycles
-        self._allowed_chat_ids = allowed_chat_ids
+        self._chat_allowlist = chat_allowlist
         self._offset_ref = offset_ref
         self._chat_state = chat_state
         self._on_text_update = on_text_update
@@ -85,6 +108,9 @@ class _TelegramStewardTransport(StewardTransportAdapter):
         self._on_callback_update = on_callback_update
         self._agent_runtime = agent_runtime
         self._runtime = runtime
+        self._provider_composition = provider_composition
+        self._cancel_catalog_operations = cancel_catalog_operations
+        self._close_catalog_operations = close_catalog_operations
         self._handled_poll_errors = 0
 
     def consume_transport(self) -> bool:
@@ -109,11 +135,31 @@ class _TelegramStewardTransport(StewardTransportAdapter):
         updates = self._client.drain_updates()
         if not updates:
             return False
+        reload_result = self._chat_allowlist.refresh_if_changed()
+        if reload_result is not None:
+            reload_path = str(self._chat_allowlist.reload_file)
+            if reload_result.reloaded:
+                self._logger.event(
+                    "telegram_allowlist_reloaded",
+                    path=reload_path,
+                    added_chat_ids=list(reload_result.added_chat_ids),
+                    removed_chat_ids=list(reload_result.removed_chat_ids),
+                    allowed_chat_ids=sorted(self._chat_allowlist.allowed_chat_ids),
+                )
+            else:
+                self._logger.event(
+                    "telegram_allowlist_reload_failed",
+                    level="warning",
+                    path=reload_path,
+                    error=reload_result.error,
+                    error_type=reload_result.error_type,
+                    allowed_chat_ids=sorted(self._chat_allowlist.allowed_chat_ids),
+                )
         process_telegram_updates(
             updates=updates,
             logger=self._logger,
             source="telegram_steward",
-            allowed_chat_ids=self._allowed_chat_ids,
+            allowed_chat_ids=self._chat_allowlist.allowed_chat_ids,
             offset_ref=self._offset_ref,
             chat_state=self._chat_state,
             on_text_update=self._on_text_update,
@@ -146,10 +192,26 @@ class _TelegramStewardTransport(StewardTransportAdapter):
         raise exc
 
     def stop_resources(self) -> None:
-        self._client.stop_polling()
-        self._agent_runtime.close()
-        self._runtime.close()
-        self._client.stop()
+        cleanup_owned_resources(
+            [
+                CleanupStep(owner="telegram polling", cleanup=self._client.stop_polling),
+                CleanupStep(owner="runtime agent drivers", cleanup=self._agent_runtime.close),
+                CleanupStep(owner="steward drivers", cleanup=self._runtime.close),
+                CleanupStep(
+                    owner="pending catalog operations",
+                    cleanup=self._cancel_catalog_operations,
+                ),
+                CleanupStep(
+                    owner="shared provider hosts",
+                    cleanup=self._provider_composition.close,
+                ),
+                CleanupStep(
+                    owner="catalog operations",
+                    cleanup=self._close_catalog_operations,
+                ),
+                CleanupStep(owner="telegram client", cleanup=self._client.stop),
+            ]
+        )
 
 
 def run_telegram_steward(
@@ -163,30 +225,76 @@ def run_telegram_steward(
     writer: Writer = print,
     max_poll_cycles: Optional[int] = None,
     agent_command: Optional[list[str]] = None,
-    request_timeout_sec: float = 0.0,
     startup_timeout_sec: float = 120.0,
     rpc_timeout_sec: float = 5.0,
     rpc_retries: int = 3,
     approval_policy: Optional[ApprovalPolicy] = None,
-    thread_approval_policy: str = "on-request",
-    thread_sandbox: str = "workspace-write",
+    thread_approval_policy: str = DEFAULT_RUNTIME_LAUNCH_DEFAULTS.provider_approval_policy,
+    thread_sandbox: str = DEFAULT_RUNTIME_LAUNCH_DEFAULTS.sandbox,
     transport_error_sleep_sec: float = 2.0,
     sessions_root: str | Path | None = None,
     steward_prompt: str | None = None,
     state_path: str | Path | None = None,
     steward_client_factory: Callable[..., Any] | None = None,
     runtime_client_factory: Callable[..., Any] | None = None,
-    steward_driver_factory: StewardDriverFactory | None = None,
-    runtime_driver_factory: RuntimeDriverFactory | None = None,
+    steward_driver_factory: StewardDeliveryDriverFactory | None = None,
+    runtime_driver_factory: RuntimeDeliveryDriverFactory | None = None,
     telegram_status_config: TelegramStatusConfig | None = None,
     status_monotonic_now: Callable[[], float] | None = None,
     consume_control_events: Callable[[], bool] | None = None,
     idle_sleep_fn: Callable[[float], None] = time.sleep,
     routing_queue_capacity: int = StewardCore._DEFAULT_ROUTING_QUEUE_CAPACITY,
+    allowed_chat_ids_reload_file: str | Path | None = None,
+    provider_cli_paths: Mapping[ProviderKind, str | Path] | None = None,
+    profile_cli_paths: Mapping[ProviderExecutionProfile, str | Path] | None = None,
+    provider_environments: Mapping[ProviderKind, Mapping[str, str]] | None = None,
+    session_catalog_roots: Mapping[
+        ProviderExecutionProfile, str | Path
+    ] | None = None,
+    profile_catalog: RuntimeProfileCatalog | None = None,
 ) -> int:
-    if not allowed_chat_ids:
-        raise ValueError("allowed_chat_ids must be non-empty")
+    if allowed_chat_ids_reload_file is not None:
+        chat_allowlist = ReloadableTelegramChatAllowlist.from_env_file(
+            allowed_chat_ids_reload_file
+        )
+    else:
+        if not allowed_chat_ids:
+            raise ValueError("allowed_chat_ids must be non-empty")
+        chat_allowlist = ReloadableTelegramChatAllowlist(allowed_chat_ids)
+    resolved_profile_catalog = (
+        profile_catalog
+        if profile_catalog is not None
+        else load_runtime_profile_catalog_from_environment()
+    )
     logger = LifecycleLogger(Path(log_path))
+    resolved_command = (
+        list(agent_command) if agent_command is not None else ["codex", "app-server"]
+    )
+    if not resolved_command:
+        raise ValueError("agent_command must not be empty")
+    codex_profile = ProviderExecutionProfile(
+        ProviderKind.CODEX,
+        ProviderProfileId.CODEX_NATIVE,
+    )
+    provider_composition = ProductionProviderComposition(
+        provider_cli_paths=provider_cli_paths,
+        profile_cli_paths=profile_cli_paths,
+        profile_runtime_commands={codex_profile: resolved_command},
+        provider_environments=provider_environments,
+        session_catalog_roots=resolve_production_session_catalog_roots(
+            explicit_roots=session_catalog_roots,
+            state_path=state_path,
+            codex_sessions_root=sessions_root,
+        ),
+        profile_catalog=resolved_profile_catalog,
+        shared_host_settings=ProviderHostRootSettings(
+            logger=logger,
+            startup_timeout_sec=startup_timeout_sec,
+            role="agent",
+            rpc_timeout_sec=rpc_timeout_sec,
+            edge_thread_name="telegram-runtime-jsonrpc-client-thread",
+        ),
+    )
     raw_client = api if api is not None else TelegramApi(
         token=token,
         insecure_skip_verify=insecure_skip_verify,
@@ -194,42 +302,79 @@ def run_telegram_steward(
     )
     client = TelegramApiThreadDriver(raw_client)
     client.start()
-    resolved_command = list(agent_command) if agent_command is not None else ["codex", "app-server"]
-    if not resolved_command:
-        raise ValueError("agent_command must not be empty")
     status_config = telegram_status_config or TelegramStatusConfig()
     resolved_policy = approval_policy or ApprovalPolicy.from_csv("", "", default_decision="human")
+    launch_defaults = RuntimeLaunchDefaults(thread_approval_policy, thread_sandbox)
+    def default_steward_driver_factory(
+        _access_point: AccessPointKey,
+        driver_logger: LifecycleLogger,
+    ):
+        return provider_composition.create_delivery_driver(
+            command=resolved_command,
+            logger=driver_logger,
+            rpc_timeout_sec=rpc_timeout_sec,
+            rpc_retries=rpc_retries,
+            approval_policy=resolved_policy,
+            thread_approval_policy=thread_approval_policy,
+            thread_sandbox=thread_sandbox,
+            resume_session_id=None,
+            client_factory=steward_client_factory,
+            edge_thread_name="telegram-steward-jsonrpc-client-thread",
+            status_source="steward",
+        )
+
+    def default_runtime_driver_factory(
+        _access_point: AccessPointKey,
+        spec: dict[str, Any],
+        driver_logger: LifecycleLogger,
+    ):
+        execution_profile = provider_composition.require_provider(
+            spec.get("provider") or ProviderKind.CODEX,
+            str(spec.get("profile") or "").strip() or None,
+        )
+        return provider_composition.create_delivery_driver(
+            provider=execution_profile,
+            profile=None,
+            command=(
+                resolved_command
+                if execution_profile == codex_profile
+                else None
+            ),
+            runtime_args=spec.get("args"),
+            logger=driver_logger,
+            rpc_timeout_sec=rpc_timeout_sec,
+            rpc_retries=rpc_retries,
+            approval_policy=resolved_policy,
+            thread_approval_policy=str(spec.get("approval_policy") or ""),
+            thread_sandbox=str(spec.get("sandbox") or ""),
+            resume_session_id=(str(spec.get("thread_id") or "").strip() or None),
+            working_dir=str(spec.get("cwd") or ""),
+            initial_model=(str(spec.get("model") or "").strip() or None),
+            initial_backend=(str(spec.get("backend") or "").strip() or None),
+            client_factory=runtime_client_factory,
+            edge_thread_name="telegram-runtime-jsonrpc-client-thread",
+            startup_timeout_sec=startup_timeout_sec,
+        )
+
     runtime = InteractiveStewardRuntime(
         logger=logger,
-        agent_command=resolved_command,
-        request_timeout_sec=request_timeout_sec,
-        rpc_timeout_sec=rpc_timeout_sec,
-        rpc_retries=rpc_retries,
-        approval_policy=resolved_policy,
-        thread_approval_policy=thread_approval_policy,
-        thread_sandbox=thread_sandbox,
         steward_prompt=steward_prompt,
-        client_factory=steward_client_factory,
-        driver_factory=steward_driver_factory,
+        driver_factory=steward_driver_factory or default_steward_driver_factory,
     )
     agent_runtime = InteractiveAgentRuntime(
         logger=logger,
-        agent_command=resolved_command,
-        request_timeout_sec=request_timeout_sec,
-        rpc_timeout_sec=rpc_timeout_sec,
-        rpc_retries=rpc_retries,
-        approval_policy=resolved_policy,
-        default_thread_approval_policy=thread_approval_policy,
-        default_thread_sandbox=thread_sandbox,
-        client_factory=runtime_client_factory,
-        driver_factory=runtime_driver_factory,
+        driver_factory=runtime_driver_factory or default_runtime_driver_factory,
+        provider_validator=provider_composition.require_provider,
         startup_timeout_sec=startup_timeout_sec,
+        profile_catalog=resolved_profile_catalog,
+        launch_defaults=launch_defaults,
     )
     registry = build_steward_registry_context(
         logger=logger,
         agent_runtime=agent_runtime,
         state_path=state_path,
         sort_key=access_point_sort_key,
+        profile_catalog=resolved_profile_catalog,
     )
 
     chat_state = TelegramChatState()
@@ -238,7 +383,7 @@ def run_telegram_steward(
     logger.event(
         "telegram_steward_started",
         poll_timeout_sec=poll_timeout_sec,
-        allowed_chat_ids=sorted(allowed_chat_ids) if allowed_chat_ids is not None else None,
+        allowed_chat_ids=sorted(chat_allowlist.allowed_chat_ids),
         mode="real_steward",
     )
     access_point_adapter = TelegramStewardAccessPointAdapter(
@@ -263,7 +408,9 @@ def run_telegram_steward(
         runtime=runtime,
         agent_runtime=agent_runtime,
         access_point_adapter=access_point_adapter,
-        sessions_root=sessions_root,
+        list_provider_sessions=provider_composition.list_sessions,
+        list_agent_sessions=provider_composition.list_agent_sessions,
+        provider_installation_status=provider_composition.installation_status,
         persisted_state_by_access_point=registry.persisted_state_by_access_point,
         persist_registry=lambda reason, access_point=None: registry.persist(reason=reason, access_point=access_point),
         drop_persisted_state=registry.drop,
@@ -312,6 +459,7 @@ def run_telegram_steward(
             ),
         ),
         routing_queue_capacity=routing_queue_capacity,
+        profile_catalog=resolved_profile_catalog,
     )
 
     def _enqueue_text_update(update: TelegramTextUpdate) -> None:
@@ -423,7 +571,7 @@ def run_telegram_steward(
         logger=logger,
         writer=writer,
         max_poll_cycles=max_poll_cycles,
-        allowed_chat_ids=allowed_chat_ids,
+        chat_allowlist=chat_allowlist,
         offset_ref=offset_ref,
         chat_state=chat_state,
         on_text_update=_enqueue_text_update,
@@ -431,10 +579,12 @@ def run_telegram_steward(
         on_callback_update=_handle_callback_update,
         agent_runtime=agent_runtime,
         runtime=runtime,
+        provider_composition=provider_composition,
+        cancel_catalog_operations=core.cancel_catalog_operations,
+        close_catalog_operations=core.close_catalog_operations,
     )
 
     loop = StewardTickLoop(
-        request_timeout_sec=request_timeout_sec,
         drain_driver_events=core.drain_driver_events,
         tick_interactions=core.tick_interactions,
         flush_due_status_runtimes=_flush_due_status_runtimes,
@@ -443,6 +593,8 @@ def run_telegram_steward(
         is_idle=core.is_idle,
         consume_control_events=consume_control_events,
         sleep_fn=idle_sleep_fn,
+        lifecycle_logger=logger,
+        phase_context=core.tick_diagnostic_context,
     )
 
     loop.drain_until_idle(consume_transport=False)

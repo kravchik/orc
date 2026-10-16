@@ -114,6 +114,10 @@ def sanitize_stderr_text(text: str) -> str:
     return sanitized[:STDERR_LINE_MAX_CHARS]
 
 
+def _cleanup_error(errors: list[Exception]) -> str:
+    return "; ".join(str(error).strip() or type(error).__name__ for error in errors)
+
+
 class _BoundedStderrReporter:
     def __init__(self, callback: StderrCallback | None) -> None:
         self._callback = callback
@@ -218,25 +222,44 @@ class StdioJsonRpcClient:
 
     def stop(self) -> None:
         self._last_stop_escalated_to_kill = False
+        errors: list[Exception] = []
         if self._selector is not None:
-            self._selector.close()
+            try:
+                self._selector.close()
+            except Exception as exc:
+                errors.append(exc)
             self._selector = None
         if self._proc is None:
+            if errors:
+                raise RuntimeError(_cleanup_error(errors))
             return
-        if self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self._last_stop_escalated_to_kill = True
-                self._proc.kill()
-                self._proc.wait(timeout=2.0)
-        self._stderr_reporter.flush()
-        for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+        process = self._proc
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self._last_stop_escalated_to_kill = True
+                    process.kill()
+                    process.wait(timeout=2.0)
+        except Exception as exc:
+            errors.append(exc)
+        try:
+            self._stderr_reporter.flush()
+        except Exception as exc:
+            errors.append(exc)
+        for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None and not stream.closed:
-                stream.close()
-        self._proc = None
-        self._decoder.reset()
+                try:
+                    stream.close()
+                except Exception as exc:
+                    errors.append(exc)
+        if process.poll() is not None:
+            self._proc = None
+            self._decoder.reset()
+        if errors:
+            raise RuntimeError(_cleanup_error(errors))
 
     def send(self, payload: dict) -> None:
         if self._proc is None or self._proc.stdin is None:

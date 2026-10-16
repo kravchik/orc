@@ -15,6 +15,7 @@ AGENT_PROXY_COMMANDS = frozenset(
         "inspect",
         "compact",
         "model",
+        "effort",
         "interrupt",
         "stop",
         "quit",

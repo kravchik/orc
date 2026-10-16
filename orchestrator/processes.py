@@ -5,11 +5,69 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Iterable
 
 
 DEFAULT_LOG_MAX_BYTES = 20 * 1024 * 1024
 DEFAULT_LOG_BACKUP_COUNT = 5
+
+
+@dataclass(frozen=True)
+class CleanupFailure:
+    owner: str
+    error_type: str
+    error: str
+    exception: Exception = field(repr=False, compare=False)
+
+
+class CleanupError(RuntimeError):
+    def __init__(self, failures: Iterable[CleanupFailure]) -> None:
+        self.failures = tuple(failures)
+        if not self.failures:
+            raise ValueError("cleanup error requires at least one failure")
+        details = "; ".join(
+            f"{failure.owner}: {failure.error_type}: {failure.error}"
+            for failure in self.failures
+        )
+        super().__init__(f"resource cleanup failed: {details}")
+
+
+@dataclass(frozen=True)
+class CleanupStep:
+    owner: str
+    cleanup: Callable[[], None]
+    release: Callable[[], None] = lambda: None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.owner, str) or not self.owner.strip():
+            raise ValueError("cleanup owner must be a non-empty string")
+        if not callable(self.cleanup) or not callable(self.release):
+            raise ValueError("cleanup step callbacks must be callable")
+        object.__setattr__(self, "owner", self.owner.strip())
+
+
+def cleanup_owned_resources(steps: Iterable[CleanupStep]) -> None:
+    """Attempt every cleanup and release ownership only after success."""
+
+    failures: list[CleanupFailure] = []
+    for step in steps:
+        try:
+            step.cleanup()
+            step.release()
+        except Exception as exc:
+            failures.append(
+                CleanupFailure(
+                    owner=step.owner,
+                    error_type=type(exc).__name__,
+                    error=str(exc).strip() or type(exc).__name__,
+                    exception=exc,
+                )
+            )
+    if failures:
+        raise CleanupError(failures)
+
 
 class LifecycleLogger:
     def __init__(self, log_path: Path) -> None:

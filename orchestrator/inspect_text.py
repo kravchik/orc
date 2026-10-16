@@ -1,143 +1,168 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+from orchestrator.agent_inspection import (
+    AgentBackgroundSnapshot,
+    AgentContextSnapshot,
+    AgentSessionSnapshot,
+    AgentWorkSnapshot,
+    SnapshotAvailability,
+)
+from orchestrator.agent_identity import (
+    ProviderKind,
+    ProviderProfileId,
+    ProviderSessionRef,
+)
+from orchestrator.runtime_profile_catalog import ProviderSessionProjector
 
 
-def format_thread_metadata_lines(
-    metadata: dict[str, Any] | None,
+def format_session_snapshot_lines(
+    snapshot: AgentSessionSnapshot,
     *,
-    thread_id_fallback: str = "",
+    session_projector: ProviderSessionProjector,
     thread_name_fallback: str = "",
+    thread_id_fallback: str = "",
+    session_provider: str = "",
+    session_profile: str = "",
     model_fallback: str = "",
     include_model: bool = True,
 ) -> list[str]:
-    raw = dict(metadata or {})
     lines: list[str] = []
+    if snapshot.availability is not SnapshotAvailability.AVAILABLE:
+        lines.append(f"session data: {_availability_text(snapshot.availability, snapshot.error)}")
 
-    name = _normalize_text(raw.get("name")) or thread_name_fallback.strip()
+    available = snapshot.availability is SnapshotAvailability.AVAILABLE
+    name = (snapshot.name.strip() if available else "") or thread_name_fallback.strip()
     if name:
         lines.append(f"thread name: {name}")
     else:
-        thread_id = (
-            _normalize_text(raw.get("id"))
-            or _normalize_text(raw.get("thread_id"))
-            or thread_id_fallback.strip()
+        session_ref = snapshot.session_ref if available else None
+        thread_id = session_ref.native_id.strip() if session_ref is not None else thread_id_fallback.strip()
+        provider = (
+            session_ref.provider.value
+            if session_ref is not None
+            else session_provider.strip()
         )
         if thread_id:
-            lines.append(f"thread id: {thread_id}")
+            session_id = thread_id
+            if session_ref is not None:
+                session_id = session_projector.namespaced_id(session_ref)
+            elif provider:
+                provider_kind = ProviderKind.parse(provider)
+                profile = (
+                    ProviderProfileId.parse(session_profile)
+                    if session_profile.strip()
+                    else session_projector.default_profile(provider_kind)
+                )
+                session_id = ProviderSessionRef(
+                    provider=provider_kind,
+                    profile=profile,
+                    native_id=thread_id,
+                )
+                session_id = session_projector.namespaced_id(session_id)
+            label = "provider session id" if provider else "thread id"
+            lines.append(f"{label}: {session_id}")
 
-    status_type, active_flags = _normalize_status(raw.get("status"))
-    if status_type:
-        lines.append(f"thread status: {status_type}")
-    if active_flags:
-        lines.append(f"active flags: {', '.join(active_flags)}")
-
-    loaded = _normalize_loaded(raw.get("loaded"))
-    if loaded:
-        lines.append(f"loaded: {loaded}")
-
-    ephemeral = _normalize_bool_label(raw.get("ephemeral"))
-    if ephemeral:
-        lines.append(f"ephemeral: {ephemeral}")
-
-    provider = _normalize_text(raw.get("modelProvider")) or _normalize_text(raw.get("provider"))
-    if provider:
-        lines.append(f"provider: {provider}")
-
-    created_at = _format_timestamp(raw.get("createdAt"))
-    if created_at:
-        lines.append(f"created at: {created_at}")
-
-    updated_at = _format_timestamp(raw.get("updatedAt"))
-    if updated_at:
-        lines.append(f"updated at: {updated_at}")
-
-    preview = _normalize_text(raw.get("preview"))
-    if preview:
-        lines.append(f"preview: {preview}")
+    if available:
+        if snapshot.status:
+            lines.append(f"thread status: {snapshot.status}")
+        if snapshot.active_flags:
+            lines.append(f"active flags: {', '.join(snapshot.active_flags)}")
+        if snapshot.loaded is not None:
+            lines.append(f"loaded: {'yes' if snapshot.loaded else 'no'}")
+        if snapshot.ephemeral is not None:
+            lines.append(f"ephemeral: {'yes' if snapshot.ephemeral else 'no'}")
+        if snapshot.backend:
+            lines.append(f"model backend: {snapshot.backend}")
+        if snapshot.created_at:
+            lines.append(f"created at: {snapshot.created_at}")
+        if snapshot.updated_at:
+            lines.append(f"updated at: {snapshot.updated_at}")
+        if snapshot.preview:
+            lines.append(f"preview: {snapshot.preview}")
+        if snapshot.auth_owner:
+            lines.append(f"authentication owner: {snapshot.auth_owner}")
+        if snapshot.auth_method_ids:
+            lines.append(
+                "authentication methods: " + ", ".join(snapshot.auth_method_ids)
+            )
 
     if include_model:
-        model = _normalize_text(raw.get("model")) or model_fallback.strip()
+        model = (snapshot.model.strip() if available else "") or model_fallback.strip()
         if model:
             lines.append(f"model: {model}")
-
     return lines
 
 
-def append_active_work_lines(lines: list[str], rows: list[dict[str, str]]) -> None:
-    active_rows = [row for row in rows if str(row.get("status", "")).strip() == "in_progress"]
-    lines.append(f"open items tracked by ORC: {len(active_rows)}")
-    if not active_rows:
+def format_context_snapshot(snapshot: AgentContextSnapshot) -> str:
+    if snapshot.availability is SnapshotAvailability.UNSUPPORTED:
+        return "model window remaining: unsupported"
+    if snapshot.availability is SnapshotAvailability.UNKNOWN:
+        return "model window remaining: unknown"
+    if snapshot.availability is SnapshotAvailability.ERROR:
+        return f"model window remaining: component error: {snapshot.error}"
+    if snapshot.used_tokens is None or snapshot.model_context_window is None:
+        return "model window remaining: unknown"
+    remaining = max(0, snapshot.model_context_window - snapshot.used_tokens)
+    percent = max(0.0, min(100.0, remaining * 100.0 / snapshot.model_context_window))
+    return (
+        f"model window remaining: {remaining}/{snapshot.model_context_window} tokens "
+        f"({percent:.1f}%)"
+    )
+
+
+def append_work_snapshot_lines(lines: list[str], snapshot: AgentWorkSnapshot) -> None:
+    if snapshot.availability is not SnapshotAvailability.AVAILABLE:
+        lines.append(f"work data: {_availability_text(snapshot.availability, snapshot.error)}")
+        return
+    active_items = [item for item in snapshot.items if item.state.strip() == "in_progress"]
+    lines.append(f"open items tracked by ORC: {len(active_items)}")
+    if not active_items:
         lines.append("none")
         return
-    for row in active_rows:
-        item_type = str(row.get("type", "item") or "item").strip() or "item"
-        item_id = str(row.get("id", "") or "").strip()
-        status = str(row.get("status", "") or "").strip()
-        detail = str(row.get("detail", "") or "").strip()
-        lines.append(f"- {item_type} {item_id}".rstrip())
-        if status:
-            lines.append(f"  status: {status}")
-        if detail:
-            for part in [piece.strip() for piece in detail.split(";") if piece.strip()]:
-                normalized = part
-                if part.startswith("cmd="):
-                    normalized = f"command: {part[4:]}"
-                elif part.startswith("status="):
-                    normalized = f"status: {part[7:]}"
-                elif part.startswith("path="):
-                    normalized = f"path: {part[5:]}"
-                elif part.startswith("query="):
-                    normalized = f"query: {part[6:]}"
-                elif part.startswith("action="):
-                    normalized = f"action: {part[7:]}"
-                elif part.startswith("output_chars="):
-                    normalized = f"output chars: {part[13:]}"
+    for item in active_items:
+        item_type = item.kind.strip() or "item"
+        lines.append(f"- {item_type} {item.item_ref.strip()}".rstrip())
+        if item.state.strip():
+            lines.append(f"  status: {item.state.strip()}")
+        for detail in item.details:
+            normalized = _normalize_work_detail(detail.strip())
+            if normalized:
                 lines.append(f"  {normalized}")
 
 
-def _normalize_text(value: object) -> str:
-    if not isinstance(value, str):
-        return ""
-    return value.strip()
+def append_background_snapshot_lines(
+    lines: list[str],
+    snapshot: AgentBackgroundSnapshot,
+) -> None:
+    if snapshot.availability is not SnapshotAvailability.AVAILABLE:
+        lines.append(
+            f"background work: {_availability_text(snapshot.availability, snapshot.error)}"
+        )
+        return
+    lines.append(f"background work: {len(snapshot.items)}")
+    for item in snapshot.items:
+        line = f"- {item.task_ref}: {item.state}"
+        if item.summary:
+            line += f" ({item.summary})"
+        lines.append(line)
 
 
-def _normalize_status(value: object) -> tuple[str, list[str]]:
-    if isinstance(value, str):
-        normalized = value.strip()
-        return (normalized, []) if normalized else ("", [])
-    if not isinstance(value, dict):
-        return ("", [])
-    status_type = _normalize_text(value.get("type"))
-    raw_flags = value.get("activeFlags")
-    active_flags: list[str] = []
-    if isinstance(raw_flags, list):
-        for item in raw_flags:
-            if isinstance(item, str) and item.strip():
-                active_flags.append(item.strip())
-    return status_type, active_flags
+def _availability_text(state: SnapshotAvailability, error: str) -> str:
+    if state is SnapshotAvailability.ERROR:
+        return f"component error: {error}"
+    return state.value
 
 
-def _normalize_loaded(value: object) -> str:
-    if isinstance(value, bool):
-        return "yes" if value else "no"
-    return ""
-
-
-def _normalize_bool_label(value: object) -> str:
-    if isinstance(value, bool):
-        return "yes" if value else "no"
-    return ""
-
-
-def _format_timestamp(value: object) -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, (int, float)):
-        try:
-            dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return ""
-        return dt.isoformat().replace("+00:00", "Z")
-    return ""
+def _normalize_work_detail(detail: str) -> str:
+    prefixes = (
+        ("cmd=", "command: "),
+        ("status=", "status: "),
+        ("path=", "path: "),
+        ("query=", "query: "),
+        ("action=", "action: "),
+        ("output_chars=", "output chars: "),
+    )
+    for prefix, replacement in prefixes:
+        if detail.startswith(prefix):
+            return f"{replacement}{detail[len(prefix):]}"
+    return detail

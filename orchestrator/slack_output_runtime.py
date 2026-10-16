@@ -8,7 +8,10 @@ from typing import Callable
 
 from orchestrator import clock
 from orchestrator.protocol_status import format_item_status_lines
-from orchestrator.status_output_runtime import MAX_IN_PROGRESS_STATUS_WINDOWS
+from orchestrator.status_output_runtime import (
+    MAX_IN_PROGRESS_STATUS_WINDOWS,
+    status_ref_log_fields,
+)
 from orchestrator.telegram_status import TelegramStatusConfig
 
 
@@ -878,6 +881,7 @@ class SlackOutputRuntime:
             in_progress_windows=len(self._in_progress_status_keys),
             retention_limit=retention_limit,
             reason=reason,
+            **status_ref_log_fields(status_key),
         )
 
     def _status_has_pending_delivery(self, status_key: str) -> bool:
@@ -967,8 +971,6 @@ def _structured_root_summary(*, meta_lines: list[str], snapshot: list[dict[str, 
         return f"{_humanize_item_type(str(completed[-1].get('type') or 'work'))} completed"
     if meta_lines:
         last = str(meta_lines[-1] or "").strip()
-        if last == "turn/started":
-            return "Working"
         return _render_status_line_text(last)
     return "Working"
 

@@ -8,7 +8,10 @@ from typing import Callable
 
 from orchestrator import clock
 from orchestrator.access_point_common import access_point_retry_after_seconds
-from orchestrator.status_output_runtime import MAX_IN_PROGRESS_STATUS_WINDOWS
+from orchestrator.status_output_runtime import (
+    MAX_IN_PROGRESS_STATUS_WINDOWS,
+    status_ref_log_fields,
+)
 from orchestrator.steward_restore_notice_rendering import render_session_references_html
 from orchestrator.telegram_status import TelegramStatusConfig, TelegramStatusWindow
 
@@ -445,6 +448,7 @@ class TelegramOutputRuntime:
             in_progress_windows=len(self._in_progress_status_keys),
             retention_limit=retention_limit,
             reason=reason,
+            **status_ref_log_fields(status_key),
             **self._target_fields(),
         )
 

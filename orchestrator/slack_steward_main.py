@@ -8,6 +8,12 @@ import shlex
 from pathlib import Path
 from typing import Sequence
 
+from orchestrator.runtime_profile_catalog import (
+    DEFAULT_RUNTIME_LAUNCH_DEFAULTS,
+    load_runtime_profile_catalog_from_environment,
+    materialize_runtime_profile_prompt,
+)
+
 from orchestrator.approval import ApprovalPolicy
 from orchestrator.env_utils import load_env_file
 from orchestrator.processes import LifecycleLogger
@@ -37,7 +43,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="",
         help="override Codex sessions root (default: ~/.codex/sessions)",
     )
-    parser.add_argument("--request-timeout-sec", type=float, default=0.0)
     parser.add_argument("--startup-timeout-sec", type=float, default=120.0)
     parser.add_argument("--rpc-timeout-sec", type=float, default=5.0)
     parser.add_argument("--rpc-retries", type=int, default=3)
@@ -56,8 +61,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("accept", "decline", "human"),
         default="human",
     )
-    parser.add_argument("--thread-approval-policy", default="on-request")
-    parser.add_argument("--thread-sandbox", default="workspace-write")
+    parser.add_argument(
+        "--thread-approval-policy",
+        default=DEFAULT_RUNTIME_LAUNCH_DEFAULTS.provider_approval_policy,
+    )
+    parser.add_argument(
+        "--thread-sandbox",
+        default=DEFAULT_RUNTIME_LAUNCH_DEFAULTS.sandbox,
+    )
     parser.add_argument("--slack-app-token", default="")
     return parser.parse_args(argv)
 
@@ -81,7 +92,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     prompt_file = Path(args.steward_prompt_file).expanduser()
     if not prompt_file.exists():
         raise ValueError(f"--steward-prompt-file does not exist: {prompt_file}")
-    steward_prompt = prompt_file.read_text(encoding="utf-8")
+    profile_catalog = load_runtime_profile_catalog_from_environment()
+    steward_prompt = materialize_runtime_profile_prompt(
+        prompt_file.read_text(encoding="utf-8"),
+        profile_catalog,
+    )
     if not steward_prompt.strip():
         raise ValueError(f"--steward-prompt-file is empty: {prompt_file}")
     app_token = resolve_required_slack_setting(
@@ -103,7 +118,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         slack_api_base_url=(args.slack_api_base_url.strip() or None),
         steward_command=steward_command,
         agent_command=agent_command,
-        request_timeout_sec=float(args.request_timeout_sec),
         startup_timeout_sec=float(args.startup_timeout_sec),
         rpc_timeout_sec=float(args.rpc_timeout_sec),
         rpc_retries=int(args.rpc_retries),
@@ -119,6 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         state_path=(args.state_path.strip() or None),
         sessions_root=(args.sessions_root.strip() or None),
         interactivity_source=interactivity_source,
+        profile_catalog=profile_catalog,
     )
 
 

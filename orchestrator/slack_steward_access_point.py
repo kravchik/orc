@@ -30,7 +30,7 @@ from orchestrator.approval_details_formatter import (
     build_approval_details_lines,
     build_approval_prompt_detail_lines,
 )
-from orchestrator.approval import ApprovalRequest, supports_session_approval
+from orchestrator.agent_session import AgentApprovalRequest
 from orchestrator.processes import LifecycleLogger
 from orchestrator.runtime_snapshot import AccessPointRuntimeSnapshot, format_status_text
 from orchestrator.slack_api_thread_driver import SlackApiThreadDriver
@@ -62,7 +62,7 @@ class SlackStewardOutboundMessage:
 class PendingSlackStewardApproval:
     access_point: AccessPointKey
     source: str
-    request: ApprovalRequest
+    request: AgentApprovalRequest
     prompt_state: AccessPointDeliveryState
     prompt_queue_token: int | None
     prompt_ts: str | None
@@ -101,7 +101,7 @@ def _build_approval_blocks(*, allow_always: bool) -> list[dict]:
     return [{"type": "actions", "elements": buttons}]
 
 
-def _format_approval_prompt(*, request: ApprovalRequest, allow_always: bool) -> str:
+def _format_approval_prompt(*, request: AgentApprovalRequest, allow_always: bool) -> str:
     lines = [f"{approval_source_icon(request)} approval needed"]
     lines.extend(build_approval_prompt_detail_lines(request))
     options = "accept/decline/details"
@@ -111,7 +111,7 @@ def _format_approval_prompt(*, request: ApprovalRequest, allow_always: bool) -> 
     return "\n".join(lines)
 
 
-def _format_approval_details(request: ApprovalRequest) -> str:
+def _format_approval_details(request: AgentApprovalRequest) -> str:
     return "\n".join(
         build_approval_details_lines(
             request,
@@ -206,10 +206,7 @@ class SlackStewardAccessPointAdapter:
             return StewardApprovalDetailsRequest(access_point=inbound.access_point)
         if raw in ("accept", "decline") or (
             raw == "always_allow"
-            and supports_session_approval(
-                method=pending.request.method,
-                params=pending.request.params,
-            )
+            and pending.request.supports_decision("always_allow")
         ):
             self._log_access_point_event(
                 "slack_steward_approval_text_recognized",
@@ -218,6 +215,15 @@ class SlackStewardAccessPointAdapter:
                 via="text",
             )
             return StewardApprovalDecision(access_point=inbound.access_point, decision=raw, via="text")
+        if raw == "always_allow":
+            self._log_access_point_event(
+                "steward_approval_preflight_rejected",
+                access_point=inbound.access_point,
+                approval_ref=pending.request.approval_ref.value,
+                decision=raw,
+                reason="unsupported_decision",
+                via="text",
+            )
         return None
 
     def approval_action_from_interactive(
@@ -250,10 +256,7 @@ class SlackStewardAccessPointAdapter:
             return StewardApprovalDetailsRequest(access_point=pending.access_point)
         if raw in ("accept", "decline") or (
             raw == "always_allow"
-            and supports_session_approval(
-                method=pending.request.method,
-                params=pending.request.params,
-            )
+            and pending.request.supports_decision("always_allow")
         ):
             self._log_access_point_event(
                 "slack_steward_approval_action_recognized",
@@ -263,6 +266,16 @@ class SlackStewardAccessPointAdapter:
                 action_id=action.action_id,
             )
             return StewardApprovalDecision(access_point=pending.access_point, decision=raw, via="button")
+        if raw == "always_allow":
+            self._log_access_point_event(
+                "steward_approval_preflight_rejected",
+                access_point=pending.access_point,
+                approval_ref=pending.request.approval_ref.value,
+                decision=raw,
+                reason="unsupported_decision",
+                via="button",
+                action_id=action.action_id,
+            )
         return None
 
     def preprocess_inbound(
@@ -299,12 +312,9 @@ class SlackStewardAccessPointAdapter:
         *,
         access_point: AccessPointKey,
         source: str,
-        request: ApprovalRequest,
+        request: AgentApprovalRequest,
     ) -> PendingSlackStewardApproval:
-        allow_always = supports_session_approval(
-            method=request.method,
-            params=request.params,
-        )
+        allow_always = request.supports_decision("always_allow")
         pending = PendingSlackStewardApproval(
             access_point=access_point,
             source=source,
@@ -333,14 +343,14 @@ class SlackStewardAccessPointAdapter:
             on_success=lambda sent, p=pending, req=request, ap=access_point, src=source: self._on_approval_prompt_sent(
                 pending=p,
                 sent=sent,
-                req_id=req.req_id,
+                approval_ref=req.approval_ref.value,
                 access_point=ap,
                 source=src,
             ),
             on_failure=lambda exc, p=pending, req=request, ap=access_point, src=source: self._on_approval_prompt_failed(
                 pending=p,
                 exc=exc,
-                req_id=req.req_id,
+                approval_ref=req.approval_ref.value,
                 access_point=ap,
                 source=src,
             ),
@@ -370,10 +380,7 @@ class SlackStewardAccessPointAdapter:
         )
 
     def send_invalid_approval_reply(self, pending_approval: PendingSlackStewardApproval) -> None:
-        allow_always = supports_session_approval(
-            method=pending_approval.request.method,
-            params=pending_approval.request.params,
-        )
+        allow_always = pending_approval.request.supports_decision("always_allow")
         text = (
             "reply with accept, decline, details, or always_allow"
             if allow_always
@@ -401,10 +408,7 @@ class SlackStewardAccessPointAdapter:
     def clear_approval_blocks(self, pending_approval: PendingSlackStewardApproval) -> None:
         if pending_approval.prompt_ts is None:
             return
-        allow_always = supports_session_approval(
-            method=pending_approval.request.method,
-            params=pending_approval.request.params,
-        )
+        allow_always = pending_approval.request.supports_decision("always_allow")
         prompt_text = _format_approval_prompt(request=pending_approval.request, allow_always=allow_always)
         self._enqueue_outbound(
             priority=ACCESS_POINT_OUTBOUND_CLASS_APPROVAL_CLEANUP,
@@ -477,7 +481,11 @@ class SlackStewardAccessPointAdapter:
             status_config=self._status_config,
             status_eager_flush_when_due=False,
         )
-        status_store = TurnStatusStore(output_runtime=output_runtime)
+        status_store = TurnStatusStore(
+            output_runtime=output_runtime,
+            access_point=(access_point.chat_id, access_point.thread_id),
+            semantic_source=source,
+        )
         pair = (output_runtime, status_store)
         mapping[access_point] = pair
         return pair
@@ -690,6 +698,25 @@ class SlackStewardAccessPointAdapter:
             on_success=(lambda _result: on_sent()) if callable(on_sent) else None,
             on_failure=on_failed if callable(on_failed) else None,
             ordering_key=access_point,
+        )
+
+    def queue_turn_failure(
+        self,
+        *,
+        access_point: AccessPointKey,
+        error: str,
+        source: str,
+        kind: Any = None,
+        on_sent: Any = None,
+        on_failed: Any = None,
+    ) -> None:
+        self.queue_text_reply(
+            access_point=access_point,
+            text=f"agent error: {error}",
+            source=source,
+            kind=kind,
+            on_sent=on_sent,
+            on_failed=on_failed,
         )
 
     def queue_routing_copy(
@@ -926,7 +953,7 @@ class SlackStewardAccessPointAdapter:
                 channel_id=str(pending_approval.access_point.chat_id),
                 thread_ts=self._thread_ts(pending_approval.access_point),
                 route_target=pending_approval.source,
-                req_id=pending_approval.request.req_id,
+                approval_ref=pending_approval.request.approval_ref.value,
             )
             return
 
@@ -935,7 +962,7 @@ class SlackStewardAccessPointAdapter:
         *,
         pending: PendingSlackStewardApproval,
         sent: object | None,
-        req_id: object,
+        approval_ref: object,
         access_point: AccessPointKey,
         source: str,
     ) -> None:
@@ -951,7 +978,7 @@ class SlackStewardAccessPointAdapter:
             channel_id=str(access_point.chat_id),
             thread_ts=self._thread_ts(access_point),
             route_target=source,
-            req_id=req_id,
+            approval_ref=approval_ref,
         )
 
     def _on_approval_prompt_failed(
@@ -959,7 +986,7 @@ class SlackStewardAccessPointAdapter:
         *,
         pending: PendingSlackStewardApproval,
         exc: Exception,
-        req_id: object,
+        approval_ref: object,
         access_point: AccessPointKey,
         source: str,
     ) -> None:
@@ -970,7 +997,7 @@ class SlackStewardAccessPointAdapter:
             channel_id=str(access_point.chat_id),
             thread_ts=self._thread_ts(access_point),
             route_target=source,
-            req_id=req_id,
+            approval_ref=approval_ref,
             error=str(exc),
             error_type=type(exc).__name__,
         )

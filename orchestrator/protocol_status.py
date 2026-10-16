@@ -8,6 +8,8 @@ from typing import Any
 from orchestrator.context_window import format_context_usage_status
 from orchestrator.status_output_runtime import MAX_IN_PROGRESS_STATUS_WINDOWS
 
+MAX_PROTOCOL_DIAGNOSTIC_METHOD_CHARS = 256
+
 IGNORED_STATUS_METHODS = {
     # These are verbose codex/event deltas mirrored by item/* events.
     "codex/event/agent_message_content_delta",
@@ -386,7 +388,14 @@ def format_protocol_status(method: str, params: dict | None = None) -> str:
     usage = format_context_usage_status(method=method, params=params)
     if usage is not None:
         return usage
-    return method
+    return _bounded_protocol_diagnostic(method)
+
+
+def _bounded_protocol_diagnostic(method: str) -> str:
+    text = str(method or "").strip()
+    if len(text) <= MAX_PROTOCOL_DIAGNOSTIC_METHOD_CHARS:
+        return text
+    return text[: MAX_PROTOCOL_DIAGNOSTIC_METHOD_CHARS - 3] + "..."
 
 
 def normalize_status_source(source: str) -> str:

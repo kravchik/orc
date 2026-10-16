@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import re
 from pathlib import Path
 from typing import Any, Callable
 
-from orchestrator.codex_sessions import list_codex_cli_sessions
+from orchestrator.agent_identity import ProviderKind, ProviderSessionRef
+from orchestrator.agent_catalog import AgentCatalogListing, agent_catalog_failure_payloads
+from orchestrator.agent_provider import ProviderSessionCatalogEntry
+from orchestrator.runtime_profile_catalog import (
+    BUILTIN_RUNTIME_PROFILE_CATALOG,
+    RuntimeProfileCatalog,
+)
 
 
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ListResumableActionRequest:
+    cwd: str
+    limit: int
 
 
 def parse_steward_response(message: str) -> tuple[str, list[dict[str, Any]]]:
@@ -30,7 +43,6 @@ def parse_steward_response(message: str) -> tuple[str, list[dict[str, Any]]]:
 def execute_steward_actions(
     actions: list[dict[str, Any]],
     *,
-    sessions_root: str | Path | None = None,
     show_running_provider: Callable[[], dict[str, Any]] | None = None,
     show_running_access_point: dict[str, Any] | None = None,
     stop_agent_provider: Callable[[str], dict[str, Any]] | None = None,
@@ -46,6 +58,8 @@ def execute_steward_actions(
     grunt_remove_provider: Callable[[], dict[str, Any]] | None = None,
     approval_target_assign_provider: Callable[[str], dict[str, Any]] | None = None,
     approval_target_show_provider: Callable[[], dict[str, Any]] | None = None,
+    set_project_cwd_provider: Callable[[str], dict[str, Any]] | None = None,
+    profile_catalog: RuntimeProfileCatalog = BUILTIN_RUNTIME_PROFILE_CATALOG,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for raw in actions:
@@ -66,6 +80,7 @@ def execute_steward_actions(
                     action,
                     provider=start_agent_provider,
                     access_point=start_agent_access_point,
+                    profile_catalog=profile_catalog,
                 )
             )
             continue
@@ -88,7 +103,17 @@ def execute_steward_actions(
             )
             continue
         if action_type == "LIST_RESUMABLE":
-            results.append(_run_list_resumable(action, sessions_root=sessions_root))
+            raise RuntimeError(
+                "LIST_RESUMABLE requires the asynchronous Steward action interaction"
+            )
+        if action_type == "SET_PROJECT_CWD":
+            results.append(
+                _run_set_project_cwd(
+                    action,
+                    provider=set_project_cwd_provider,
+                    access_point=start_agent_access_point,
+                )
+            )
             continue
         if action_type == "SHAMAN_ASSIGN":
             results.append(
@@ -192,6 +217,84 @@ def execute_steward_actions(
             }
         )
     return results
+
+
+def _run_set_project_cwd(
+    action: dict[str, Any],
+    *,
+    provider: Callable[[str], dict[str, Any]] | None,
+    access_point: dict[str, Any] | None,
+) -> dict[str, Any]:
+    action_type = "SET_PROJECT_CWD"
+    extra_fields = sorted(str(key) for key in action if str(key) not in {"type", "cwd"})
+    if extra_fields:
+        return {
+            "type": action_type,
+            "ok": False,
+            "code": "invalid_fields",
+            "error": f"SET_PROJECT_CWD has unknown fields: {', '.join(extra_fields)}",
+        }
+    if provider is None:
+        return {
+            "type": action_type,
+            "ok": False,
+            "code": "unavailable",
+            "error": "SET_PROJECT_CWD is not available in this runtime",
+        }
+    cwd_raw = action.get("cwd")
+    if not isinstance(cwd_raw, str) or not cwd_raw.strip():
+        return {
+            "type": action_type,
+            "ok": False,
+            "code": "invalid_cwd",
+            "error": "cwd is required",
+        }
+    cwd_path = Path(cwd_raw.strip()).expanduser()
+    try:
+        resolved_cwd = cwd_path.resolve(strict=True)
+    except FileNotFoundError:
+        return {
+            "type": action_type,
+            "ok": False,
+            "code": "missing_cwd",
+            "error": "cwd does not exist",
+        }
+    except OSError:
+        return {
+            "type": action_type,
+            "ok": False,
+            "code": "invalid_cwd",
+            "error": "cwd path is invalid",
+        }
+    if not resolved_cwd.is_dir():
+        return {
+            "type": action_type,
+            "ok": False,
+            "code": "not_directory",
+            "error": "cwd must be a directory",
+        }
+    try:
+        provider_result = provider(str(resolved_cwd))
+    except Exception as exc:
+        return {
+            "type": action_type,
+            "ok": False,
+            "code": "rejected",
+            "cwd": str(resolved_cwd),
+            "error": str(exc).strip() or type(exc).__name__,
+        }
+    if not isinstance(provider_result, dict):
+        raise RuntimeError("SET_PROJECT_CWD provider returned an invalid result")
+    result = {
+        "type": action_type,
+        "cwd": str(resolved_cwd),
+        **provider_result,
+    }
+    result["type"] = action_type
+    result["cwd"] = str(resolved_cwd)
+    if isinstance(access_point, dict):
+        result["access_point"] = dict(access_point)
+    return result
 
 
 def execute_approval_target_action(
@@ -307,11 +410,9 @@ def _parse_actions_payload(raw: str) -> dict[str, Any] | None:
     return payload
 
 
-def _run_list_resumable(
+def prepare_list_resumable_action(
     action: dict[str, Any],
-    *,
-    sessions_root: str | Path | None = None,
-) -> dict[str, Any]:
+) -> ListResumableActionRequest | dict[str, Any]:
     cwd_raw = action.get("cwd")
     if not isinstance(cwd_raw, str) or not cwd_raw.strip():
         return {"type": "LIST_RESUMABLE", "ok": False, "error": "cwd is required"}
@@ -336,29 +437,45 @@ def _run_list_resumable(
             return {"type": "LIST_RESUMABLE", "ok": False, "error": "limit must be integer"}
     if limit < 0:
         return {"type": "LIST_RESUMABLE", "ok": False, "error": "limit must be >= 0"}
-    sessions = list_codex_cli_sessions(
-        project_cwd=str(resolved_cwd),
-        sessions_root=sessions_root,
-        limit=limit,
-    )
+    return ListResumableActionRequest(str(resolved_cwd), limit)
+
+
+def build_list_resumable_action_result(
+    request: ListResumableActionRequest,
+    listing: AgentCatalogListing,
+    *,
+    project_session_ref: Callable[[ProviderSessionRef], str],
+) -> dict[str, Any]:
+    if not isinstance(request, ListResumableActionRequest):
+        raise TypeError("LIST_RESUMABLE result requires a prepared request")
+    if not isinstance(listing, AgentCatalogListing):
+        raise RuntimeError("provider session catalog returned an invalid aggregate")
     items = [
-        _build_resumable_item(item)
-        for item in sessions
+        _build_resumable_item(item, project_session_ref=project_session_ref)
+        for item in listing.entries
     ]
     return {
         "type": "LIST_RESUMABLE",
         "ok": True,
-        "cwd": str(resolved_cwd),
+        "code": "listed_partial" if listing.failures else "listed",
+        "cwd": request.cwd,
         "count": len(items),
         "items": items,
+        "catalog_failures": agent_catalog_failure_payloads(listing.failures),
     }
 
 
-def _build_resumable_item(item) -> dict[str, Any]:
+def _build_resumable_item(
+    item: ProviderSessionCatalogEntry,
+    *,
+    project_session_ref: Callable[[ProviderSessionRef], str],
+) -> dict[str, Any]:
     return {
-        "thread_name": item.thread_name or "",
-        "timestamp": item.last_activity_iso,
-        "id": item.session_id,
+        "thread_name": item.name,
+        "timestamp": item.updated_at,
+        "id": project_session_ref(item.session_ref),
+        "provider": item.session_ref.provider.value,
+        "profile": item.session_ref.profile.value,
     }
 
 
@@ -549,9 +666,49 @@ def _run_start_agent(
     *,
     provider: Callable[[dict[str, Any]], dict[str, Any]] | None,
     access_point: dict[str, Any] | None,
+    profile_catalog: RuntimeProfileCatalog,
 ) -> dict[str, Any]:
+    provider_raw = action.get("provider")
+    if provider_raw is None:
+        provider_name = "codex"
+    elif isinstance(provider_raw, str) and provider_raw.strip():
+        provider_name = provider_raw.strip().lower()
+    else:
+        provider_name = ""
+    profile_raw = action.get("profile")
+    profile_name = (
+        profile_raw.strip().lower()
+        if isinstance(profile_raw, str) and profile_raw.strip()
+        else ""
+    )
+    provider_kind: ProviderKind | None = None
+    profile_error = ""
+    if provider_name:
+        try:
+            execution_profile = profile_catalog.resolve(
+                provider_name,
+                profile_name or None,
+            )
+            provider_kind = execution_profile.provider
+            profile_name = execution_profile.profile.value
+        except ValueError as exc:
+            profile_error = str(exc)
+
+    def rejected(error: str) -> dict[str, Any]:
+        result = {
+            "type": "START_AGENT",
+            "ok": False,
+            "provider": provider_name,
+            "error": error,
+        }
+        if profile_name:
+            result["profile"] = profile_name
+        return result
+
     allowed_fields = {
         "type",
+        "provider",
+        "profile",
         "cwd",
         "model",
         "mode",
@@ -561,29 +718,31 @@ def _run_start_agent(
     }
     extra_fields = sorted(str(key) for key in action.keys() if str(key) not in allowed_fields)
     if extra_fields:
-        return {
-            "type": "START_AGENT",
-            "ok": False,
-            "error": f"START_AGENT has unknown fields: {', '.join(extra_fields)}",
-        }
+        return rejected(f"START_AGENT has unknown fields: {', '.join(extra_fields)}")
     if provider is None:
-        return {
-            "type": "START_AGENT",
-            "ok": False,
-            "error": "START_AGENT is not available in this runtime",
-        }
+        return rejected("START_AGENT is not available in this runtime")
     cwd_raw = action.get("cwd")
     if not isinstance(cwd_raw, str) or not cwd_raw.strip():
-        return {"type": "START_AGENT", "ok": False, "error": "cwd is required"}
+        return rejected("cwd is required")
     cwd_path = Path(cwd_raw.strip()).expanduser()
     try:
         resolved_cwd = cwd_path.resolve()
     except OSError:
-        return {"type": "START_AGENT", "ok": False, "error": "cwd path is invalid"}
+        return rejected("cwd path is invalid")
     if not resolved_cwd.exists():
-        return {"type": "START_AGENT", "ok": False, "error": "cwd does not exist"}
+        return rejected("cwd does not exist")
     if not resolved_cwd.is_dir():
-        return {"type": "START_AGENT", "ok": False, "error": "cwd must be a directory"}
+        return rejected("cwd must be a directory")
+
+    if not provider_name:
+        return rejected("provider must be a non-empty string")
+    try:
+        if provider_kind is None:
+            raise ValueError(profile_error or f"unknown agent provider: {provider_name}")
+        if profile_error:
+            raise ValueError(profile_error)
+    except ValueError as exc:
+        return rejected(str(exc))
 
     model_raw = action.get("model")
     if model_raw is None:
@@ -591,7 +750,7 @@ def _run_start_agent(
     elif isinstance(model_raw, str) and model_raw.strip():
         model = model_raw.strip()
     else:
-        return {"type": "START_AGENT", "ok": False, "error": "model must be a non-empty string"}
+        return rejected("model must be a non-empty string")
 
     mode_raw = action.get("mode")
     if mode_raw is None:
@@ -599,37 +758,35 @@ def _run_start_agent(
     elif isinstance(mode_raw, str) and mode_raw.strip():
         mode = mode_raw.strip().lower()
     else:
-        return {"type": "START_AGENT", "ok": False, "error": "mode must be a non-empty string"}
+        return rejected("mode must be a non-empty string")
     if mode not in {"proxy", "orchestrator"}:
-        return {"type": "START_AGENT", "ok": False, "error": "mode must be one of: proxy, orchestrator"}
+        return rejected("mode must be one of: proxy, orchestrator")
     if mode != "proxy":
-        return {
-            "type": "START_AGENT",
-            "ok": False,
-            "error": f"mode is not supported yet: {mode}; only proxy is supported",
-        }
+        return rejected(f"mode is not supported yet: {mode}; only proxy is supported")
 
     approval_policy = action.get("approval_policy")
     if approval_policy is not None and (not isinstance(approval_policy, str) or not approval_policy.strip()):
-        return {"type": "START_AGENT", "ok": False, "error": "approval_policy must be a non-empty string"}
+        return rejected("approval_policy must be a non-empty string")
     sandbox = action.get("sandbox")
     if sandbox is not None and (not isinstance(sandbox, str) or not sandbox.strip()):
-        return {"type": "START_AGENT", "ok": False, "error": "sandbox must be a non-empty string"}
+        return rejected("sandbox must be a non-empty string")
     args_raw = action.get("args")
     args: list[str] = []
     if args_raw is not None:
         if not isinstance(args_raw, list):
-            return {"type": "START_AGENT", "ok": False, "error": "args must be a list of strings"}
+            return rejected("args must be a list of strings")
         for idx, raw in enumerate(args_raw):
             if not isinstance(raw, str) or not raw.strip():
-                return {
-                    "type": "START_AGENT",
-                    "ok": False,
-                    "error": f"args[{idx}] must be a non-empty string",
-                }
+                return rejected(f"args[{idx}] must be a non-empty string")
             args.append(raw)
 
-    spec: dict[str, Any] = {"cwd": str(resolved_cwd), "mode": mode, "args": args}
+    spec: dict[str, Any] = {
+        "provider": provider_name,
+        "profile": profile_name,
+        "cwd": str(resolved_cwd),
+        "mode": mode,
+        "args": args,
+    }
     if isinstance(model, str) and model.strip():
         spec["model"] = model
     if isinstance(approval_policy, str) and approval_policy.strip():
@@ -639,16 +796,20 @@ def _run_start_agent(
     try:
         provider_result = provider(spec)
     except Exception as exc:
-        return {"type": "START_AGENT", "ok": False, "error": str(exc)}
+        return rejected(str(exc))
 
     result: dict[str, Any] = {
         "type": "START_AGENT",
         "ok": True,
+        "provider": spec["provider"],
+        "profile": spec["profile"],
         "cwd": spec["cwd"],
         "mode": spec["mode"],
     }
     if isinstance(provider_result, dict):
         result.update(provider_result)
+    result["provider"] = provider_name
+    result["profile"] = profile_name
     if not str(result.get("model") or "").strip():
         result.pop("model", None)
     if isinstance(access_point, dict):
@@ -773,6 +934,8 @@ def _run_resume_agent(
     }
     if isinstance(provider_result, dict):
         result.update(provider_result)
+    if not str(result.get("thread_id") or "").strip():
+        result["thread_id"] = spec["thread_id"]
     if not str(result.get("model") or "").strip():
         result.pop("model", None)
     if isinstance(access_point, dict):

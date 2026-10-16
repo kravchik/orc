@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from orchestrator.access_point_common import AccessPointKey, AccessPointMessageRef
+from orchestrator.agent_catalog import AgentCatalogFailure
 from orchestrator.interactive_driver_events import InteractiveStartupResult
 from orchestrator.local_command_journal import LocalCommandOutcome
 from orchestrator.interaction_queue import InteractionTickContext
@@ -27,12 +28,18 @@ class LocalLifecycleOperation:
     operation: str
     thread_name: str = ""
     runtime_thread_id: str = ""
+    projected_session_id: str = ""
     agent_id: str = ""
+    provider: str = ""
+    profile: str = ""
+    adapter: str = ""
+    adapter_version: str = ""
     cwd: str = ""
     local_command: str = ""
     notify_steward: bool = False
     resume_existing: bool = False
     show_session_identity: bool = False
+    catalog_failures: tuple[AgentCatalogFailure, ...] = ()
     ack_message_ref: AccessPointMessageRef | None = None
     final_text: str | None = None
     outcome: LocalCommandOutcome | None = None
@@ -102,8 +109,12 @@ class LocalLifecycleOperation:
         if self.finished:
             return
         self.thread_name = result.thread_name or self.thread_name
-        self.runtime_thread_id = result.thread_id or self.runtime_thread_id
+        self.runtime_thread_id = self.runtime_thread_id or result.thread_id
         self.agent_id = result.agent_id or self.agent_id
+        self.provider = result.provider or self.provider
+        self.profile = result.profile or self.profile
+        self.adapter = result.adapter or self.adapter
+        self.adapter_version = result.adapter_version or self.adapter_version
         self.cwd = result.cwd or self.cwd
         self.startup_result = result if self.operation in {"START_AGENT", "RESUME_AGENT"} else None
         self.startup_persisted = persisted

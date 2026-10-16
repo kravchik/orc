@@ -2,6 +2,9 @@
 
 This guide covers the practical setup for `slack-steward`.
 
+Install and authenticate agent runtimes separately; see
+[Agent Provider Setup](SETUP.providers.md).
+
 ## Bot Setup
 
 1. Create the Slack app.
@@ -104,13 +107,13 @@ Shared:
   - path to the persistent bot state file
   - default: `state/slack-steward-access-points.json`
 - `--sessions-root`
-  - override the directory where Codex sessions are stored
+  - override the directory where `codex-native` sessions are stored
   - default: `~/.codex/sessions`
 - `--steward-command`
-  - command used to launch the steward agent
+  - command used to launch the Codex-based Steward
   - default: `codex app-server`
 - `--agent-command`
-  - command used to launch worker agents
+  - command override for `codex/codex-native` agent sessions
   - default: `codex app-server`
 - `--steward-prompt-file`
   - startup prompt file
@@ -128,10 +131,10 @@ Shared:
   - one of `accept`, `decline`, `human`
   - default: `human`
 - `--thread-approval-policy`
-  - approval policy used for Codex worker threads
+  - default launch approval policy for profiles that support this setting
   - default: `on-request`
 - `--thread-sandbox`
-  - sandbox mode used for Codex worker threads
+  - default launch sandbox for profiles that support this setting
   - default: `workspace-write`
 
 Slack-specific:
@@ -146,14 +149,11 @@ Slack-specific:
 - `--slack-api-base-url`
   - Slack Web API base URL override
   - default: use the standard Slack Web API
-- `--request-timeout-sec`
-  - steward request timeout
-  - default: `0`
 - `--rpc-timeout-sec`
-  - timeout for requests to the local Codex process
+  - timeout for local runtime control requests
   - default: `5`
 - `--rpc-retries`
-  - retry count for requests to the local Codex process
+  - retry count for local runtime control requests
   - default: `3`
 
 ## Security

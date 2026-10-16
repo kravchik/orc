@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import shlex
 from pathlib import Path
 from typing import Sequence
 
+from orchestrator.runtime_profile_catalog import (
+    DEFAULT_RUNTIME_LAUNCH_DEFAULTS,
+    load_runtime_profile_catalog_from_environment,
+    materialize_runtime_profile_prompt,
+)
+
 from orchestrator.approval import ApprovalPolicy
 from orchestrator.env_utils import load_env_file, resolve_env
+from orchestrator.telegram_allowlist import parse_telegram_allowed_chat_ids
 from orchestrator.telegram_steward import run_telegram_steward
 
 
@@ -42,7 +50,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="required comma-separated chat ids",
     )
     parser.add_argument("--telegram-poll-timeout-sec", "--poll-timeout-sec", dest="telegram_poll_timeout_sec", type=int, default=0)
-    parser.add_argument("--request-timeout-sec", type=float, default=0.0)
     parser.add_argument("--startup-timeout-sec", type=float, default=120.0)
     parser.add_argument("--rpc-timeout-sec", type=float, default=5.0)
     parser.add_argument("--rpc-retries", type=int, default=3)
@@ -55,8 +62,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("accept", "decline", "human"),
         default="human",
     )
-    parser.add_argument("--thread-approval-policy", default="on-request")
-    parser.add_argument("--thread-sandbox", default="workspace-write")
+    parser.add_argument(
+        "--thread-approval-policy",
+        default=DEFAULT_RUNTIME_LAUNCH_DEFAULTS.provider_approval_policy,
+    )
+    parser.add_argument(
+        "--thread-sandbox",
+        default=DEFAULT_RUNTIME_LAUNCH_DEFAULTS.sandbox,
+    )
     parser.add_argument(
         "--telegram-insecure-skip-verify",
         "--insecure-skip-verify",
@@ -68,16 +81,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _parse_allowed_chat_ids(raw: str) -> set[int]:
-    value = raw.strip()
-    if not value:
-        raise ValueError("--telegram-allowed-chat-ids is required and must be non-empty")
-    try:
-        parsed = {int(part.strip()) for part in value.split(",") if part.strip()}
-    except ValueError as exc:
-        raise ValueError("--telegram-allowed-chat-ids must be comma-separated integers") from exc
-    if not parsed:
-        raise ValueError("--telegram-allowed-chat-ids is required and must be non-empty")
-    return parsed
+    return parse_telegram_allowed_chat_ids(
+        raw,
+        setting_name="--telegram-allowed-chat-ids",
+    )
+
+
+def _allowed_chat_ids_reload_file(
+    args: argparse.Namespace,
+    file_env: dict[str, str],
+) -> str | None:
+    if str(args.telegram_allowed_chat_ids or "").strip():
+        return None
+    if os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "").strip():
+        return None
+    if str(file_env.get("TELEGRAM_ALLOWED_CHAT_IDS", "")).strip():
+        return str(args.env_file)
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -95,8 +115,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"missing required Telegram setting TELEGRAM_BOT_TOKEN; env file not found: {args.env_file} "
             f"(or pass --telegram-token / set TELEGRAM_BOT_TOKEN)"
         )
-    allowed_raw = resolve_env(args.telegram_allowed_chat_ids, "TELEGRAM_ALLOWED_CHAT_IDS", file_env)
-    allowed_chat_ids = _parse_allowed_chat_ids(allowed_raw)
+    allowed_chat_ids_reload_file = _allowed_chat_ids_reload_file(args, file_env)
+    allowed_chat_ids = None
+    if allowed_chat_ids_reload_file is None:
+        allowed_raw = resolve_env(
+            args.telegram_allowed_chat_ids,
+            "TELEGRAM_ALLOWED_CHAT_IDS",
+            file_env,
+        )
+        allowed_chat_ids = _parse_allowed_chat_ids(allowed_raw)
     poll_timeout_str = resolve_env(
         str(args.telegram_poll_timeout_sec) if args.telegram_poll_timeout_sec > 0 else "",
         "TELEGRAM_POLL_TIMEOUT_SEC",
@@ -116,7 +143,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     prompt_file = Path(args.steward_prompt_file).expanduser()
     if not prompt_file.exists():
         raise ValueError(f"--steward-prompt-file does not exist: {prompt_file}")
-    steward_prompt = prompt_file.read_text(encoding="utf-8")
+    profile_catalog = load_runtime_profile_catalog_from_environment()
+    steward_prompt = materialize_runtime_profile_prompt(
+        prompt_file.read_text(encoding="utf-8"),
+        profile_catalog,
+    )
     if not steward_prompt.strip():
         raise ValueError(f"--steward-prompt-file is empty: {prompt_file}")
     return run_telegram_steward(
@@ -124,10 +155,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         log_path=args.log_path,
         poll_timeout_sec=poll_timeout_sec,
         allowed_chat_ids=allowed_chat_ids,
+        allowed_chat_ids_reload_file=allowed_chat_ids_reload_file,
         insecure_skip_verify=insecure_skip_verify,
         telegram_api_base_url=(api_base_url.strip() or None),
         agent_command=command,
-        request_timeout_sec=float(args.request_timeout_sec),
         startup_timeout_sec=float(args.startup_timeout_sec),
         rpc_timeout_sec=float(args.rpc_timeout_sec),
         rpc_retries=int(args.rpc_retries),
@@ -142,6 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sessions_root=(args.sessions_root.strip() or None),
         steward_prompt=steward_prompt,
         state_path=(args.state_path.strip() or None),
+        profile_catalog=profile_catalog,
     )
 
 

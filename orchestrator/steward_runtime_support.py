@@ -1,16 +1,53 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from orchestrator.access_point_common import (
     AccessPointKey,
     AccessPointMessageRef,
     access_point_sort_key,
+    format_access_point,
 )
-from orchestrator.approval import ApprovalPolicy, ApprovalRequest
+from orchestrator.agent_identity import (
+    ApprovalRef,
+    InspectionRef,
+    ProviderExecutionProfile,
+    ProviderKind,
+    ProviderProfileId,
+    ProviderSessionRef,
+    RuntimeGeneration,
+    TurnRef,
+)
+from orchestrator.runtime_profile_catalog import (
+    BUILTIN_RUNTIME_PROFILE_CATALOG,
+    DEFAULT_RUNTIME_LAUNCH_DEFAULTS,
+    RuntimeLaunchDefaults,
+    RuntimeProfileCatalog,
+)
+from orchestrator.agent_inspection import (
+    AgentBackgroundSnapshot,
+    AgentContextSnapshot,
+    AgentRuntimeProjection,
+    AgentSessionSnapshot,
+    AgentWorkSnapshot,
+    SnapshotAvailability,
+    unavailable_projection,
+)
+from orchestrator.agent_capabilities import (
+    AgentCapability,
+    AgentCapabilitySnapshot,
+    codex_capability_snapshot,
+)
+from orchestrator.agent_io import AgentInput, AgentInputOrigin
+from orchestrator.agent_session import ApprovalDecisionResult, AgentEffectOutcome, AgentEffectResult
+from orchestrator.agent_session import AgentApprovalRequest, AgentFormRequest, ElicitationAction
+from orchestrator.interactive_driver_events import (
+    ApprovalDeliveryReceipt,
+    ElicitationDeliveryReceipt,
+)
 from orchestrator.approval_target import (
     HUMAN_APPROVAL_TARGET,
     approval_target_referrers,
@@ -24,22 +61,35 @@ from orchestrator.binding_address import (
     RoutingIdentityRegistry,
     normalize_address,
 )
-from orchestrator.interactive_codex_driver import CodexInteractiveDriver
 from orchestrator.interactive_driver_events import (
+    AgentEffortSelection,
+    AgentModelSelection,
+    AgentDeliveryEvent,
+    AgentDeliveryDriverPort,
+    InteractiveApprovalPromptEvent,
     InteractiveAgentResult,
     InteractiveAgentRequest,
-    InteractiveCodexDriver,
+    InteractiveInterruptResult,
+    InteractiveEffortApplyResult,
+    InteractiveModelApplyResult,
     InteractiveRuntimeFailure,
     InteractiveStartupResult,
-    RuntimeDriverFactory,
-    StewardDriverFactory,
+    RuntimeDeliveryDriverFactory,
+    StewardDeliveryDriverFactory,
 )
 from orchestrator.local_command_journal import LocalCommandOutcome
-from orchestrator.processes import LifecycleLogger
+from orchestrator.processes import (
+    CleanupError,
+    CleanupStep,
+    LifecycleLogger,
+    cleanup_owned_resources,
+)
 from orchestrator.interaction_queue import InteractionTickContext
 from orchestrator.steward_state import (
     RUNTIME_INTENT_BOUND_IDLE,
     RUNTIME_INTENT_RUNNING,
+    ConfiguredProviderFields,
+    PersistedAgentBinding,
     PersistedAccessPointState,
     normalize_runtime_intent,
 )
@@ -49,7 +99,7 @@ from orchestrator.steward_state import (
 class StewardDriverEvent:
     access_point: AccessPointKey
     source: str
-    event: Any
+    event: AgentDeliveryEvent
 
 
 class AgentRuntimeStartDecision(StrEnum):
@@ -58,6 +108,85 @@ class AgentRuntimeStartDecision(StrEnum):
     STARTING = "starting"
     RUNNING = "running"
     EXPLICITLY_STOPPED = "explicitly_stopped"
+
+
+class ProviderSessionBoundElsewhereError(RuntimeError):
+    code = "bound_elsewhere"
+
+    def __init__(
+        self,
+        session_ref: ProviderSessionRef,
+        owners: Iterable[AccessPointKey],
+    ) -> None:
+        if not isinstance(session_ref, ProviderSessionRef):
+            raise ValueError("provider session conflict requires ProviderSessionRef")
+        normalized_owners = tuple(sorted(set(owners), key=access_point_sort_key))
+        if not normalized_owners:
+            raise ValueError("provider session conflict requires an existing owner")
+        self.session_ref = session_ref
+        self.owners = normalized_owners
+        super().__init__(
+            "provider session is already bound to another access point: "
+            + ", ".join(format_access_point(owner) for owner in normalized_owners)
+        )
+
+
+class ProviderSessionOwnershipGuard:
+    """Atomically owns full provider-session identities for access points."""
+
+    def __init__(self) -> None:
+        self._owner_by_session: dict[ProviderSessionRef, AccessPointKey] = {}
+        self._claims_by_owner: dict[AccessPointKey, frozenset[ProviderSessionRef]] = {}
+
+    def replace_claims(
+        self,
+        owner: AccessPointKey,
+        session_refs: Iterable[ProviderSessionRef],
+    ) -> None:
+        claims = frozenset(session_refs)
+        if any(not isinstance(item, ProviderSessionRef) for item in claims):
+            raise ValueError("provider session claims require ProviderSessionRef values")
+        for session_ref in sorted(
+            claims,
+            key=lambda item: (
+                item.provider.value,
+                item.profile.value,
+                item.native_id,
+            ),
+        ):
+            existing = self._owner_by_session.get(session_ref)
+            if existing is not None and existing != owner:
+                raise ProviderSessionBoundElsewhereError(session_ref, (existing,))
+
+        previous = self._claims_by_owner.get(owner, frozenset())
+        for session_ref in previous - claims:
+            if self._owner_by_session.get(session_ref) == owner:
+                self._owner_by_session.pop(session_ref, None)
+        for session_ref in claims:
+            self._owner_by_session[session_ref] = owner
+        if claims:
+            self._claims_by_owner[owner] = claims
+        else:
+            self._claims_by_owner.pop(owner, None)
+
+    def release(self, owner: AccessPointKey) -> None:
+        self.replace_claims(owner, ())
+
+    def claims(self, owner: AccessPointKey) -> tuple[ProviderSessionRef, ...]:
+        return tuple(
+            sorted(
+                self._claims_by_owner.get(owner, frozenset()),
+                key=lambda item: (
+                    item.provider.value,
+                    item.profile.value,
+                    item.native_id,
+                ),
+            )
+        )
+
+    def owners(self, session_ref: ProviderSessionRef) -> tuple[AccessPointKey, ...]:
+        owner = self._owner_by_session.get(session_ref)
+        return () if owner is None else (owner,)
 
 
 class InterruptNoticeRuntime(Protocol):
@@ -168,36 +297,90 @@ class PendingInterruptRequest:
 @dataclass
 class _InteractiveStewardHandle:
     node_id: str
-    driver: InteractiveCodexDriver
+    driver: AgentDeliveryDriverPort
+    generation: RuntimeGeneration = field(default_factory=RuntimeGeneration.new)
+    turn_sequence: int = 0
     steward_prompt_sent: bool = False
 
 
 class StewardDeliveryLane(Protocol):
-    def submit_request(
+    def next_turn_ref(self, access_point: AccessPointKey) -> TurnRef: ...
+    def turn_wait_reason(self, access_point: AccessPointKey) -> str: ...
+    def start_turn(
         self,
         access_point: AccessPointKey,
-        text: str,
+        agent_input: AgentInput,
+        turn_ref: TurnRef,
         *,
         context_note: str | None = None,
-        as_steer: bool = False,
-    ) -> None: ...
-    def poll_once(self) -> list[StewardDriverEvent]: ...
+    ) -> AgentEffectResult: ...
+    def steer_wait_reason(
+        self,
+        access_point: AccessPointKey,
+        expected_turn_ref: TurnRef,
+    ) -> str: ...
+    def try_steer_turn(
+        self,
+        access_point: AccessPointKey,
+        agent_input: AgentInput,
+        expected_turn_ref: TurnRef,
+        *,
+        context_note: str | None = None,
+    ) -> AgentEffectResult: ...
+    def poll_once(
+        self,
+        *,
+        idle_poll_blocked_resources: frozenset[object] = frozenset(),
+    ) -> list[StewardDriverEvent]: ...
     def consume_poll_progress(self) -> bool: ...
-    def submit_approval_decision(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None: ...
+    def submit_approval_decision(
+        self,
+        access_point: AccessPointKey,
+        decision: str,
+        *,
+        expected_request: AgentApprovalRequest,
+    ) -> ApprovalDeliveryReceipt: ...
+    def submit_elicitation_response(
+        self,
+        access_point: AccessPointKey,
+        action: ElicitationAction,
+        *,
+        expected_request: AgentFormRequest,
+        content: dict[str, object] | None = None,
+    ) -> ElicitationDeliveryReceipt: ...
     def show_running(self, access_point: AccessPointKey) -> list[dict[str, Any]]: ...
-    def get_item_status_snapshot(self, access_point: AccessPointKey) -> list[dict[str, str]]: ...
-    def get_item_status_snapshot_for_turn(self, access_point: AccessPointKey, turn_id: str) -> list[dict[str, str]]: ...
-    def get_last_item_apply_info(self, access_point: AccessPointKey) -> dict | None: ...
     def has_active_turn(self, access_point: AccessPointKey) -> bool: ...
     def interrupt_active_turn(self, access_point: AccessPointKey) -> None: ...
-    def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]: ...
-    def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]: ...
+    def submit_model_selection(
+        self,
+        access_point: AccessPointKey,
+        model: str,
+    ) -> None: ...
+    def submit_effort_selection(
+        self,
+        access_point: AccessPointKey,
+        effort: str,
+    ) -> None: ...
+    def get_capability_snapshot(self, access_point: AccessPointKey) -> AgentCapabilitySnapshot | None: ...
+    def get_local_projection(self, access_point: AccessPointKey) -> AgentRuntimeProjection: ...
+    def request_inspection(
+        self,
+        access_point: AccessPointKey,
+        inspection_ref: InspectionRef,
+        timeout_sec: float,
+    ) -> AgentEffectResult: ...
     def reset(self, access_point: AccessPointKey) -> bool: ...
     def close(self) -> None: ...
 
 
 class AgentDeliveryLane(StewardDeliveryLane, Protocol):
-    def submit_approval_decision_now(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None: ...
+    def submit_approval_decision_now(
+        self,
+        access_point: AccessPointKey,
+        decision: str,
+        *,
+        expected_request: AgentApprovalRequest,
+    ) -> ApprovalDecisionResult: ...
     def start_agent(self, access_point: AccessPointKey, spec: dict[str, Any]) -> dict[str, Any]: ...
     def is_bound(self, access_point: AccessPointKey) -> bool: ...
     def has_binding(self, access_point: AccessPointKey) -> bool: ...
@@ -240,8 +423,6 @@ class AgentDeliveryLane(StewardDeliveryLane, Protocol):
     def approval_target(self, access_point: AccessPointKey) -> str: ...
     def assign_approval_target(self, access_point: AccessPointKey, target: str) -> dict[str, str]: ...
     def show_approval_target(self, access_point: AccessPointKey) -> dict[str, str]: ...
-    def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]: ...
-    def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]: ...
     def stop_agent(self, access_point: AccessPointKey) -> bool: ...
     def start_bound_agent(self, access_point: AccessPointKey) -> dict[str, Any]: ...
     def restore_binding(
@@ -261,46 +442,93 @@ class InteractiveStewardRuntime:
         self,
         *,
         logger: LifecycleLogger,
-        agent_command: list[str],
-        request_timeout_sec: float,
-        rpc_timeout_sec: float,
-        rpc_retries: int,
-        approval_policy: ApprovalPolicy,
-        thread_approval_policy: str,
-        thread_sandbox: str,
         steward_prompt: str | None,
-        client_factory: Callable[..., Any] | None,
-        driver_factory: StewardDriverFactory | None = None,
-        edge_thread_name: str = "telegram-steward-jsonrpc-client-thread",
+        driver_factory: StewardDeliveryDriverFactory,
     ) -> None:
         self._logger = logger
-        self._agent_command = list(agent_command)
-        self._request_timeout_sec = request_timeout_sec
-        self._rpc_timeout_sec = rpc_timeout_sec
-        self._rpc_retries = rpc_retries
-        self._approval_policy = approval_policy
-        self._thread_approval_policy = thread_approval_policy
-        self._thread_sandbox = thread_sandbox
         self._steward_prompt = (steward_prompt or "").strip()
-        self._client_factory = client_factory
         self._driver_factory = driver_factory
-        self._edge_thread_name = edge_thread_name
         self._handles: dict[AccessPointKey, _InteractiveStewardHandle] = {}
+        self._startup_cleanup_drivers: dict[str, AgentDeliveryDriverPort] = {}
         self._poll_progressed = False
 
     def ensure_started(self, access_point: AccessPointKey) -> None:
         self._ensure_handle(access_point)
 
-    def submit_request(
+    def steer_wait_reason(
         self,
         access_point: AccessPointKey,
-        text: str,
+        expected_turn_ref: TurnRef,
+    ) -> str:
+        handle = self._handles.get(access_point)
+        if handle is None:
+            return "steward_starting"
+        return handle.driver.steer_wait_reason(expected_turn_ref)
+
+    def try_steer_turn(
+        self,
+        access_point: AccessPointKey,
+        agent_input: AgentInput,
+        expected_turn_ref: TurnRef,
         *,
         context_note: str | None = None,
-        as_steer: bool = False,
-    ) -> None:
+    ) -> AgentEffectResult:
         handle = self._ensure_handle(access_point)
-        request_text = str(text)
+        request, prepend_prompt = self._build_request(
+            handle=handle,
+            access_point=access_point,
+            agent_input=agent_input,
+            context_note=context_note,
+        )
+        receipt = handle.driver.try_steer_turn(request, expected_turn_ref)
+        if receipt.outcome is AgentEffectOutcome.ACCEPTED and prepend_prompt:
+            handle.steward_prompt_sent = True
+        return receipt
+
+    def start_turn(
+        self,
+        access_point: AccessPointKey,
+        agent_input: AgentInput,
+        turn_ref: TurnRef,
+        *,
+        context_note: str | None = None,
+    ) -> AgentEffectResult:
+        handle = self._ensure_handle(access_point)
+        request, prepend_prompt = self._build_request(
+            handle=handle,
+            access_point=access_point,
+            agent_input=agent_input,
+            context_note=context_note,
+        )
+        receipt = handle.driver.start_turn(request, turn_ref)
+        if receipt.outcome is AgentEffectOutcome.ACCEPTED and prepend_prompt:
+            handle.steward_prompt_sent = True
+        return receipt
+
+    def next_turn_ref(self, access_point: AccessPointKey) -> TurnRef:
+        handle = self._ensure_handle(access_point)
+        handle.turn_sequence += 1
+        return TurnRef(handle.generation, handle.turn_sequence)
+
+    def turn_wait_reason(self, access_point: AccessPointKey) -> str:
+        handle = self._handles.get(access_point)
+        if handle is None:
+            return "steward_starting"
+        if not handle.driver.is_ready():
+            return "steward_starting"
+        if handle.driver.has_busy_work():
+            return "steward_busy"
+        return ""
+
+    def _build_request(
+        self,
+        *,
+        handle: _InteractiveStewardHandle,
+        access_point: AccessPointKey,
+        agent_input: AgentInput,
+        context_note: str | None,
+    ) -> tuple[InteractiveAgentRequest, bool]:
+        request_text = agent_input.text
         prepend_prompt = bool(self._steward_prompt and not handle.steward_prompt_sent)
         context_block = ""
         if context_note:
@@ -325,26 +553,34 @@ class InteractiveStewardRuntime:
             node_id=handle.node_id,
             prepend_prompt=prepend_prompt,
             context_note=bool(context_note),
-            text_preview=str(text).strip()[:200],
+            text_preview=agent_input.text.strip()[:200],
         )
-        handle.driver.submit_request(
+        return (
             InteractiveAgentRequest(
                 chat_id=access_point.chat_id,
                 thread_id=access_point.thread_id,
-                prompt=request_text,
-                as_steer=as_steer,
-            )
+                agent_input=agent_input.with_text(request_text),
+            ),
+            prepend_prompt,
         )
-        if prepend_prompt:
-            handle.steward_prompt_sent = True
 
-    def poll_once(self) -> list[StewardDriverEvent]:
+    def poll_once(
+        self,
+        *,
+        idle_poll_blocked_resources: frozenset[object] = frozenset(),
+    ) -> list[StewardDriverEvent]:
         self._poll_progressed = False
         out: list[StewardDriverEvent] = []
         for access_point, handle in list(self._handles.items()):
+            if (
+                ("steward", access_point) in idle_poll_blocked_resources
+                and handle.driver.is_ready()
+                and not handle.driver.has_active_turn()
+            ):
+                continue
             events = handle.driver.poll_once()
-            consume_progress = getattr(handle.driver, "consume_poll_progress", None)
-            if callable(consume_progress) and consume_progress():
+            handle.driver.acknowledge_event_handoff()
+            if handle.driver.consume_poll_progress():
                 self._poll_progressed = True
             for event in events:
                 self._logger.event(
@@ -368,34 +604,20 @@ class InteractiveStewardRuntime:
         if handle is None:
             return []
         state = "RUNNING" if handle.driver.is_ready() else "STARTING"
+        session = handle.driver.get_local_projection().session
         return [
             {
                 "role": "steward",
                 "agent_id": handle.node_id,
                 "state": state,
                 "controllable": False,
+                "provider": ProviderKind.CODEX.value,
                 "configured_model": "",
-                "effective_model": handle.driver.get_actual_thread_model(),
+                "configured_backend": "",
+                "effective_model": session.model,
+                "effective_backend": session.backend,
             }
         ]
-
-    def get_item_status_snapshot(self, access_point: AccessPointKey) -> list[dict[str, str]]:
-        handle = self._handles.get(access_point)
-        if handle is None:
-            return []
-        return handle.driver.get_item_status_snapshot()
-
-    def get_item_status_snapshot_for_turn(self, access_point: AccessPointKey, turn_id: str) -> list[dict[str, str]]:
-        handle = self._handles.get(access_point)
-        if handle is None:
-            return []
-        return handle.driver.get_item_status_snapshot_for_turn(turn_id)
-
-    def get_last_item_apply_info(self, access_point: AccessPointKey) -> dict | None:
-        handle = self._handles.get(access_point)
-        if handle is None:
-            return None
-        return handle.driver.get_last_item_apply_info()
 
     def has_active_turn(self, access_point: AccessPointKey) -> bool:
         handle = self._handles.get(access_point)
@@ -409,25 +631,43 @@ class InteractiveStewardRuntime:
             raise RuntimeError("no running steward node for this access point")
         handle.driver.interrupt_active_turn()
 
-    def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]:
+    def get_capability_snapshot(
+        self,
+        access_point: AccessPointKey,
+    ) -> AgentCapabilitySnapshot | None:
         handle = self._handles.get(access_point)
         if handle is None:
-            return {}
-        getter = getattr(handle.driver, "get_thread_metadata", None)
-        if not callable(getter):
-            return {}
-        raw = getter()
-        return dict(raw) if isinstance(raw, dict) else {}
+            return None
+        return handle.driver.get_capability_snapshot()
 
-    def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]:
+    def get_local_projection(self, access_point: AccessPointKey) -> AgentRuntimeProjection:
         handle = self._handles.get(access_point)
         if handle is None:
-            return {}
-        getter = getattr(handle.driver, "get_context_usage", None)
-        raw = getter() if callable(getter) else {}
-        return dict(raw) if isinstance(raw, dict) else {}
+            return unavailable_projection()
+        return handle.driver.get_local_projection()
 
-    def submit_approval_decision(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None:
+    def request_inspection(
+        self,
+        access_point: AccessPointKey,
+        inspection_ref: InspectionRef,
+        timeout_sec: float,
+    ) -> AgentEffectResult:
+        handle = self._handles.get(access_point)
+        if handle is None or not handle.driver.is_ready():
+            return AgentEffectResult.rejected("steward session is not ready")
+        return handle.driver.request_inspection(
+            inspection_ref,
+            timeout_sec,
+            (access_point.chat_id, access_point.thread_id),
+        )
+
+    def submit_approval_decision(
+        self,
+        access_point: AccessPointKey,
+        decision: str,
+        *,
+        expected_request: AgentApprovalRequest,
+    ) -> ApprovalDeliveryReceipt:
         handle = self._handles.get(access_point)
         if handle is None:
             raise RuntimeError("no running steward node for this access point")
@@ -439,52 +679,77 @@ class InteractiveStewardRuntime:
             node_id=handle.node_id,
             decision=decision,
         )
-        handle.driver.submit_approval_decision(decision, expected_request=expected_request)
+        return handle.driver.submit_approval_decision(
+            decision,
+            expected_request=expected_request,
+        )
+
+    def submit_elicitation_response(
+        self,
+        access_point: AccessPointKey,
+        action: ElicitationAction,
+        *,
+        expected_request: AgentFormRequest,
+        content: dict[str, object] | None = None,
+    ) -> ElicitationDeliveryReceipt:
+        handle = self._handles.get(access_point)
+        if handle is None:
+            raise RuntimeError("no running steward node for this access point")
+        return handle.driver.submit_elicitation_response(
+            action,
+            expected_request=expected_request,
+            content=content,
+        )
 
     def reset(self, access_point: AccessPointKey) -> bool:
-        handle = self._handles.pop(access_point, None)
-        if handle is None:
+        handle = self._handles.get(access_point)
+        node_id = self._node_id(access_point)
+        pending = self._startup_cleanup_drivers.get(node_id)
+        if handle is None and pending is None:
             return False
-        handle.driver.stop()
+        steps: list[CleanupStep] = []
+        if handle is not None:
+            steps.append(self._handle_cleanup_step(access_point, handle))
+        if pending is not None:
+            steps.append(self._startup_cleanup_step(node_id, pending))
+        cleanup_owned_resources(steps)
         return True
 
     def close(self) -> None:
-        handles = list(self._handles.values())
-        self._handles.clear()
-        for handle in handles:
-            handle.driver.stop()
+        steps = [
+            self._handle_cleanup_step(access_point, handle)
+            for access_point, handle in list(self._handles.items())
+        ]
+        steps.extend(
+            self._startup_cleanup_step(node_id, driver)
+            for node_id, driver in list(self._startup_cleanup_drivers.items())
+        )
+        cleanup_owned_resources(steps)
 
     def _ensure_handle(self, access_point: AccessPointKey) -> _InteractiveStewardHandle:
         existing = self._handles.get(access_point)
         if existing is not None:
             return existing
-        node_id = (
-            f"ap-{access_point.type}-"
-            f"{access_point.chat_id}-"
-            f"{access_point.thread_id if access_point.thread_id is not None else 'main'}"
-        )
-        driver = (
-            self._driver_factory(access_point, self._logger)
-            if self._driver_factory is not None
-            else CodexInteractiveDriver(
-                command=list(self._agent_command),
-                logger=self._logger,
-                request_timeout_sec=self._request_timeout_sec,
-                rpc_timeout_sec=self._rpc_timeout_sec,
-                rpc_retries=self._rpc_retries,
-                approval_policy=self._approval_policy,
-                thread_approval_policy=self._thread_approval_policy,
-                thread_sandbox=self._thread_sandbox,
-                resume_thread_id=None,
-                working_dir=None,
-                initial_model=None,
-                client_factory=self._client_factory,
-                edge_thread_name=self._edge_thread_name,
-            )
-        )
-        driver.start()
+        node_id = self._node_id(access_point)
+        pending = self._startup_cleanup_drivers.get(node_id)
+        if pending is not None:
+            cleanup_owned_resources([self._startup_cleanup_step(node_id, pending)])
+        driver = self._driver_factory(access_point, self._logger)
+        self._startup_cleanup_drivers[node_id] = driver
+        try:
+            driver.start()
+        except Exception as startup_error:
+            try:
+                cleanup_owned_resources([self._startup_cleanup_step(node_id, driver)])
+            except CleanupError as cleanup_error:
+                raise RuntimeError(
+                    f"steward driver startup failed: {startup_error}; "
+                    f"rollback failed: {cleanup_error}"
+                ) from startup_error
+            raise
         handle = _InteractiveStewardHandle(node_id=node_id, driver=driver)
         self._handles[access_point] = handle
+        self._startup_cleanup_drivers.pop(node_id, None)
         self._logger.event(
             "access_point_node_spawned",
             access_point_type=access_point.type,
@@ -494,28 +759,147 @@ class InteractiveStewardRuntime:
         )
         return handle
 
+    @staticmethod
+    def _node_id(access_point: AccessPointKey) -> str:
+        return (
+            f"ap-{access_point.type}-"
+            f"{access_point.chat_id}-"
+            f"{access_point.thread_id if access_point.thread_id is not None else 'main'}"
+        )
+
+    def _handle_cleanup_step(
+        self,
+        access_point: AccessPointKey,
+        handle: _InteractiveStewardHandle,
+    ) -> CleanupStep:
+        def release() -> None:
+            if self._handles.get(access_point) is handle:
+                self._handles.pop(access_point, None)
+
+        return CleanupStep(
+            owner=f"steward driver {handle.node_id}",
+            cleanup=handle.driver.stop,
+            release=release,
+        )
+
+    def _startup_cleanup_step(
+        self,
+        node_id: str,
+        driver: AgentDeliveryDriverPort,
+    ) -> CleanupStep:
+        def release() -> None:
+            if self._startup_cleanup_drivers.get(node_id) is driver:
+                self._startup_cleanup_drivers.pop(node_id, None)
+
+        return CleanupStep(
+            owner=f"steward startup driver {node_id}",
+            cleanup=driver.stop,
+            release=release,
+        )
+
+
+@dataclass
+class _EffectiveAgentRuntime:
+    generation: RuntimeGeneration
+    session: ProviderSessionRef | None = None
+    model: str = ""
+    backend: str = ""
+    turn_ref: TurnRef | None = None
+    approval_ref: ApprovalRef | None = None
+
 
 @dataclass
 class _InteractiveAgentBinding:
     node_id: str
-    cwd: str
-    model: str
-    mode: str
-    spec: dict[str, Any]
-    thread_id: str
-    requested_thread_id: str
-    driver: InteractiveCodexDriver | None
+    provider: ProviderKind
+    profile: ProviderProfileId
+    configured: ConfiguredProviderFields
+    session: ProviderSessionRef | None
+    requested_session: ProviderSessionRef | None
+    driver: AgentDeliveryDriverPort | None
+    adapter_name: str = ""
+    adapter_version: str = ""
+    runtime_name: str = ""
+    runtime_version: str = ""
     runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE
-    thread_name: str = ""
+    session_name: str = ""
     approval_target: str = HUMAN_APPROVAL_TARGET
-    effective_model: str = ""
+    effective: _EffectiveAgentRuntime | None = None
+    turn_sequence: int = 0
     startup_logged: bool = False
     state: str = "BOUND_IDLE"
-    startup_started_at: float | None = None
-    startup_deadline: float | None = None
-    startup_generation: int = 0
     rollback_binding: _InteractiveAgentBinding | None = None
-    pending_request_sequences: list[int] = field(default_factory=list)
+
+    @property
+    def cwd(self) -> str:
+        return self.configured.cwd
+
+    @property
+    def model(self) -> str:
+        return self.configured.model
+
+    @property
+    def backend(self) -> str:
+        return self.configured.backend
+
+    @property
+    def mode(self) -> str:
+        return self.configured.mode
+
+    @property
+    def thread_id(self) -> str:
+        return self.session.native_id if self.session is not None else ""
+
+    @property
+    def requested_thread_id(self) -> str:
+        return self.requested_session.native_id if self.requested_session is not None else ""
+
+    @property
+    def thread_name(self) -> str:
+        return self.session_name
+
+    @property
+    def effective_model(self) -> str:
+        return self.effective.model if self.effective is not None else ""
+
+    @property
+    def effective_backend(self) -> str:
+        return self.effective.backend if self.effective is not None else ""
+
+    @property
+    def runtime_generation(self) -> RuntimeGeneration | None:
+        return self.effective.generation if self.effective is not None else None
+
+
+@dataclass(frozen=True)
+class _PendingAgentDriverCleanup:
+    access_point: AccessPointKey
+    driver: AgentDeliveryDriverPort
+    session_claims: frozenset[ProviderSessionRef]
+
+
+def _persisted_binding(binding: _InteractiveAgentBinding) -> PersistedAgentBinding:
+    return PersistedAgentBinding(
+        agent_id=binding.node_id,
+        provider=binding.provider,
+        profile=binding.profile,
+        session=binding.session,
+        session_name=binding.thread_name,
+        configured=binding.configured,
+        adapter_name=binding.adapter_name,
+        adapter_version=binding.adapter_version,
+        runtime_name=binding.runtime_name,
+        runtime_version=binding.runtime_version,
+    )
+
+
+def _binding_component_fields(binding: _InteractiveAgentBinding) -> dict[str, str]:
+    return {
+        "adapter": binding.adapter_name or "unknown",
+        "adapter_version": binding.adapter_version or "unknown",
+        "runtime": binding.runtime_name or "unknown",
+        "runtime_version": binding.runtime_version or "unknown",
+    }
 
 
 class InteractiveAgentRuntime:
@@ -525,45 +909,130 @@ class InteractiveAgentRuntime:
         self,
         *,
         logger: LifecycleLogger,
-        agent_command: list[str],
-        request_timeout_sec: float,
-        rpc_timeout_sec: float,
-        rpc_retries: int,
-        approval_policy: ApprovalPolicy,
-        default_thread_approval_policy: str,
-        default_thread_sandbox: str,
-        client_factory: Callable[..., Any] | None,
-        driver_factory: RuntimeDriverFactory | None = None,
-        edge_thread_name: str = "telegram-runtime-jsonrpc-client-thread",
+        driver_factory: RuntimeDeliveryDriverFactory,
+        provider_validator: Callable[[ProviderExecutionProfile], object],
         startup_timeout_sec: float = _DEFAULT_STARTUP_TIMEOUT_SEC,
+        profile_catalog: RuntimeProfileCatalog = BUILTIN_RUNTIME_PROFILE_CATALOG,
+        launch_defaults: RuntimeLaunchDefaults = DEFAULT_RUNTIME_LAUNCH_DEFAULTS,
     ) -> None:
         self._logger = logger
-        self._agent_command = list(agent_command)
-        self._request_timeout_sec = request_timeout_sec
-        self._rpc_timeout_sec = rpc_timeout_sec
-        self._rpc_retries = rpc_retries
-        self._approval_policy = approval_policy
-        self._default_thread_approval_policy = default_thread_approval_policy
-        self._default_thread_sandbox = default_thread_sandbox
-        self._client_factory = client_factory
         self._driver_factory = driver_factory
-        self._edge_thread_name = edge_thread_name
+        self._provider_validator = provider_validator
+        if not isinstance(profile_catalog, RuntimeProfileCatalog):
+            raise ValueError("agent runtime requires RuntimeProfileCatalog")
+        if not isinstance(launch_defaults, RuntimeLaunchDefaults):
+            raise ValueError("agent runtime requires RuntimeLaunchDefaults")
+        self._profile_catalog = profile_catalog
+        self._launch_defaults = launch_defaults
         self._startup_timeout_sec = float(startup_timeout_sec)
         if self._startup_timeout_sec <= 0.0:
             raise ValueError("startup_timeout_sec must be positive")
         self._id_seq = 0
-        self._startup_generation = 0
-        self._next_request_sequence = 1
         self._binding_by_access_point: dict[AccessPointKey, _InteractiveAgentBinding] = {}
+        self._session_ownership = ProviderSessionOwnershipGuard()
+        self._restore_conflict_by_access_point: dict[
+            AccessPointKey,
+            ProviderSessionBoundElsewhereError,
+        ] = {}
+        self._pending_driver_cleanup: dict[
+            str,
+            _PendingAgentDriverCleanup,
+        ] = {}
         self._address_registry = RoutingIdentityRegistry[AccessPointKey]()
         self._metadata_changes: set[AccessPointKey] = set()
         self._poll_progressed = False
+
+    @classmethod
+    def _binding_session_claims(
+        cls,
+        binding: _InteractiveAgentBinding | None,
+    ) -> tuple[ProviderSessionRef, ...]:
+        if binding is None:
+            return ()
+        claims = {binding.session} if binding.session is not None else set()
+        if binding.state == "STARTING":
+            if binding.requested_session is not None:
+                claims.add(binding.requested_session)
+            claims.update(cls._binding_session_claims(binding.rollback_binding))
+        return tuple(claims)
+
+    def _replace_binding(
+        self,
+        access_point: AccessPointKey,
+        binding: _InteractiveAgentBinding,
+    ) -> None:
+        self._sync_session_claims(access_point, binding=binding)
+        self._binding_by_access_point[access_point] = binding
+        self._restore_conflict_by_access_point.pop(access_point, None)
+
+    def _remove_binding(self, access_point: AccessPointKey) -> None:
+        self._binding_by_access_point.pop(access_point, None)
+        self._sync_session_claims(access_point, binding=None)
+        self._metadata_changes.discard(access_point)
+
+    def _session_claims_with_pending_cleanup(
+        self,
+        access_point: AccessPointKey,
+        *,
+        binding: _InteractiveAgentBinding | None,
+    ) -> tuple[ProviderSessionRef, ...]:
+        claims = set(self._binding_session_claims(binding))
+        for pending in self._pending_driver_cleanup.values():
+            if pending.access_point == access_point:
+                claims.update(pending.session_claims)
+        return tuple(claims)
+
+    def _sync_session_claims(
+        self,
+        access_point: AccessPointKey,
+        *,
+        binding: _InteractiveAgentBinding | None = None,
+    ) -> None:
+        if binding is None:
+            binding = self._binding_by_access_point.get(access_point)
+        self._session_ownership.replace_claims(
+            access_point,
+            self._session_claims_with_pending_cleanup(
+                access_point,
+                binding=binding,
+            ),
+        )
+
+    def _retain_pending_driver_cleanup(
+        self,
+        *,
+        access_point: AccessPointKey,
+        binding: _InteractiveAgentBinding,
+        driver: AgentDeliveryDriverPort,
+    ) -> None:
+        self._pending_driver_cleanup[binding.node_id] = _PendingAgentDriverCleanup(
+            access_point=access_point,
+            driver=driver,
+            session_claims=frozenset(self._binding_session_claims(binding)),
+        )
 
     def _normalize_spec(self, spec: dict[str, Any]) -> dict[str, Any]:
         resolved_spec = dict(spec)
         resolved_spec["cwd"] = str(resolved_spec.get("cwd") or "")
         resolved_spec["model"] = str(resolved_spec.get("model") or "")
+        resolved_spec["backend"] = str(resolved_spec.get("backend") or "")
         resolved_spec["mode"] = str(resolved_spec.get("mode") or "proxy")
+        execution_profile = self._profile_catalog.resolve(
+            resolved_spec.get("provider") or ProviderKind.CODEX,
+            resolved_spec.get("profile"),
+        )
+        resolved_spec["provider"] = execution_profile.provider.value
+        resolved_spec["profile"] = execution_profile.profile.value
+        launch = self._profile_catalog.normalize_launch_configuration(
+            execution_profile,
+            args=resolved_spec.get("args"),
+            provider_approval_policy=resolved_spec.get("approval_policy"),
+            sandbox=resolved_spec.get("sandbox"),
+            defaults=self._launch_defaults,
+        )
+        resolved_spec["args"] = list(launch.args)
+        resolved_spec["approval_policy"] = launch.provider_approval_policy
+        resolved_spec["sandbox"] = launch.sandbox
         resolved_spec["approval_target"] = normalize_approval_target(
             resolved_spec.get("approval_target") or HUMAN_APPROVAL_TARGET
         )
@@ -573,11 +1042,45 @@ class InteractiveAgentRuntime:
 
     def start_agent(self, access_point: AccessPointKey, spec: dict[str, Any]) -> dict[str, Any]:
         resolved_spec = self._normalize_spec(spec)
+        execution_profile = self._profile_catalog.resolve(
+            resolved_spec["provider"],
+            resolved_spec["profile"],
+        )
+        provider = execution_profile.provider
+        profile = execution_profile.profile
+        restore_conflict = self._restore_conflict_by_access_point.get(access_point)
+        if restore_conflict is not None:
+            raise restore_conflict
         existing = self._binding_by_access_point.get(access_point)
         if existing is not None and existing.driver is not None:
             raise RuntimeError("agent is already running for this access point")
+        native_session_id = str(resolved_spec.get("thread_id") or "").strip()
+        session = (
+            ProviderSessionRef(provider, native_session_id, profile)
+            if native_session_id
+            else None
+        )
+        startup_claims = set(self._binding_session_claims(existing))
+        if session is not None:
+            startup_claims.add(session)
+        reservation_claims = set(
+            self._session_claims_with_pending_cleanup(
+                access_point,
+                binding=existing,
+            )
+        )
+        reservation_claims.update(startup_claims)
+        self._session_ownership.replace_claims(access_point, reservation_claims)
+        try:
+            self._provider_validator(execution_profile)
+            self._cleanup_pending_drivers(access_point=access_point)
+            self._session_ownership.replace_claims(access_point, startup_claims)
+            driver = self._build_driver(access_point=access_point, spec=resolved_spec)
+            capabilities = driver.get_capability_snapshot()
+        except Exception:
+            self._sync_session_claims(access_point)
+            raise
         self._id_seq += 1
-        self._startup_generation += 1
         node_id = (
             f"agent-{access_point.type}-"
             f"{access_point.chat_id}-"
@@ -586,38 +1089,65 @@ class InteractiveAgentRuntime:
         )
         binding = _InteractiveAgentBinding(
             node_id=node_id,
-            cwd=str(resolved_spec.get("cwd") or ""),
-            model=str(resolved_spec.get("model") or ""),
-            mode=str(resolved_spec.get("mode") or "proxy"),
-            spec=resolved_spec,
-            thread_id=str(resolved_spec.get("thread_id") or ""),
-            requested_thread_id=str(resolved_spec.get("thread_id") or ""),
-            driver=self._build_driver(access_point=access_point, spec=resolved_spec),
+            provider=provider,
+            profile=profile,
+            configured=ConfiguredProviderFields(
+                cwd=str(resolved_spec.get("cwd") or ""),
+                model=str(resolved_spec.get("model") or ""),
+                backend=str(resolved_spec.get("backend") or ""),
+                mode=str(resolved_spec.get("mode") or "proxy"),
+                approval_policy=str(resolved_spec.get("approval_policy") or ""),
+                sandbox=str(resolved_spec.get("sandbox") or ""),
+                args=tuple(
+                    str(item)
+                    for item in (
+                        resolved_spec.get("args")
+                        if isinstance(resolved_spec.get("args"), list)
+                        else []
+                    )
+                ),
+            ),
+            session=session,
+            requested_session=session,
+            driver=driver,
+            adapter_name=capabilities.adapter.name,
+            adapter_version=capabilities.adapter.version,
+            runtime_name=capabilities.runtime.name,
+            runtime_version=capabilities.runtime.version,
             runtime_intent=RUNTIME_INTENT_RUNNING,
-            thread_name=str(resolved_spec.get("thread_name") or "").strip(),
+            session_name=str(resolved_spec.get("thread_name") or "").strip(),
             approval_target=str(resolved_spec.get("approval_target") or HUMAN_APPROVAL_TARGET),
+            effective=_EffectiveAgentRuntime(generation=RuntimeGeneration.new()),
             state="STARTING",
-            startup_started_at=clock.monotonic(),
-            startup_deadline=clock.monotonic() + self._startup_timeout_sec,
-            startup_generation=self._startup_generation,
             rollback_binding=existing,
         )
-        self._binding_by_access_point[access_point] = binding
+        self._replace_binding(access_point, binding)
         driver = binding.driver
         try:
             driver.start()
-        except Exception:
+        except Exception as startup_error:
+            self._retain_pending_driver_cleanup(
+                access_point=access_point,
+                binding=binding,
+                driver=driver,
+            )
             if existing is None:
                 binding.driver = None
                 binding.state = "BOUND_IDLE"
                 binding.runtime_intent = RUNTIME_INTENT_BOUND_IDLE
+                binding.effective = None
+                binding.turn_sequence = 0
+                self._replace_binding(access_point, binding)
             else:
                 existing.runtime_intent = RUNTIME_INTENT_BOUND_IDLE
-                self._binding_by_access_point[access_point] = existing
+                self._replace_binding(access_point, existing)
             try:
-                driver.stop()
-            except Exception:
-                pass
+                self._cleanup_pending_drivers(node_id=node_id)
+            except CleanupError as cleanup_error:
+                raise RuntimeError(
+                    f"runtime agent startup failed: {startup_error}; "
+                    f"rollback failed: {cleanup_error}"
+                ) from startup_error
             raise
         self._logger.event(
             "access_point_agent_starting",
@@ -628,8 +1158,12 @@ class InteractiveAgentRuntime:
             cwd=binding.cwd,
             model=binding.model,
             mode=binding.mode,
+            provider=binding.provider.value,
+            profile=binding.profile.value,
             startup_timeout_sec=self._startup_timeout_sec,
-            startup_generation=binding.startup_generation,
+            runtime_generation=(
+                binding.runtime_generation.value if binding.runtime_generation is not None else ""
+            ),
         )
         return self._binding_start_result(binding)
 
@@ -640,6 +1174,11 @@ class InteractiveAgentRuntime:
             "state": binding.state.lower(),
             "cwd": binding.cwd,
             "model": binding.model,
+            "provider": binding.provider.value,
+            "profile": binding.profile.value,
+            **_binding_component_fields(binding),
+            "configured_backend": binding.backend,
+            "effective_backend": binding.effective_backend,
             "mode": binding.mode,
             "thread_id": binding.thread_id,
             "thread_name": binding.thread_name,
@@ -675,14 +1214,22 @@ class InteractiveAgentRuntime:
             return None
         info = {
             "agent_id": binding.node_id,
+            "provider": binding.provider.value,
+            "profile": binding.profile.value,
+            **_binding_component_fields(binding),
             "cwd": binding.cwd,
             "model": binding.model,
             "configured_model": binding.model,
             "effective_model": binding.effective_model,
+            "configured_backend": binding.backend,
+            "effective_backend": binding.effective_backend,
             "mode": binding.mode,
             "thread_id": binding.thread_id,
             "thread_name": binding.thread_name,
             "approval_target": binding.approval_target,
+            "approval_policy": binding.configured.approval_policy,
+            "sandbox": binding.configured.sandbox,
+            "args": list(binding.configured.args),
         }
         identity = self._address_registry.identity(access_point)
         if identity is not None:
@@ -803,7 +1350,6 @@ class InteractiveAgentRuntime:
     ) -> None:
         approval_target = normalize_approval_target(target)
         binding.approval_target = approval_target
-        binding.spec["approval_target"] = approval_target
 
     def assign_approval_target(self, access_point: AccessPointKey, target: str) -> dict[str, str]:
         binding = self._require_approval_target_binding(access_point)
@@ -891,15 +1437,33 @@ class InteractiveAgentRuntime:
         if binding is None:
             return False
         if binding.driver is None:
+            self._cleanup_pending_drivers(access_point=access_point)
             binding.runtime_intent = RUNTIME_INTENT_BOUND_IDLE
             return True
-        self._transition_to_bound_idle(
+        startup_generation = (
+            binding.runtime_generation.value
+            if binding.state == "STARTING"
+            and binding.runtime_generation is not None
+            else ""
+        )
+        _idle_binding, cleanup_error = self._transition_to_bound_idle(
             access_point=access_point,
             binding=binding,
             driver=binding.driver,
             use_startup_rollback=True,
             cleanup_event="access_point_agent_stop_cleanup_failed",
         )
+        if startup_generation:
+            self._logger.event(
+                "access_point_agent_start_cancelled",
+                access_point_type=access_point.type,
+                chat_id=access_point.chat_id,
+                thread_id=access_point.thread_id,
+                runtime_generation=startup_generation,
+                reason="stop",
+            )
+        if cleanup_error:
+            raise RuntimeError(cleanup_error)
         return True
 
     def startup_failure_result(
@@ -931,67 +1495,89 @@ class InteractiveAgentRuntime:
             raise RuntimeError("no bound agent for this access point")
         if binding.driver is not None:
             return self._binding_start_result(binding)
-        return self.start_agent(access_point, dict(binding.spec))
+        spec = _persisted_binding(binding).to_runtime_spec()
+        spec["approval_target"] = binding.approval_target
+        return self.start_agent(access_point, spec)
 
     def restore_binding(
         self,
         access_point: AccessPointKey,
         *,
-        spec: dict[str, Any],
-        agent_id: str = "",
-        thread_id: str = "",
+        binding: PersistedAgentBinding,
         runtime_intent: str = RUNTIME_INTENT_BOUND_IDLE,
+        address: str = "",
+        routing_mode: str = "",
+        approval_target: str = HUMAN_APPROVAL_TARGET,
     ) -> dict[str, str]:
-        resolved_spec = self._normalize_spec(spec)
-        restored_address = str(resolved_spec.pop("address", "") or "").strip()
-        restored_routing_mode = str(
-            resolved_spec.pop("routing_mode", ROUTING_MODE_SHAMAN) or ROUTING_MODE_SHAMAN
-        ).strip()
-        if thread_id.strip():
-            resolved_spec["thread_id"] = thread_id.strip()
-        restored_id = agent_id.strip() or (
+        restored_id = binding.agent_id.strip() or (
             f"restored-agent-{access_point.type}-"
             f"{access_point.chat_id}-"
             f"{access_point.thread_id if access_point.thread_id is not None else 'main'}"
         )
-        binding = _InteractiveAgentBinding(
+        runtime_binding = _InteractiveAgentBinding(
             node_id=restored_id,
-            cwd=str(resolved_spec.get("cwd") or ""),
-            model=str(resolved_spec.get("model") or ""),
-            mode=str(resolved_spec.get("mode") or "proxy"),
-            spec=resolved_spec,
-            thread_id=str(resolved_spec.get("thread_id") or ""),
-            requested_thread_id=str(resolved_spec.get("thread_id") or ""),
+            provider=binding.provider,
+            profile=binding.profile,
+            configured=binding.configured,
+            session=binding.session,
+            requested_session=binding.session,
             driver=None,
+            adapter_name=binding.adapter_name,
+            adapter_version=binding.adapter_version,
+            runtime_name=binding.runtime_name,
+            runtime_version=binding.runtime_version,
             runtime_intent=normalize_runtime_intent(runtime_intent),
-            thread_name=str(resolved_spec.get("thread_name") or "").strip(),
-            approval_target=str(resolved_spec.get("approval_target") or HUMAN_APPROVAL_TARGET),
+            session_name=binding.session_name,
+            approval_target=normalize_approval_target(approval_target),
         )
-        if restored_address:
-            self._address_registry.assign(
+        previous_claims = self._session_ownership.claims(access_point)
+        try:
+            self._session_ownership.replace_claims(
                 access_point,
-                restored_address,
-                restored_routing_mode,
+                self._session_claims_with_pending_cleanup(
+                    access_point,
+                    binding=runtime_binding,
+                ),
             )
-        self._binding_by_access_point[access_point] = binding
+        except ProviderSessionBoundElsewhereError as exc:
+            self._restore_conflict_by_access_point[access_point] = exc
+            raise
+        restored_address = str(address or "").strip()
+        try:
+            if restored_address:
+                self._address_registry.assign(
+                    access_point,
+                    restored_address,
+                    str(routing_mode or ROUTING_MODE_SHAMAN).strip(),
+                )
+            self._replace_binding(access_point, runtime_binding)
+        except Exception:
+            self._session_ownership.replace_claims(access_point, previous_claims)
+            raise
         self._logger.event(
             "access_point_agent_binding_restored",
             access_point_type=access_point.type,
             chat_id=access_point.chat_id,
             thread_id=access_point.thread_id,
-            agent_id=binding.node_id,
-            cwd=binding.cwd,
-            model=binding.model,
-            mode=binding.mode,
-            restored_thread_id=binding.thread_id,
+            agent_id=runtime_binding.node_id,
+            provider=runtime_binding.provider.value,
+            profile=runtime_binding.profile.value,
+            cwd=runtime_binding.cwd,
+            configured_model=runtime_binding.model,
+            configured_backend=runtime_binding.backend,
+            mode=runtime_binding.mode,
+            restored_session_id=runtime_binding.thread_id,
         )
         return {
-            "agent_id": binding.node_id,
-            "cwd": binding.cwd,
-            "model": binding.model,
-            "mode": binding.mode,
-            "thread_id": binding.thread_id,
-            "thread_name": binding.thread_name,
+            "agent_id": runtime_binding.node_id,
+            "provider": runtime_binding.provider.value,
+            "profile": runtime_binding.profile.value,
+            "cwd": runtime_binding.cwd,
+            "model": runtime_binding.model,
+            "configured_backend": runtime_binding.backend,
+            "mode": runtime_binding.mode,
+            "thread_id": runtime_binding.thread_id,
+            "thread_name": runtime_binding.thread_name,
         }
 
     def snapshot_persisted(self) -> dict[AccessPointKey, PersistedAccessPointState]:
@@ -1004,22 +1590,19 @@ class InteractiveAgentRuntime:
                 address=identity.address if identity is not None else "",
                 routing_mode=identity.mode if identity is not None else "",
                 approval_target=binding.approval_target,
-                agent={
-                    "agent_id": binding.node_id,
-                    "thread_id": binding.thread_id,
-                    "thread_name": binding.thread_name,
-                    "cwd": binding.cwd,
-                    "model": binding.model,
-                    "mode": binding.mode,
-                    "spec": dict(binding.spec),
-                },
+                agent=_persisted_binding(binding),
             )
         return snapshot
 
     def reset(self, access_point: AccessPointKey) -> bool:
         binding = self._binding_by_access_point.get(access_point)
         if binding is None:
-            return False
+            conflict = self._restore_conflict_by_access_point.pop(access_point, None)
+            if conflict is None:
+                return False
+            self._sync_session_claims(access_point)
+            self._metadata_changes.discard(access_point)
+            return True
         current_identity = self._address_registry.identity(access_point)
         current = current_identity.address if current_identity is not None else None
         if current is not None:
@@ -1030,48 +1613,125 @@ class InteractiveAgentRuntime:
             )
             if referrers:
                 raise ValueError(f"address is used as approval target by: {', '.join(referrers)}")
-        self._binding_by_access_point.pop(access_point, None)
-        self._metadata_changes.discard(access_point)
+        self._cleanup_pending_drivers(access_point=access_point)
+        if binding.driver is not None:
+            cleanup_owned_resources(
+                [
+                    CleanupStep(
+                        owner=f"runtime agent driver {binding.node_id}",
+                        cleanup=binding.driver.stop,
+                    )
+                ]
+            )
+        self._remove_binding(access_point)
         if current_identity is not None:
             self._address_registry.remove(access_point, current_identity.mode)
-        if binding.driver is not None:
-            binding.driver.stop()
         return True
 
-    def submit_request(
+    def steer_wait_reason(
         self,
         access_point: AccessPointKey,
-        text: str,
-        *,
-        context_note: str | None = None,
-        as_steer: bool = False,
-    ) -> None:
+        expected_turn_ref: TurnRef,
+    ) -> str:
         binding = self._binding_by_access_point.get(access_point)
         if binding is None or binding.driver is None:
-            raise RuntimeError("no running agent is bound to this access point")
-        request_sequence = self._next_request_sequence
-        self._next_request_sequence += 1
+            return ""
+        return binding.driver.steer_wait_reason(expected_turn_ref)
+
+    def try_steer_turn(
+        self,
+        access_point: AccessPointKey,
+        agent_input: AgentInput,
+        expected_turn_ref: TurnRef,
+        *,
+        context_note: str | None = None,
+    ) -> AgentEffectResult:
+        if context_note:
+            return AgentEffectResult.rejected("runtime agent steer does not accept Steward context notes")
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None or binding.effective is None:
+            return AgentEffectResult.rejected("no running agent is bound to this access point")
+        if expected_turn_ref.runtime_generation != binding.effective.generation:
+            return AgentEffectResult.rejected("agent runtime generation no longer matches")
         self._logger.event(
-            "runtime_agent_submit_request",
+            "runtime_agent_steer_requested",
             access_point_type=access_point.type,
             chat_id=access_point.chat_id,
             thread_id=access_point.thread_id,
             agent_id=binding.node_id,
             runtime_thread_id=binding.thread_id,
-            request_sequence=request_sequence,
-            text_preview=str(text).strip()[:200],
+            turn_ref_sequence=expected_turn_ref.sequence,
+            text_preview=agent_input.text.strip()[:200],
         )
-        binding.driver.submit_request(
+        return binding.driver.try_steer_turn(
             InteractiveAgentRequest(
                 chat_id=access_point.chat_id,
                 thread_id=access_point.thread_id,
-                prompt=str(text),
-                as_steer=as_steer,
-            )
+                agent_input=agent_input,
+            ),
+            expected_turn_ref,
         )
-        binding.pending_request_sequences.append(request_sequence)
 
-    def submit_approval_decision(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None:
+    def next_turn_ref(self, access_point: AccessPointKey) -> TurnRef:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None or binding.effective is None:
+            raise RuntimeError("no running agent is bound to this access point")
+        binding.turn_sequence += 1
+        return TurnRef(binding.effective.generation, binding.turn_sequence)
+
+    def turn_wait_reason(self, access_point: AccessPointKey) -> str:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None:
+            return "agent_not_running"
+        if binding.state != "RUNNING" or not binding.driver.is_ready():
+            return "agent_starting"
+        if binding.driver.has_busy_work():
+            return "agent_busy"
+        return ""
+
+    def start_turn(
+        self,
+        access_point: AccessPointKey,
+        agent_input: AgentInput,
+        turn_ref: TurnRef,
+        *,
+        context_note: str | None = None,
+    ) -> AgentEffectResult:
+        if context_note:
+            raise ValueError("runtime agent turns do not accept Steward context notes")
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None or binding.effective is None:
+            return AgentEffectResult.rejected("no running agent is bound to this access point")
+        if turn_ref.runtime_generation != binding.effective.generation:
+            return AgentEffectResult.rejected("agent runtime generation no longer matches")
+        request = InteractiveAgentRequest(
+            chat_id=access_point.chat_id,
+            thread_id=access_point.thread_id,
+            agent_input=agent_input,
+        )
+        receipt = binding.driver.start_turn(request, turn_ref)
+        if receipt.outcome is AgentEffectOutcome.ACCEPTED:
+            binding.effective.turn_ref = turn_ref
+            binding.effective.approval_ref = None
+            self._logger.event(
+                "runtime_agent_turn_started",
+                access_point_type=access_point.type,
+                chat_id=access_point.chat_id,
+                thread_id=access_point.thread_id,
+                agent_id=binding.node_id,
+                runtime_thread_id=binding.thread_id,
+                turn_ref_sequence=turn_ref.sequence,
+                text_preview=agent_input.text.strip()[:200],
+            )
+        return receipt
+
+    def submit_approval_decision(
+        self,
+        access_point: AccessPointKey,
+        decision: str,
+        *,
+        expected_request: AgentApprovalRequest,
+    ) -> ApprovalDeliveryReceipt:
         binding = self._binding_by_access_point.get(access_point)
         if binding is None or binding.driver is None:
             raise RuntimeError("no running agent is bound to this access point")
@@ -1084,12 +1744,25 @@ class InteractiveAgentRuntime:
             runtime_thread_id=binding.thread_id,
             decision=decision,
         )
-        binding.driver.submit_approval_decision(decision, expected_request=expected_request)
+        return binding.driver.submit_approval_decision(
+            decision,
+            expected_request=expected_request,
+        )
 
-    def submit_approval_decision_now(self, access_point: AccessPointKey, decision: str, *, expected_request: ApprovalRequest | None = None) -> None:
+    def submit_approval_decision_now(
+        self,
+        access_point: AccessPointKey,
+        decision: str,
+        *,
+        expected_request: AgentApprovalRequest,
+    ) -> ApprovalDecisionResult:
         binding = self._binding_by_access_point.get(access_point)
         if binding is None or binding.driver is None:
-            raise RuntimeError("no running agent is bound to this access point")
+            return ApprovalDecisionResult.preflight(
+                AgentEffectResult.rejected(
+                    "no running agent is bound to this access point"
+                )
+            )
         self._logger.event(
             "runtime_agent_submit_approval_decision_now",
             access_point_type=access_point.type,
@@ -1099,38 +1772,93 @@ class InteractiveAgentRuntime:
             runtime_thread_id=binding.thread_id,
             decision=decision,
         )
-        submit_now = getattr(binding.driver, "submit_approval_decision_now", None)
-        if callable(submit_now):
-            submit_now(decision, expected_request=expected_request)
-            return
-        binding.driver.submit_approval_decision(decision, expected_request=expected_request)
+        return binding.driver.submit_approval_decision_now(
+            decision,
+            expected_request=expected_request,
+        )
 
-    def poll_once(self) -> list[StewardDriverEvent]:
+    def submit_elicitation_response(
+        self,
+        access_point: AccessPointKey,
+        action: ElicitationAction,
+        *,
+        expected_request: AgentFormRequest,
+        content: dict[str, object] | None = None,
+    ) -> ElicitationDeliveryReceipt:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None:
+            raise RuntimeError("no running agent is bound to this access point")
+        return binding.driver.submit_elicitation_response(
+            action,
+            expected_request=expected_request,
+            content=content,
+        )
+
+    def submit_model_selection(
+        self,
+        access_point: AccessPointKey,
+        model: str,
+    ) -> None:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None or binding.state != "RUNNING":
+            raise RuntimeError("agent session is not running")
+        binding.driver.submit_model_selection(
+            AgentModelSelection(
+                access_point=(access_point.chat_id, access_point.thread_id),
+                selected_model=model,
+            )
+        )
+
+    def submit_effort_selection(
+        self,
+        access_point: AccessPointKey,
+        effort: str,
+    ) -> None:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None or binding.state != "RUNNING":
+            raise RuntimeError("agent session is not running")
+        binding.driver.submit_effort_selection(
+            AgentEffortSelection(
+                access_point=(access_point.chat_id, access_point.thread_id),
+                selected_effort=effort,
+            )
+        )
+
+    def poll_once(
+        self,
+        *,
+        idle_poll_blocked_resources: frozenset[object] = frozenset(),
+    ) -> list[StewardDriverEvent]:
         self._poll_progressed = False
         out: list[StewardDriverEvent] = []
         for access_point, binding in self._ordered_bindings_for_poll():
             driver = binding.driver
             if driver is None:
                 continue
-            if binding.state == "STARTING" and self._startup_timed_out(binding):
-                event = self._fail_startup(
-                    access_point=access_point,
-                    binding=binding,
-                    driver=driver,
-                    error=f"startup timeout after {self._startup_timeout_sec:g}s",
-                )
-                if event is not None:
-                    out.append(event)
-                    self._poll_progressed = True
-                continue
-            has_active_turn = getattr(driver, "has_active_turn", None)
-            had_active_turn = bool(has_active_turn()) if callable(has_active_turn) else False
-            pending_request_count = getattr(driver, "pending_request_count", None)
-            pending_requests_before_poll = (
-                int(pending_request_count()) if callable(pending_request_count) else None
+            had_active_turn = driver.has_active_turn()
+            active_turn_ref = (
+                binding.effective.turn_ref
+                if had_active_turn and binding.effective is not None
+                else None
             )
+            if had_active_turn and active_turn_ref is None:
+                self._logger.event(
+                    "runtime_agent_active_turn_uncorrelated",
+                    access_point_type=access_point.type,
+                    chat_id=access_point.chat_id,
+                    thread_id=access_point.thread_id,
+                    agent_id=binding.node_id,
+                )
+            if (
+                access_point in idle_poll_blocked_resources
+                and binding.state == "RUNNING"
+                and driver.is_ready()
+                and not had_active_turn
+            ):
+                continue
             try:
                 events = driver.poll_once()
+                driver.acknowledge_event_handoff()
             except Exception as exc:
                 if binding.state == "STARTING":
                     event = self._fail_startup(
@@ -1150,25 +1878,38 @@ class InteractiveAgentRuntime:
                         driver=driver,
                         error=str(exc),
                         had_active_turn=had_active_turn,
+                        active_turn_ref=active_turn_ref,
                         emitted_events=[],
                     )
                 )
                 self._poll_progressed = True
                 continue
-            consume_progress = getattr(driver, "consume_poll_progress", None)
-            if callable(consume_progress) and consume_progress():
+            if driver.consume_poll_progress():
                 self._poll_progressed = True
-            has_active_turn_after_poll = bool(has_active_turn()) if callable(has_active_turn) else False
-            if pending_requests_before_poll is not None and callable(pending_request_count):
-                consumed_requests = max(
-                    0,
-                    pending_requests_before_poll - int(pending_request_count()),
-                )
-            else:
-                consumed_requests = int(not had_active_turn and has_active_turn_after_poll)
-            if consumed_requests:
-                del binding.pending_request_sequences[:consumed_requests]
             for event in events:
+                if isinstance(event, InteractiveModelApplyResult):
+                    if event.result == "requested":
+                        binding.configured = replace(
+                            binding.configured,
+                            model=event.requested_model,
+                        )
+                        self._metadata_changes.add(access_point)
+                if isinstance(event, InteractiveEffortApplyResult):
+                    self._logger.event(
+                        "agent_effort_apply_result",
+                        access_point_type=access_point.type,
+                        chat_id=access_point.chat_id,
+                        thread_id=access_point.thread_id,
+                        requested_effort=event.requested_effort,
+                        actual_effort=event.actual_effort,
+                        result=event.result,
+                    )
+                if (
+                    isinstance(event, InteractiveApprovalPromptEvent)
+                    and binding.effective is not None
+                    and event.request.turn_ref == binding.effective.turn_ref
+                ):
+                    binding.effective.approval_ref = event.request.approval_ref
                 self._logger.event(
                     "runtime_agent_driver_event",
                     access_point_type=access_point.type,
@@ -1179,8 +1920,33 @@ class InteractiveAgentRuntime:
                     event_type=type(event).__name__,
                 )
                 out.append(StewardDriverEvent(access_point=access_point, source="agent", event=event))
-            terminal_error_getter = getattr(driver, "get_terminal_error", None)
-            terminal_error = str(terminal_error_getter() or "") if callable(terminal_error_getter) else ""
+                if (
+                    isinstance(event, (InteractiveAgentResult, InteractiveInterruptResult))
+                    and binding.effective is not None
+                ):
+                    if binding.effective.turn_ref == event.turn_ref:
+                        binding.effective.turn_ref = None
+                        binding.effective.approval_ref = None
+                    else:
+                        self._logger.event(
+                            "runtime_agent_stale_terminal_state_ignored",
+                            access_point_type=access_point.type,
+                            chat_id=access_point.chat_id,
+                            thread_id=access_point.thread_id,
+                            agent_id=binding.node_id,
+                            runtime_generation=event.turn_ref.runtime_generation.value,
+                            turn_ref_sequence=event.turn_ref.sequence,
+                        )
+            if (
+                binding.state == "RUNNING"
+                and binding.effective is not None
+                and any(isinstance(event, InteractiveAgentResult) for event in events)
+            ):
+                session = driver.get_local_projection().session
+                if session.availability is SnapshotAvailability.AVAILABLE:
+                    binding.effective.model = session.model.strip()
+                    binding.effective.backend = session.backend.strip()
+            terminal_error = str(driver.get_terminal_error() or "")
             if binding.state == "RUNNING" and terminal_error:
                 out.extend(
                     self._fail_running_runtime(
@@ -1189,6 +1955,7 @@ class InteractiveAgentRuntime:
                         driver=driver,
                         error=terminal_error,
                         had_active_turn=had_active_turn,
+                        active_turn_ref=active_turn_ref,
                         emitted_events=events,
                     )
                 )
@@ -1196,23 +1963,75 @@ class InteractiveAgentRuntime:
                 continue
             if binding.state == "STARTING" and driver.is_ready():
                 persisted_metadata_changed = False
-                actual_model = driver.get_actual_thread_model().strip()
-                if actual_model and actual_model != binding.effective_model:
-                    binding.effective_model = actual_model
-                if actual_model and binding.model and actual_model != binding.model:
-                    binding.model = actual_model
-                    binding.spec["model"] = actual_model
+                capabilities = driver.get_capability_snapshot()
+                observed_components = (
+                    capabilities.adapter.name,
+                    capabilities.adapter.version,
+                    capabilities.runtime.name,
+                    capabilities.runtime.version,
+                )
+                configured_components = (
+                    binding.adapter_name,
+                    binding.adapter_version,
+                    binding.runtime_name,
+                    binding.runtime_version,
+                )
+                if observed_components != configured_components:
+                    (
+                        binding.adapter_name,
+                        binding.adapter_version,
+                        binding.runtime_name,
+                        binding.runtime_version,
+                    ) = observed_components
                     persisted_metadata_changed = True
-                actual_thread_id = driver.get_thread_id().strip()
-                if actual_thread_id and actual_thread_id != binding.thread_id:
-                    binding.thread_id = actual_thread_id
-                    binding.spec["thread_id"] = actual_thread_id
+                session = driver.get_local_projection().session
+                actual_model = session.model.strip()
+                if binding.effective is None:
+                    raise AssertionError("starting binding must have a runtime generation")
+                binding.effective.model = actual_model
+                binding.effective.backend = session.backend.strip()
+                actual_session = session.session_ref
+                if (
+                    actual_session is not None
+                    and actual_session.execution_profile
+                    != ProviderExecutionProfile(binding.provider, binding.profile)
+                ):
+                    raise RuntimeError(
+                        "started provider session does not match configured provider profile"
+                    )
+                startup_claims = set(self._binding_session_claims(binding))
+                if actual_session is not None:
+                    startup_claims.add(actual_session)
+                try:
+                    self._session_ownership.replace_claims(
+                        access_point,
+                        set(
+                            self._session_claims_with_pending_cleanup(
+                                access_point,
+                                binding=binding,
+                            )
+                        )
+                        | startup_claims,
+                    )
+                except ProviderSessionBoundElsewhereError as exc:
+                    event = self._fail_startup(
+                        access_point=access_point,
+                        binding=binding,
+                        driver=driver,
+                        error=str(exc),
+                    )
+                    if event is not None:
+                        out.append(event)
+                        self._poll_progressed = True
+                    continue
+                binding.effective.session = actual_session
+                if actual_session is not None and actual_session != binding.session:
+                    binding.session = actual_session
                     persisted_metadata_changed = True
                 binding.state = "RUNNING"
                 binding.runtime_intent = RUNTIME_INTENT_RUNNING
-                binding.startup_started_at = None
-                binding.startup_deadline = None
                 binding.rollback_binding = None
+                self._sync_session_claims(access_point, binding=binding)
                 if persisted_metadata_changed:
                     self._metadata_changes.add(access_point)
                 if not binding.startup_logged:
@@ -1226,8 +2045,12 @@ class InteractiveAgentRuntime:
                         runtime_thread_id=binding.thread_id,
                         requested_thread_id=binding.requested_thread_id,
                         mode=binding.mode,
+                        provider=binding.provider.value,
+                        profile=binding.profile.value,
                         configured_model=binding.model,
+                        configured_backend=binding.backend,
                         effective_model=binding.effective_model,
+                        effective_backend=binding.effective_backend,
                         cwd=binding.cwd,
                     )
                     binding.startup_logged = True
@@ -1250,41 +2073,28 @@ class InteractiveAgentRuntime:
                     node_id=binding.node_id,
                     runtime_thread_id=binding.thread_id,
                     configured_model=binding.model,
+                    provider=binding.provider.value,
+                    profile=binding.profile.value,
+                    configured_backend=binding.backend,
                     effective_model=binding.effective_model,
-                    startup_generation=binding.startup_generation,
+                    effective_backend=binding.effective_backend,
+                    runtime_generation=binding.runtime_generation.value,
                 )
                 self._poll_progressed = True
         return out
 
     def _ordered_bindings_for_poll(self) -> list[tuple[AccessPointKey, _InteractiveAgentBinding]]:
-        bindings = list(self._binding_by_access_point.items())
-        eligible_indices: list[int] = []
-        eligible_bindings: list[tuple[AccessPointKey, _InteractiveAgentBinding]] = []
-        for index, item in enumerate(bindings):
-            _access_point, binding = item
-            driver = binding.driver
-            has_active_turn = getattr(driver, "has_active_turn", None) if driver is not None else None
-            if (
-                binding.state == "RUNNING"
-                and callable(has_active_turn)
-                and not has_active_turn()
-                and binding.pending_request_sequences
-            ):
-                eligible_indices.append(index)
-                eligible_bindings.append(item)
-        eligible_bindings.sort(key=lambda item: item[1].pending_request_sequences[0])
-        for index, item in zip(eligible_indices, eligible_bindings):
-            bindings[index] = item
-        return bindings
+        return list(self._binding_by_access_point.items())
 
     def _fail_running_runtime(
         self,
         *,
         access_point: AccessPointKey,
         binding: _InteractiveAgentBinding,
-        driver: InteractiveCodexDriver,
+        driver: AgentDeliveryDriverPort,
         error: str,
         had_active_turn: bool,
+        active_turn_ref: TurnRef | None,
         emitted_events: list[Any],
     ) -> list[StewardDriverEvent]:
         current = self._binding_by_access_point.get(access_point)
@@ -1294,22 +2104,31 @@ class InteractiveAgentRuntime:
         out: list[StewardDriverEvent] = []
         has_turn_failure = any(
             isinstance(event, InteractiveAgentResult)
-            and str(event.reply or "").startswith("agent error: ")
+            and event.failed
+            and event.turn_ref == active_turn_ref
             for event in emitted_events
         )
-        if had_active_turn and not has_turn_failure:
+        if had_active_turn and active_turn_ref is not None and not has_turn_failure:
             out.append(
                 StewardDriverEvent(
                     access_point=access_point,
                     source="agent",
-                    event=InteractiveAgentResult(
+                    event=InteractiveAgentResult.failed_result(
                         chat_id=access_point.chat_id,
                         thread_id=access_point.thread_id,
-                        prompt="",
-                        reply=f"agent error: {failure}",
+                        agent_input=AgentInput(
+                            text="",
+                            origin=AgentInputOrigin.CONTROL,
+                            verbatim=True,
+                        ),
+                        error=failure,
+                        turn_ref=active_turn_ref,
                     ),
                 )
             )
+        resume_supported = driver.get_capability_snapshot().supports(
+            AgentCapability.RESUME_SESSION
+        )
         failed_binding, cleanup_error = self._transition_to_bound_idle(
             access_point=access_point,
             binding=binding,
@@ -1317,6 +2136,11 @@ class InteractiveAgentRuntime:
             use_startup_rollback=False,
             cleanup_event="access_point_agent_runtime_cleanup_failed",
         )
+        if not resume_supported:
+            failed_binding.session = None
+            failed_binding.requested_session = None
+            self._sync_session_claims(access_point, binding=failed_binding)
+            self._metadata_changes.add(access_point)
         if cleanup_error:
             failure = f"{failure}; cleanup failed: {cleanup_error}"
         self._logger.event(
@@ -1340,17 +2164,12 @@ class InteractiveAgentRuntime:
         )
         return out
 
-    @staticmethod
-    def _startup_timed_out(binding: _InteractiveAgentBinding) -> bool:
-        deadline = binding.startup_deadline
-        return deadline is not None and clock.monotonic() >= deadline
-
     def _fail_startup(
         self,
         *,
         access_point: AccessPointKey,
         binding: _InteractiveAgentBinding,
-        driver: InteractiveCodexDriver,
+        driver: AgentDeliveryDriverPort,
         error: str,
     ) -> StewardDriverEvent | None:
         current = self._binding_by_access_point.get(access_point)
@@ -1360,11 +2179,20 @@ class InteractiveAgentRuntime:
                 access_point_type=access_point.type,
                 chat_id=access_point.chat_id,
                 thread_id=access_point.thread_id,
-                startup_generation=binding.startup_generation,
+                runtime_generation=(
+                    binding.runtime_generation.value
+                    if binding.runtime_generation is not None
+                    else ""
+                ),
                 error=str(error),
             )
             return None
 
+        runtime_generation = (
+            binding.runtime_generation.value
+            if binding.runtime_generation is not None
+            else ""
+        )
         failed_binding, stop_error = self._transition_to_bound_idle(
             access_point=access_point,
             binding=binding,
@@ -1381,7 +2209,7 @@ class InteractiveAgentRuntime:
             chat_id=access_point.chat_id,
             thread_id=access_point.thread_id,
             node_id=failed_binding.node_id,
-            startup_generation=binding.startup_generation,
+            runtime_generation=runtime_generation,
             state="BOUND_IDLE",
             error=failure,
         )
@@ -1400,35 +2228,44 @@ class InteractiveAgentRuntime:
         *,
         access_point: AccessPointKey,
         binding: _InteractiveAgentBinding,
-        driver: InteractiveCodexDriver,
+        driver: AgentDeliveryDriverPort,
         use_startup_rollback: bool,
         cleanup_event: str,
     ) -> tuple[_InteractiveAgentBinding, str]:
-        binding.pending_request_sequences.clear()
+        runtime_generation = (
+            binding.runtime_generation.value
+            if binding.runtime_generation is not None
+            else ""
+        )
         rollback = binding.rollback_binding if use_startup_rollback else None
+        self._retain_pending_driver_cleanup(
+            access_point=access_point,
+            binding=binding,
+            driver=driver,
+        )
         if rollback is not None:
-            self._binding_by_access_point[access_point] = rollback
+            self._replace_binding(access_point, rollback)
             idle_binding = rollback
         else:
             binding.driver = None
             binding.state = "BOUND_IDLE"
-            binding.effective_model = ""
-            binding.startup_started_at = None
-            binding.startup_deadline = None
+            binding.effective = None
+            binding.turn_sequence = 0
             binding.rollback_binding = None
+            self._replace_binding(access_point, binding)
             idle_binding = binding
         idle_binding.runtime_intent = RUNTIME_INTENT_BOUND_IDLE
         cleanup_error = ""
         try:
-            driver.stop()
-        except Exception as exc:
+            self._cleanup_pending_drivers(node_id=binding.node_id)
+        except CleanupError as exc:
             cleanup_error = str(exc)
             self._logger.event(
                 cleanup_event,
                 access_point_type=access_point.type,
                 chat_id=access_point.chat_id,
                 thread_id=access_point.thread_id,
-                startup_generation=binding.startup_generation,
+                runtime_generation=runtime_generation,
                 error=cleanup_error,
                 error_type=type(exc).__name__,
             )
@@ -1447,8 +2284,13 @@ class InteractiveAgentRuntime:
             state=binding.state,
             error=error,
             cwd=binding.cwd,
+            provider=binding.provider.value,
+            profile=binding.profile.value,
+            **_binding_component_fields(binding),
             configured_model=binding.model,
+            configured_backend=binding.backend,
             effective_model=binding.effective_model,
+            effective_backend=binding.effective_backend,
             mode=binding.mode,
             thread_id=binding.thread_id,
             thread_name=binding.thread_name,
@@ -1480,34 +2322,21 @@ class InteractiveAgentRuntime:
             {
                 "role": "agent",
                 "agent_id": binding.node_id,
+                "provider": binding.provider.value,
+                "profile": binding.profile.value,
+                **_binding_component_fields(binding),
                 "state": state,
                 "controllable": state in {"STARTING", "RUNNING"},
                 "cwd": binding.cwd,
                 "model": binding.model,
                 "configured_model": binding.model,
                 "effective_model": binding.effective_model,
+                "configured_backend": binding.backend,
+                "effective_backend": binding.effective_backend,
                 "mode": binding.mode,
                 "thread_id": binding.thread_id,
             }
         ]
-
-    def get_item_status_snapshot(self, access_point: AccessPointKey) -> list[dict[str, str]]:
-        binding = self._binding_by_access_point.get(access_point)
-        if binding is None or binding.driver is None:
-            return []
-        return binding.driver.get_item_status_snapshot()
-
-    def get_item_status_snapshot_for_turn(self, access_point: AccessPointKey, turn_id: str) -> list[dict[str, str]]:
-        binding = self._binding_by_access_point.get(access_point)
-        if binding is None or binding.driver is None:
-            return []
-        return binding.driver.get_item_status_snapshot_for_turn(turn_id)
-
-    def get_last_item_apply_info(self, access_point: AccessPointKey) -> dict | None:
-        binding = self._binding_by_access_point.get(access_point)
-        if binding is None or binding.driver is None:
-            return None
-        return binding.driver.get_last_item_apply_info()
 
     def has_active_turn(self, access_point: AccessPointKey) -> bool:
         binding = self._binding_by_access_point.get(access_point)
@@ -1521,57 +2350,147 @@ class InteractiveAgentRuntime:
             raise RuntimeError("no running agent is bound to this access point")
         binding.driver.interrupt_active_turn()
 
-    def get_thread_metadata(self, access_point: AccessPointKey) -> dict[str, Any]:
+    def get_capability_snapshot(
+        self,
+        access_point: AccessPointKey,
+    ) -> AgentCapabilitySnapshot | None:
         binding = self._binding_by_access_point.get(access_point)
-        if binding is None or binding.driver is None:
-            return {}
-        getter = getattr(binding.driver, "get_thread_metadata", None)
-        if not callable(getter):
-            return {}
-        raw = getter()
-        return dict(raw) if isinstance(raw, dict) else {}
+        if binding is None:
+            return None
+        if binding.driver is not None:
+            return binding.driver.get_capability_snapshot()
+        if binding.provider != ProviderKind.CODEX:
+            return None
+        return codex_capability_snapshot(backend_name=binding.backend or "unknown")
 
-    def get_context_usage(self, access_point: AccessPointKey) -> dict[str, object]:
+    def get_local_projection(self, access_point: AccessPointKey) -> AgentRuntimeProjection:
         binding = self._binding_by_access_point.get(access_point)
-        if binding is None or binding.driver is None:
-            return {}
-        getter = getattr(binding.driver, "get_context_usage", None)
-        raw = getter() if callable(getter) else {}
-        return dict(raw) if isinstance(raw, dict) else {}
+        if binding is None:
+            return unavailable_projection()
+        if binding.driver is not None:
+            return binding.driver.get_local_projection()
+        availability = (
+            SnapshotAvailability.UNKNOWN
+            if binding.provider == ProviderKind.CODEX
+            else SnapshotAvailability.UNSUPPORTED
+        )
+        capabilities = (
+            codex_capability_snapshot(backend_name=binding.backend or "unknown")
+            if binding.provider == ProviderKind.CODEX
+            else None
+        )
+        return AgentRuntimeProjection(
+            capabilities=capabilities,
+            session=AgentSessionSnapshot(
+                availability,
+                session_ref=binding.session,
+                name=binding.thread_name,
+                model=binding.model,
+                backend=binding.backend,
+            ),
+            work=AgentWorkSnapshot(availability),
+            context=AgentContextSnapshot(
+                SnapshotAvailability.UNKNOWN
+                if binding.provider == ProviderKind.CODEX
+                else SnapshotAvailability.UNSUPPORTED
+            ),
+            background=AgentBackgroundSnapshot(SnapshotAvailability.UNSUPPORTED),
+        )
+
+    def request_inspection(
+        self,
+        access_point: AccessPointKey,
+        inspection_ref: InspectionRef,
+        timeout_sec: float,
+    ) -> AgentEffectResult:
+        binding = self._binding_by_access_point.get(access_point)
+        if binding is None or binding.driver is None or binding.state != "RUNNING":
+            return AgentEffectResult.rejected("agent session is not running")
+        return binding.driver.request_inspection(
+            inspection_ref,
+            timeout_sec,
+            (access_point.chat_id, access_point.thread_id),
+        )
 
     def close(self) -> None:
-        bindings = list(self._binding_by_access_point.values())
-        self._binding_by_access_point.clear()
-        self._metadata_changes.clear()
-        for binding in bindings:
-            if binding.driver is not None:
-                binding.driver.stop()
+        steps: list[CleanupStep] = []
+        for access_point, binding in list(self._binding_by_access_point.items()):
+            driver = binding.driver
+            if driver is None:
+                self._remove_binding(access_point)
+                continue
 
-    def _build_driver(self, *, access_point: AccessPointKey, spec: dict[str, Any]) -> InteractiveCodexDriver:
-        if self._driver_factory is not None:
-            return self._driver_factory(access_point, spec, self._logger)
+            def release_binding(
+                access_point: AccessPointKey = access_point,
+                binding: _InteractiveAgentBinding = binding,
+            ) -> None:
+                if self._binding_by_access_point.get(access_point) is binding:
+                    self._remove_binding(access_point)
 
-        command = list(self._agent_command)
-        raw_args = spec.get("args") or []
-        if isinstance(raw_args, list):
-            command.extend(str(item) for item in raw_args)
-        model = str(spec.get("model") or "").strip()
-        thread_approval_policy = str(spec.get("approval_policy") or self._default_thread_approval_policy)
-        thread_sandbox = str(spec.get("sandbox") or self._default_thread_sandbox)
-        return CodexInteractiveDriver(
-            command=command,
-            logger=self._logger,
-            request_timeout_sec=self._request_timeout_sec,
-            rpc_timeout_sec=self._rpc_timeout_sec,
-            rpc_retries=self._rpc_retries,
-            approval_policy=self._approval_policy,
-            thread_approval_policy=thread_approval_policy,
-            thread_sandbox=thread_sandbox,
-            resume_thread_id=(str(spec.get("thread_id") or "").strip() or None),
-            working_dir=str(spec.get("cwd") or ""),
-            initial_model=model or None,
-            client_factory=self._client_factory,
-            edge_thread_name=self._edge_thread_name,
+            steps.append(
+                CleanupStep(
+                    owner=f"runtime agent driver {binding.node_id}",
+                    cleanup=driver.stop,
+                    release=release_binding,
+                )
+            )
+        steps.extend(self._pending_driver_cleanup_steps())
+        cleanup_owned_resources(steps)
+        self._restore_conflict_by_access_point.clear()
+
+    def _build_driver(
+        self,
+        *,
+        access_point: AccessPointKey,
+        spec: dict[str, Any],
+    ) -> AgentDeliveryDriverPort:
+        return self._driver_factory(access_point, spec, self._logger)
+
+    def _pending_driver_cleanup_steps(
+        self,
+        *,
+        access_point: AccessPointKey | None = None,
+        node_id: str | None = None,
+    ) -> list[CleanupStep]:
+        steps: list[CleanupStep] = []
+        for pending_node_id, pending in list(self._pending_driver_cleanup.items()):
+            pending_access_point = pending.access_point
+            driver = pending.driver
+            if access_point is not None and pending_access_point != access_point:
+                continue
+            if node_id is not None and pending_node_id != node_id:
+                continue
+
+            def release(
+                pending_node_id: str = pending_node_id,
+                pending_access_point: AccessPointKey = pending_access_point,
+                driver: AgentDeliveryDriverPort = driver,
+            ) -> None:
+                current = self._pending_driver_cleanup.get(pending_node_id)
+                if current is not None and current.driver is driver:
+                    self._pending_driver_cleanup.pop(pending_node_id, None)
+                    self._sync_session_claims(pending_access_point)
+
+            steps.append(
+                CleanupStep(
+                    owner=f"runtime startup driver {pending_node_id}",
+                    cleanup=driver.stop,
+                    release=release,
+                )
+            )
+        return steps
+
+    def _cleanup_pending_drivers(
+        self,
+        *,
+        access_point: AccessPointKey | None = None,
+        node_id: str | None = None,
+    ) -> None:
+        cleanup_owned_resources(
+            self._pending_driver_cleanup_steps(
+                access_point=access_point,
+                node_id=node_id,
+            )
         )
 
 
@@ -1582,11 +2501,31 @@ class StopStewardLoop(Exception):
         self.drain = drain
 
 
+STEWARD_SLOW_TICK_PHASE_WARNING_SEC = 1.0
+_STEWARD_TICK_DIAGNOSTIC_NAME_MAX_CHARS = 64
+
+
+@dataclass(frozen=True)
+class StewardTickDiagnosticContext:
+    operation: str
+    access_point: AccessPointKey | None = None
+
+    def __post_init__(self) -> None:
+        operation = str(self.operation).strip()
+        if not operation:
+            raise ValueError("Steward tick diagnostic operation must not be empty")
+        if len(operation) > _STEWARD_TICK_DIAGNOSTIC_NAME_MAX_CHARS:
+            raise ValueError("Steward tick diagnostic operation is too long")
+        object.__setattr__(self, "operation", operation)
+
+
 class StewardTickLoop:
+    _DRAIN_IDLE_TIMEOUT_SEC = 0.5
+    _DRAIN_WALL_TIMEOUT_SEC = 5.0
+
     def __init__(
         self,
         *,
-        request_timeout_sec: float,
         drain_driver_events: Callable[[], bool],
         tick_interactions: Callable[[], bool],
         flush_due_status_runtimes: Callable[[], bool],
@@ -1597,8 +2536,10 @@ class StewardTickLoop:
         drain_sleep_sec: float = 0.02,
         sleep_fn: Callable[[float], None] = time.sleep,
         wall_monotonic_now: Callable[[], float] = time.monotonic,
+        lifecycle_logger: LifecycleLogger | None = None,
+        phase_monotonic_now: Callable[[], float] = time.monotonic,
+        phase_context: Callable[[str], StewardTickDiagnosticContext | None] | None = None,
     ) -> None:
-        self._request_timeout_sec = request_timeout_sec
         self._drain_driver_events = drain_driver_events
         self._tick_interactions = tick_interactions
         self._flush_due_status_runtimes = flush_due_status_runtimes
@@ -1609,48 +2550,111 @@ class StewardTickLoop:
         self._drain_sleep_sec = drain_sleep_sec
         self._sleep_fn = sleep_fn
         self._wall_monotonic_now = wall_monotonic_now
+        self._lifecycle_logger = lifecycle_logger
+        self._phase_monotonic_now = phase_monotonic_now
+        self._phase_context = phase_context
 
     def tick_once(self) -> bool:
-        return self._run_phases(
-            (
-                self._consume_control_events,
-                self._flush_due_status_runtimes,
-                self._drain_driver_events,
-                self._tick_interactions,
-                self._flush_due_status_runtimes,
-                self._consume_transport,
-                self._drain_pending_inputs,
-                self._flush_due_status_runtimes,
-            )
-        )
+        return self._run_phases(self._phase_plan(consume_transport=True))
 
     def tick_without_transport(self) -> bool:
-        return self._run_phases(
+        return self._run_phases(self._phase_plan(consume_transport=False))
+
+    def _phase_plan(
+        self,
+        *,
+        consume_transport: bool,
+    ) -> tuple[tuple[str, Callable[[], bool]], ...]:
+        phases: list[tuple[str, Callable[[], bool]]] = [
+            ("consume_control_events", self._consume_control_events),
+            ("flush_status_before_drivers", self._flush_due_status_runtimes),
+            ("drain_driver_events", self._drain_driver_events),
+            ("tick_interactions", self._tick_interactions),
             (
-                self._consume_control_events,
+                "flush_status_before_transport"
+                if consume_transport
+                else "flush_status_before_inputs",
                 self._flush_due_status_runtimes,
-                self._drain_driver_events,
-                self._tick_interactions,
-                self._flush_due_status_runtimes,
-                self._drain_pending_inputs,
-                self._flush_due_status_runtimes,
+            ),
+        ]
+        if consume_transport:
+            phases.append(("consume_transport", self._consume_transport))
+        phases.extend(
+            (
+                ("drain_pending_inputs", self._drain_pending_inputs),
+                ("flush_status_after_inputs", self._flush_due_status_runtimes),
             )
         )
+        return tuple(phases)
 
-    @staticmethod
-    def _run_phases(phases: tuple[Callable[[], bool], ...]) -> bool:
+    def _run_phases(
+        self,
+        phases: tuple[tuple[str, Callable[[], bool]], ...],
+    ) -> bool:
         progressed = False
-        for phase in phases:
-            progressed = phase() or progressed
+        for phase_name, phase in phases:
+            progressed = self._run_phase(phase_name, phase) or progressed
         return progressed
 
+    def _run_phase(self, phase_name: str, phase: Callable[[], bool]) -> bool:
+        logger = self._lifecycle_logger
+        if logger is None:
+            return phase()
+
+        context: StewardTickDiagnosticContext | None = None
+        if self._phase_context is not None:
+            try:
+                candidate = self._phase_context(phase_name)
+                if isinstance(candidate, StewardTickDiagnosticContext):
+                    context = candidate
+            except Exception:
+                context = None
+
+        try:
+            started_at = float(self._phase_monotonic_now())
+        except Exception:
+            return phase()
+
+        result = phase()
+
+        try:
+            duration_sec = max(
+                0.0,
+                float(self._phase_monotonic_now()) - started_at,
+            )
+        except Exception:
+            return result
+        if duration_sec <= STEWARD_SLOW_TICK_PHASE_WARNING_SEC:
+            return result
+
+        fields: dict[str, object] = {
+            "phase": phase_name[:_STEWARD_TICK_DIAGNOSTIC_NAME_MAX_CHARS],
+            "duration_ms": round(duration_sec * 1000.0, 3),
+        }
+        if context is not None:
+            fields["operation"] = context.operation
+            if context.access_point is not None:
+                fields.update(
+                    {
+                        "access_point_type": context.access_point.type,
+                        "chat_id": context.access_point.chat_id,
+                        "thread_id": context.access_point.thread_id,
+                    }
+                )
+        try:
+            logger.event("steward_slow_tick_phase", **fields)
+        except Exception:
+            pass
+        return result
+
     def drain_until_idle(self, *, consume_transport: bool = True) -> int:
-        idle_timeout_sec = max(0.5, float(self._request_timeout_sec) + 0.5)
+        idle_timeout_sec = self._DRAIN_IDLE_TIMEOUT_SEC
         idle_deadline = clock.monotonic() + idle_timeout_sec
-        wall_idle_deadline = self._wall_monotonic_now() + idle_timeout_sec
+        # Productive ticks extend inactivity, but cannot turn shutdown drain into a livelock.
+        wall_deadline = self._wall_monotonic_now() + self._DRAIN_WALL_TIMEOUT_SEC
         while (
             clock.monotonic() < idle_deadline
-            and self._wall_monotonic_now() < wall_idle_deadline
+            and self._wall_monotonic_now() < wall_deadline
         ):
             try:
                 progressed = self.tick_once() if consume_transport else self.tick_without_transport()
@@ -1660,6 +2664,5 @@ class StewardTickLoop:
                 return 0
             if progressed:
                 idle_deadline = clock.monotonic() + idle_timeout_sec
-                wall_idle_deadline = self._wall_monotonic_now() + idle_timeout_sec
             self._sleep_fn(self._drain_sleep_sec)
         return 0

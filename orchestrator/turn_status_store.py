@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
-
-from orchestrator.protocol_status import (
-    ProtocolItemTracker,
-    format_item_status_lines,
-    format_protocol_status,
-    should_emit_status_method,
-)
+from orchestrator.access_point_common import AccessPointId
+from orchestrator.agent_identity import TurnRef, WorkStatusRef
+from orchestrator.agent_inspection import AgentWorkSnapshot
+from orchestrator.agent_session import WorkStatusKind
+from orchestrator.interactive_driver_events import StatusStreamKey, StatusStreamKind
+from orchestrator.protocol_status import format_item_status_lines
 from orchestrator.status_output_runtime import StatusOutputRuntime
-
-
-def should_suppress_status_apply_info(info: dict[str, Any]) -> bool:
-    return _is_ignored_forgotten_turn_event(info=info) or _is_frozen_late_update(
-        info=info,
-        editable_turn_window=5,
-    )
 
 
 class TurnStatusStore:
@@ -27,29 +18,37 @@ class TurnStatusStore:
         self,
         *,
         output_runtime: StatusOutputRuntime,
+        access_point: tuple[AccessPointId, AccessPointId | None],
+        semantic_source: str,
         max_tracked_turns: int = 5,
     ) -> None:
         self._output_runtime = output_runtime
+        self._access_point = access_point
+        if not isinstance(semantic_source, str) or not semantic_source.strip():
+            raise ValueError("turn status store requires semantic source")
+        self._semantic_source = semantic_source.strip()
         self._max_tracked_turns = max(1, int(max_tracked_turns))
-        self._tracker = ProtocolItemTracker(max_tracked_turns=self._max_tracked_turns)
-        self._editable_turn_window = self._max_tracked_turns
-        self._seen_turn_started = False
+        self._tracked_turn_ids: list[str] = []
         self._active_turn_id: str | None = None
         self._active_aux_segment = 0
         self._active_segment_by_turn: dict[str, int] = {}
         self._item_segment_by_turn: dict[str, dict[str, int]] = {}
         self._meta_lines_by_status_key: dict[str, list[str]] = {}
-        self._suppressed_segments_by_turn: dict[str, set[int]] = {}
+        self._turn_started_meta_by_status_key: dict[str, str] = {}
+        self._preserved_snapshot_by_stream: dict[
+            StatusStreamKey,
+            tuple[str, list[dict[str, str]], WorkStatusKind],
+        ] = {}
 
     def clear(self, *, clear_output: bool = True) -> None:
-        self._tracker.clear()
-        self._seen_turn_started = False
+        self._tracked_turn_ids.clear()
         self._active_turn_id = None
         self._active_aux_segment = 0
         self._active_segment_by_turn.clear()
         self._item_segment_by_turn.clear()
         self._meta_lines_by_status_key.clear()
-        self._suppressed_segments_by_turn.clear()
+        self._turn_started_meta_by_status_key.clear()
+        self._preserved_snapshot_by_stream.clear()
         if clear_output:
             self._output_runtime.clear_status()
 
@@ -78,245 +77,204 @@ class TurnStatusStore:
             return f"turn:{normalized_turn_id}"
         return f"turn:{normalized_turn_id}:segment:{current_segment}"
 
-    def suppress_current_turn_segment(self) -> None:
-        turn_id = self._current_turn_id()
-        if not isinstance(turn_id, str) or not turn_id.strip():
-            return
-        normalized_turn_id = turn_id.strip()
-        current_segment = int(self._active_segment_by_turn.get(normalized_turn_id, 0))
-        self._suppressed_segments_by_turn.setdefault(normalized_turn_id, set()).add(current_segment)
-
-    def apply_protocol_event(self, *, method: str, params: dict[str, Any] | None) -> None:
-        normalized_params = params if isinstance(params, dict) else {}
-        changed_item_id = self._tracker.apply(method=method, params=normalized_params)
-        info = self._tracker.last_apply_info() or {}
-        self._forget_pruned_turns(info)
-        self._update_active_turn_from_info(info)
-        self._remember_segment_assignment(info=info, changed_item_id=changed_item_id)
-        if _is_turn_started_event(info=info, status_text=method):
-            self._seen_turn_started = True
-        elif _is_stale_pre_turn_item_event(
-            info=info,
-            status_text=method,
-            seen_turn_started=self._seen_turn_started,
-        ):
-            return
-        if _is_ignored_forgotten_turn_event(info=info):
-            return
-        turn_id = self._effective_turn_id(info=info, method=method, params=normalized_params)
-        status_key = self._status_key_for_target(turn_id=turn_id, info=info)
-        if turn_id:
-            if _is_frozen_late_update(info=info, editable_turn_window=self._editable_turn_window):
-                return
-            if self._is_suppressed_segment(turn_id=turn_id, info=info):
-                return
-            snapshot = self._tracker.snapshot_for_turn(turn_id)
-            if snapshot:
-                self._set_snapshot_for_status_key(
-                    status_key=status_key,
-                    snapshot=self._filter_snapshot_for_status_key(snapshot, status_key=status_key),
-                )
-                return
-        if not should_emit_status_method(method):
-            return
-        status_text = format_protocol_status(method=method, params=normalized_params)
-        if turn_id:
-            if _is_turn_started_event(info=info, status_text=method):
-                self._record_meta_line(status_key=status_key, status_text=status_text)
-                self._set_snapshot_for_status_key(
-                    status_key=status_key,
-                    fallback_lines=[status_text],
-                )
-                return
-            self._record_meta_line(status_key=status_key, status_text=status_text)
-            self._set_snapshot_for_status_key(
-                status_key=status_key,
-                fallback_lines=self._meta_lines_for_status_key(status_key),
-            )
-            return
-        self._record_meta_line(status_key=status_key, status_text=status_text)
-        self._set_snapshot_for_status_key(
-            status_key=status_key,
-            fallback_lines=self._meta_lines_for_status_key(status_key),
-        )
-
-    def apply_backend_status(
+    def apply_agent_status(
         self,
         *,
+        stream_key: StatusStreamKey,
         status_text: str,
-        snapshot_getter: Callable[[], list[dict[str, str]]],
-        snapshot_for_turn_getter: Callable[[str], list[dict[str, str]]] | None = None,
-        apply_info_getter: Callable[[], dict[str, Any] | None] | None = None,
+        kind: WorkStatusKind,
+        status_text_kind: WorkStatusKind | None = None,
+        work: AgentWorkSnapshot | None,
+        item_ref: str = "",
+        begins_turn: bool = False,
+        preserve_work_snapshot: bool = False,
     ) -> None:
-        if not should_emit_status_method(status_text):
-            return
-        apply_info = apply_info_getter() if callable(apply_info_getter) else None
-        info = apply_info if isinstance(apply_info, dict) else {}
-        self._forget_pruned_turns(info)
-        self._update_active_turn_from_info(info)
-        changed_item_id_raw = info.get("item_id")
-        changed_item_id = changed_item_id_raw.strip() if isinstance(changed_item_id_raw, str) else None
-        self._remember_segment_assignment(info=info, changed_item_id=changed_item_id)
-        if _is_turn_started_event(info=info, status_text=status_text):
-            self._seen_turn_started = True
-        elif _is_stale_pre_turn_item_event(
-            info=info,
-            status_text=status_text,
-            seen_turn_started=self._seen_turn_started,
-        ):
-            return
-        if _is_ignored_forgotten_turn_event(info=info):
-            return
-        turn_id = self._effective_turn_id(info=info, method=status_text, params=None)
-        status_key = self._status_key_for_target(turn_id=turn_id, info=info)
-        if turn_id:
-            if _is_frozen_late_update(info=info, editable_turn_window=self._editable_turn_window):
-                return
-            if self._is_suppressed_segment(turn_id=turn_id, info=info):
-                return
-            if callable(snapshot_for_turn_getter):
-                snapshot = list(snapshot_for_turn_getter(turn_id))
-            else:
-                snapshot = list(snapshot_getter())
-            if snapshot:
-                self._set_snapshot_for_status_key(
-                    status_key=status_key,
-                    snapshot=self._filter_snapshot_for_status_key(snapshot, status_key=status_key),
-                )
-                return
-            if _is_turn_started_event(info=info, status_text=status_text):
-                self._record_meta_line(status_key=status_key, status_text=status_text)
-                self._set_snapshot_for_status_key(
-                    status_key=status_key,
-                    fallback_lines=[status_text],
-                )
-                return
-            self._record_meta_line(status_key=status_key, status_text=status_text)
+        if stream_key.access_point != self._access_point:
+            raise ValueError("status stream access point does not match store")
+        if stream_key.semantic_source != self._semantic_source:
+            raise ValueError("status stream semantic source does not match store")
+        display_kind = status_text_kind or kind
+        turn_id = (
+            _work_status_id(stream_key.status_ref)
+            if stream_key.status_ref is not None
+            else _turn_ref_status_id(stream_key.turn_ref)
+        )
+        self._remember_turn(turn_id)
+        if kind is WorkStatusKind.TURN_COMPLETED and self._active_turn_id == turn_id:
+            self.split_current_turn()
+        self._update_active_turn(turn_id=turn_id, kind=kind, begins_turn=begins_turn)
+        self._remember_segment_assignment(
+            turn_id=turn_id,
+            kind=kind,
+            changed_item_id=item_ref or None,
+        )
+        status_key = (
+            self._aux_status_key(turn_id)
+            if stream_key.stream_kind is StatusStreamKind.AUXILIARY
+            else self._status_key_for_turn(
+                turn_id=turn_id,
+                kind=kind,
+                item_ref=item_ref,
+            )
+        )
+        preserved = self._preserved_snapshot_by_stream.get(stream_key)
+        if preserved is not None:
+            status_key = preserved[0]
+        raw_snapshot = _work_snapshot_rows(work)
+        snapshot = (
+            raw_snapshot
+            if preserved is not None
+            else self._filter_snapshot_for_status_key(
+                raw_snapshot,
+                status_key=status_key,
+            )
+        )
+        if preserved is not None and snapshot:
+            self._preserved_snapshot_by_stream[stream_key] = (
+                status_key,
+                [dict(item) for item in snapshot],
+                display_kind,
+            )
+        elif preserve_work_snapshot and snapshot:
+            self._preserved_snapshot_by_stream[stream_key] = (
+                status_key,
+                [dict(item) for item in snapshot],
+                display_kind,
+            )
+        elif not snapshot and preserved is not None:
+            status_key, snapshot, display_kind = preserved
+            snapshot = [dict(item) for item in snapshot]
+        if snapshot:
             self._set_snapshot_for_status_key(
                 status_key=status_key,
-                fallback_lines=self._meta_lines_for_status_key(status_key),
+                snapshot=snapshot,
+                status_text_kind=display_kind,
             )
+            if kind is WorkStatusKind.TURN_COMPLETED:
+                self._preserved_snapshot_by_stream.pop(stream_key, None)
             return
         self._record_meta_line(status_key=status_key, status_text=status_text)
+        if display_kind is WorkStatusKind.TURN_STARTED:
+            normalized_status_text = str(status_text or "").strip()
+            if normalized_status_text:
+                self._turn_started_meta_by_status_key[status_key] = normalized_status_text
         self._set_snapshot_for_status_key(
             status_key=status_key,
             fallback_lines=self._meta_lines_for_status_key(status_key),
+            status_text_kind=display_kind,
         )
 
     def _current_turn_id(self) -> str | None:
         if isinstance(self._active_turn_id, str) and self._active_turn_id.strip():
             return self._active_turn_id
-        return self._tracker.current_turn_id()
-
-    def _aux_status_key(self) -> str:
-        if self._active_aux_segment <= 0:
-            return "aux"
-        return f"aux:segment:{self._active_aux_segment}"
-
-    def _effective_turn_id(
-        self,
-        *,
-        info: dict[str, Any],
-        method: str,
-        params: dict[str, Any] | None,
-    ) -> str | None:
-        if _force_aux_status_event(method):
-            return None
-        resolved = _resolve_turn_id(info=info, status_text=method)
-        if resolved:
-            return resolved
-        direct = _direct_turn_id(params=params)
-        if direct:
-            return direct
-        current = self._current_turn_id()
-        if current:
-            return current
         return None
 
-    def _status_key_for_target(self, *, turn_id: str | None, info: dict[str, Any]) -> str:
-        resolved = self._status_key_for_turn(turn_id=turn_id, info=info)
-        if resolved:
-            return resolved
-        return self._aux_status_key()
+    def _aux_status_key(self, turn_id: str) -> str:
+        if self._active_aux_segment <= 0:
+            return f"aux:{turn_id}"
+        return f"aux:{turn_id}:segment:{self._active_aux_segment}"
 
-    def _update_active_turn_from_info(self, info: dict[str, Any]) -> None:
-        kind = str(info.get("kind") or "").strip()
-        if kind == "item_ignored_forgotten_turn":
-            return
-        turn_id_raw = info.get("turn_id")
-        turn_id = turn_id_raw.strip() if isinstance(turn_id_raw, str) else ""
-        if not turn_id:
-            return
-        if kind == "turn_started":
+    def _update_active_turn(
+        self,
+        *,
+        turn_id: str,
+        kind: WorkStatusKind,
+        begins_turn: bool,
+    ) -> None:
+        if kind is WorkStatusKind.TURN_STARTED or begins_turn:
             self._active_turn_id = turn_id
             self._active_segment_by_turn.setdefault(turn_id, 0)
             self._item_segment_by_turn.setdefault(turn_id, {})
-            return
-        if kind == "turn_completed":
+            if kind is WorkStatusKind.TURN_STARTED:
+                return
+        if kind is WorkStatusKind.TURN_COMPLETED:
             if self._active_turn_id == turn_id:
                 self._active_turn_id = None
             return
-        if kind == "item_changed" and self._active_turn_id is None:
-            turn_status = str(info.get("turn_status") or "").strip()
-            if turn_status == "in_progress" or bool(info.get("has_active_turn")):
-                self._active_turn_id = turn_id
+        if kind is WorkStatusKind.ITEM_CHANGED and self._active_turn_id is None:
+            self._active_turn_id = turn_id
 
-    def _forget_pruned_turns(self, info: dict[str, Any]) -> None:
-        forgotten_turn_ids = info.get("forgotten_turn_ids")
-        if not isinstance(forgotten_turn_ids, list):
+    def _remember_turn(self, turn_id: str) -> None:
+        if turn_id in self._tracked_turn_ids:
             return
-        for value in forgotten_turn_ids:
-            forgotten_turn = value.strip() if isinstance(value, str) else ""
-            if not forgotten_turn:
-                continue
+        self._tracked_turn_ids.append(turn_id)
+        while len(self._tracked_turn_ids) > self._max_tracked_turns:
+            forgotten_turn = self._tracked_turn_ids.pop(0)
             self._active_segment_by_turn.pop(forgotten_turn, None)
             self._item_segment_by_turn.pop(forgotten_turn, None)
-            self._suppressed_segments_by_turn.pop(forgotten_turn, None)
             if self._active_turn_id == forgotten_turn:
                 self._active_turn_id = None
-            prefix = f"turn:{forgotten_turn}"
+            prefixes = (f"turn:{forgotten_turn}", f"aux:{forgotten_turn}")
             stale_meta_keys = [
                 key
                 for key in self._meta_lines_by_status_key
-                if key == prefix or key.startswith(f"{prefix}:segment:")
+                if any(
+                    key == prefix or key.startswith(f"{prefix}:segment:")
+                    for prefix in prefixes
+                )
             ]
             for key in stale_meta_keys:
                 self._meta_lines_by_status_key.pop(key, None)
+                self._turn_started_meta_by_status_key.pop(key, None)
+            stale_streams = [
+                key
+                for key in self._preserved_snapshot_by_stream
+                if _status_stream_id(key) == forgotten_turn
+            ]
+            for key in stale_streams:
+                self._preserved_snapshot_by_stream.pop(key, None)
 
-    def _remember_segment_assignment(self, *, info: dict[str, Any], changed_item_id: str | None) -> None:
-        turn_id_raw = info.get("turn_id")
-        turn_id = turn_id_raw.strip() if isinstance(turn_id_raw, str) else ""
-        if not turn_id:
-            return
-        kind = str(info.get("kind") or "").strip()
-        if kind == "turn_started":
+    def _remember_segment_assignment(
+        self,
+        *,
+        turn_id: str,
+        kind: WorkStatusKind,
+        changed_item_id: str | None,
+    ) -> None:
+        if kind is WorkStatusKind.TURN_STARTED:
             self._active_segment_by_turn.setdefault(turn_id, 0)
             self._item_segment_by_turn.setdefault(turn_id, {})
             return
-        if kind != "item_changed" or not isinstance(changed_item_id, str) or not changed_item_id.strip():
+        if (
+            kind is not WorkStatusKind.ITEM_CHANGED
+            or not isinstance(changed_item_id, str)
+            or not changed_item_id.strip()
+        ):
             return
         item_id = changed_item_id.strip()
         item_segments = self._item_segment_by_turn.setdefault(turn_id, {})
         item_segments.setdefault(item_id, int(self._active_segment_by_turn.get(turn_id, 0)))
 
-    def _status_key_for_turn(self, *, turn_id: str | None, info: dict[str, Any]) -> str | None:
-        if not turn_id:
-            return None
-        segment = self._segment_index_for_turn(turn_id=turn_id, info=info)
+    def _status_key_for_turn(
+        self,
+        *,
+        turn_id: str,
+        kind: WorkStatusKind,
+        item_ref: str,
+    ) -> str:
+        segment = self._segment_index_for_turn(
+            turn_id=turn_id,
+            kind=kind,
+            item_ref=item_ref,
+        )
         if segment <= 0:
             return f"turn:{turn_id}"
         return f"turn:{turn_id}:segment:{segment}"
 
-    def _segment_index_for_turn(self, *, turn_id: str, info: dict[str, Any]) -> int:
-        kind = str(info.get("kind") or "").strip()
-        if kind == "item_changed":
-            item_id_raw = info.get("item_id")
-            item_id = item_id_raw.strip() if isinstance(item_id_raw, str) else ""
-            if item_id:
+    def _segment_index_for_turn(
+        self,
+        *,
+        turn_id: str,
+        kind: WorkStatusKind,
+        item_ref: str,
+    ) -> int:
+        if kind is WorkStatusKind.ITEM_CHANGED:
+            normalized_item_ref = str(item_ref or "").strip()
+            if normalized_item_ref:
                 item_segments = self._item_segment_by_turn.get(turn_id, {})
-                if item_id in item_segments:
+                if normalized_item_ref in item_segments:
                     try:
-                        return int(item_segments[item_id])
+                        return int(item_segments[normalized_item_ref])
                     except (TypeError, ValueError):
                         return 0
         try:
@@ -356,6 +314,19 @@ class TurnStatusStore:
             return []
         return list(self._meta_lines_by_status_key.get(status_key, []))
 
+    def _structured_meta_lines_for_status_key(self, status_key: str | None) -> list[str]:
+        lines = self._meta_lines_for_status_key(status_key)
+        if not isinstance(status_key, str):
+            return lines
+        turn_started = self._turn_started_meta_by_status_key.get(status_key)
+        if turn_started is None:
+            return lines
+        try:
+            lines.remove(turn_started)
+        except ValueError:
+            pass
+        return lines
+
     def _record_meta_line(self, *, status_key: str, status_text: str) -> None:
         text = str(status_text or "").strip()
         if not text:
@@ -367,6 +338,7 @@ class TurnStatusStore:
         while len(self._meta_lines_by_status_key) > self._max_tracked_turns:
             oldest_key = next(iter(self._meta_lines_by_status_key))
             self._meta_lines_by_status_key.pop(oldest_key, None)
+            self._turn_started_meta_by_status_key.pop(oldest_key, None)
 
     def _set_snapshot_for_status_key(
         self,
@@ -374,10 +346,9 @@ class TurnStatusStore:
         status_key: str | None,
         snapshot: list[dict[str, str]] | None = None,
         fallback_lines: list[str] | None = None,
+        status_text_kind: WorkStatusKind,
     ) -> None:
         meta_lines = self._meta_lines_for_status_key(status_key)
-        if snapshot:
-            meta_lines = [line for line in meta_lines if line != "turn/started"]
         structured_setter = getattr(self._output_runtime, "set_status_snapshot_structured", None)
         if (
             callable(structured_setter)
@@ -386,12 +357,22 @@ class TurnStatusStore:
         ):
             structured_setter(
                 status_key=status_key,
-                meta_lines=list(meta_lines),
+                meta_lines=(
+                    []
+                    if status_text_kind
+                    in {WorkStatusKind.TURN_STARTED, WorkStatusKind.TURN_COMPLETED}
+                    else self._structured_meta_lines_for_status_key(status_key)
+                ),
                 snapshot=list(snapshot or []),
             )
         else:
             lines: list[str] = []
-            lines.extend(meta_lines)
+            display_meta_lines = (
+                self._structured_meta_lines_for_status_key(status_key)
+                if snapshot
+                else meta_lines
+            )
+            lines.extend(display_meta_lines)
             if snapshot:
                 snapshot_text = format_item_status_lines(snapshot)
                 if snapshot_text.strip():
@@ -400,7 +381,7 @@ class TurnStatusStore:
                 filtered_fallback = [
                     line for line in fallback_lines if isinstance(line, str) and line.strip()
                 ]
-                if filtered_fallback != meta_lines:
+                if filtered_fallback != display_meta_lines:
                     lines.extend(filtered_fallback)
             deduped: list[str] = []
             for line in lines:
@@ -417,88 +398,29 @@ class TurnStatusStore:
                 in_progress=any(item.get("status") == "in_progress" for item in snapshot),
             )
 
-    def _is_suppressed_segment(self, *, turn_id: str, info: dict[str, Any]) -> bool:
-        suppressed = self._suppressed_segments_by_turn.get(turn_id)
-        if not suppressed:
-            return False
-        return self._segment_index_for_turn(turn_id=turn_id, info=info) in suppressed
+def _turn_ref_status_id(turn_ref: TurnRef) -> str:
+    return f"orc:{turn_ref.runtime_generation.value}:{turn_ref.sequence}"
 
 
-def _resolve_turn_id(*, info: dict[str, Any], status_text: str) -> str | None:
-    raw_turn_id = info.get("turn_id")
-    if not isinstance(raw_turn_id, str) or not raw_turn_id.strip():
-        return None
-    turn_id = raw_turn_id.strip()
-    kind = str(info.get("kind") or "").strip()
-    if kind == "item_changed":
-        return turn_id
-    if kind in ("turn_started", "turn_completed") and status_text in ("turn/started", "turn/completed"):
-        return turn_id
-    return None
+def _work_status_id(status_ref: WorkStatusRef) -> str:
+    return f"work:{status_ref.runtime_generation.value}:{status_ref.sequence}"
 
 
-def _is_frozen_late_update(*, info: dict[str, Any], editable_turn_window: int) -> bool:
-    kind = str(info.get("kind") or "").strip()
-    if kind != "item_changed":
-        return False
-    late_distance = info.get("late_distance")
-    if not isinstance(late_distance, int):
-        return False
-    return late_distance >= max(1, int(editable_turn_window))
+def _status_stream_id(stream_key: StatusStreamKey) -> str:
+    if stream_key.status_ref is not None:
+        return _work_status_id(stream_key.status_ref)
+    return _turn_ref_status_id(stream_key.turn_ref)
 
 
-def _is_turn_started_event(*, info: dict[str, Any], status_text: str) -> bool:
-    kind = str(info.get("kind") or "").strip()
-    return kind == "turn_started" and status_text == "turn/started"
-
-
-def _is_stale_pre_turn_item_event(
-    *,
-    info: dict[str, Any],
-    status_text: str,
-    seen_turn_started: bool,
-) -> bool:
-    if seen_turn_started:
-        return False
-    if str(info.get("kind") or "").strip() != "item_changed":
-        return False
-    return status_text.startswith("item/")
-
-
-def _is_ignored_forgotten_turn_event(*, info: dict[str, Any]) -> bool:
-    return str(info.get("kind") or "").strip() == "item_ignored_forgotten_turn"
-
-
-def _direct_turn_id(*, params: dict[str, Any] | None) -> str | None:
-    if not isinstance(params, dict):
-        return None
-    direct = params.get("turnId")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-    direct_snake = params.get("turn_id")
-    if isinstance(direct_snake, str) and direct_snake.strip():
-        return direct_snake.strip()
-    msg = params.get("msg")
-    if isinstance(msg, dict):
-        msg_turn_id = msg.get("turnId")
-        if isinstance(msg_turn_id, str) and msg_turn_id.strip():
-            return msg_turn_id.strip()
-        msg_turn_id_snake = msg.get("turn_id")
-        if isinstance(msg_turn_id_snake, str) and msg_turn_id_snake.strip():
-            return msg_turn_id_snake.strip()
-    return None
-
-
-def _force_aux_status_event(status_value: str) -> bool:
-    normalized = str(status_value or "").strip()
-    if normalized in {
-        "codex/event/task_started",
-        "codex/event/mcp_startup_update",
-        "codex/event/mcp_startup_complete",
-    }:
-        return True
-    return (
-        normalized.startswith("task started ")
-        or normalized.startswith("mcp startup:")
-        or normalized.startswith("mcp startup complete")
-    )
+def _work_snapshot_rows(work: AgentWorkSnapshot | None) -> list[dict[str, str]]:
+    if work is None:
+        return []
+    return [
+        {
+            "id": item.item_ref,
+            "type": item.kind,
+            "status": item.state,
+            "detail": "; ".join(item.details),
+        }
+        for item in work.items
+    ]

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from orchestrator.access_point_common import AccessPointKey
-from orchestrator.approval import ApprovalRequest
+from orchestrator.agent_catalog_interactions import CatalogOperationHandle
+from orchestrator.agent_session import AgentApprovalRequest
 from orchestrator.interactive_driver_events import InteractiveAgentResult, InteractiveStartupResult
 from orchestrator.interaction_queue import InteractionTickContext
 from orchestrator.steward_actions import (
+    ListResumableActionRequest,
     build_action_loop_terminal_prompt,
     build_action_result_prompt,
     build_steward_action_fingerprint,
@@ -22,12 +24,26 @@ class StewardConversationRuntime(Protocol):
     def steward_event(self, conversation: StewardConversation, name: str, **fields: Any) -> None: ...
     def steward_execute_actions(
         self, conversation: StewardConversation, actions: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]: ...
+    ) -> list[dict[str, Any]] | None: ...
     def steward_begin_startup_notice(
         self, conversation: StewardConversation, results: list[dict[str, Any]],
     ) -> None: ...
     def steward_submit_followup(self, conversation: StewardConversation, prompt: str) -> None: ...
     def steward_queue_reply(self, conversation: StewardConversation, text: str) -> None: ...
+    def steward_queue_failure(self, conversation: StewardConversation, error: str) -> None: ...
+
+
+class StewardActionInteractionRuntime(Protocol):
+    def steward_action_interaction_tick(
+        self,
+        interaction: StewardActionInteraction,
+    ) -> str | None: ...
+
+    def steward_action_interaction_completed(
+        self,
+        interaction: StewardActionInteraction,
+        outcome: str,
+    ) -> None: ...
 
 
 @dataclass(eq=False)
@@ -43,7 +59,9 @@ class StewardConversation:
     action_progress: list[dict[str, Any]] = field(default_factory=list)
     action_terminal_reason: str = ""
     interrupt_notice: PendingInterruptRequest | None = None
-    pending_approval_request: ApprovalRequest | None = None
+    pending_approval_request: AgentApprovalRequest | None = None
+    startup_completion_expected: bool = False
+    deferred_startup_result: InteractiveStartupResult | None = None
     finished: bool = False
 
     @property
@@ -51,7 +69,7 @@ class StewardConversation:
         return "steward"
 
     def handle_result(self, runtime: StewardConversationRuntime, result: InteractiveAgentResult) -> None:
-        plain_reply, actions = parse_steward_response(result.reply)
+        plain_reply, actions = parse_steward_response(result.require_output().text)
         if self.phase == "terminal_followup":
             if actions:
                 runtime.steward_event(
@@ -92,6 +110,22 @@ class StewardConversation:
         self.action_round = next_round
         self.last_action_fingerprint = fingerprint
         results = runtime.steward_execute_actions(self, actions)
+        if results is None:
+            self.phase = "waiting_action_results"
+            return
+        self.complete_action_collection(runtime, results)
+
+    def complete_action_collection(
+        self,
+        runtime: StewardConversationRuntime,
+        results: list[dict[str, Any]],
+    ) -> None:
+        if self.finished or self.phase not in {
+            "initial",
+            "action_followup",
+            "waiting_action_results",
+        }:
+            return
         if any(
             str(item.get("type") or "").strip().upper() in {"START_AGENT", "RESUME_AGENT"}
             and bool(item.get("ok")) for item in results
@@ -100,7 +134,42 @@ class StewardConversation:
             self.pending_action_results = results
             runtime.steward_begin_startup_notice(self, results)
             return
+        self.abandon_startup_completion()
         self._submit_followup(runtime, results)
+
+    def expect_startup_completion(self) -> None:
+        if not self.finished:
+            self.startup_completion_expected = True
+
+    def defer_startup_completion(self, result: InteractiveStartupResult) -> bool:
+        if (
+            self.finished
+            or not self.startup_completion_expected
+            or self.phase == "waiting_agent_startup"
+        ):
+            return False
+        if self.deferred_startup_result is not None:
+            raise RuntimeError(
+                "Steward startup completed more than once before lifecycle ownership"
+            )
+        self.deferred_startup_result = result
+        return True
+
+    def take_deferred_startup_completion(self) -> InteractiveStartupResult | None:
+        self.startup_completion_expected = False
+        result = self.deferred_startup_result
+        self.deferred_startup_result = None
+        return result
+
+    def abandon_startup_completion(self) -> None:
+        self.startup_completion_expected = False
+        self.deferred_startup_result = None
+
+    def handle_failure(self, runtime: StewardConversationRuntime, error: str) -> None:
+        if self.action_round:
+            self._finish_loop(runtime, "final_reply")
+        self.phase = "waiting_reply_delivery"
+        runtime.steward_queue_failure(self, error)
 
     def complete_startup(
         self, runtime: StewardConversationRuntime, result: InteractiveStartupResult, persisted: bool,
@@ -112,10 +181,21 @@ class StewardConversation:
             kind = str(item.get("type") or "").strip().upper()
             if kind not in {"START_AGENT", "RESUME_AGENT"} or not bool(item.get("ok")):
                 continue
+            requested_session_id = str(item.get("thread_id") or "").strip()
             item.update({
                 "agent_id": result.agent_id, "state": result.state,
-                "thread_id": result.thread_id, "thread_name": result.thread_name,
-                "configured_model": result.configured_model, "effective_model": result.effective_model,
+                "thread_id": requested_session_id or result.thread_id,
+                "thread_name": result.thread_name,
+                "provider": result.provider,
+                "profile": result.profile,
+                "adapter": result.adapter,
+                "adapter_version": result.adapter_version,
+                "runtime": result.runtime,
+                "runtime_version": result.runtime_version,
+                "configured_model": result.configured_model,
+                "configured_backend": result.configured_backend,
+                "effective_model": result.effective_model,
+                "effective_backend": result.effective_backend,
             })
             if result.result != "completed":
                 item["ok"] = False
@@ -221,15 +301,20 @@ class StewardConversation:
         lines.extend(["Pending actions were not executed.", "Continue?"])
         return "\n".join(lines)
 
-    def steer(self, text: str, submit: Callable[[AccessPointKey, str], None]) -> bool:
-        if self.finished or self.phase != "initial" or not self.allow_steer:
-            return False
-        submit(self.access_point, text)
-        return True
+    def accepts_steer(self) -> bool:
+        return not self.finished and self.phase == "initial" and self.allow_steer
 
     def finish(self) -> None:
+        self.abandon_startup_completion()
         self.finished = True
         self.pending_approval_request = None
+
+    def cancel_waiting_startup(self) -> bool:
+        if self.finished or self.phase != "waiting_agent_startup":
+            return False
+        self.pending_action_results = None
+        self.finish()
+        return True
 
     def tick(self, context: InteractionTickContext) -> str | None:
         if self.finished and self.interrupt_notice is None:
@@ -239,3 +324,63 @@ class StewardConversation:
     def on_completed(self, context: InteractionTickContext, outcome: str) -> None:
         if outcome != "completed":
             raise AssertionError(f"unexpected Steward conversation outcome: {outcome}")
+
+
+@dataclass(eq=False)
+class StewardActionInteraction:
+    parent: StewardConversation
+    actions: tuple[dict[str, Any], ...]
+    action_round: int
+    results: list[dict[str, Any] | None] = field(init=False)
+    slot_index: int = 0
+    prepared_list_request: ListResumableActionRequest | None = None
+    operations: tuple[CatalogOperationHandle[Any], ...] = ()
+    operation_started_at: float | None = None
+    operation_sequence: int = 0
+    cancelled: bool = False
+    finished: bool = False
+    completion_recorded: bool = False
+
+    def __post_init__(self) -> None:
+        self.actions = tuple(dict(action) for action in self.actions)
+        self.results = [None] * len(self.actions)
+
+    @property
+    def access_point(self) -> AccessPointKey:
+        return self.parent.access_point
+
+    def cancel(self) -> bool:
+        if self.finished:
+            return False
+        self.cancelled = True
+        for operation in self.operations:
+            operation.cancel()
+        self.finished = True
+        return True
+
+    def tick(self, context: InteractionTickContext) -> str | None:
+        runtime: StewardActionInteractionRuntime = context.runtime
+        before = (
+            self.slot_index,
+            self.prepared_list_request,
+            self.operations,
+            tuple(self.results),
+            self.cancelled,
+            self.finished,
+        )
+        outcome = runtime.steward_action_interaction_tick(self)
+        after = (
+            self.slot_index,
+            self.prepared_list_request,
+            self.operations,
+            tuple(self.results),
+            self.cancelled,
+            self.finished,
+        )
+        if before != after:
+            context.progressed = True
+        return outcome
+
+    def on_completed(self, context: InteractionTickContext, outcome: str) -> None:
+        runtime: StewardActionInteractionRuntime = context.runtime
+        runtime.steward_action_interaction_completed(self, outcome)

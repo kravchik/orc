@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Protocol
+from typing import Any, Callable, ClassVar, Protocol
 
 from orchestrator.access_point_common import AccessPointKey
 from orchestrator.access_point_work import is_transient_approval_target_wait_reason
 from orchestrator.agent_interactions import AgentConversation
-from orchestrator.approval import ApprovalRequest
+from orchestrator.agent_session import AgentApprovalRequest, ApprovalDecisionResult
+from orchestrator.interactive_driver_events import ApprovalDeliveryReceipt
 from orchestrator.approval_delegation import build_approval_delegation_prompt, parse_approval_delegation_decision
 from orchestrator.approval_target import HUMAN_APPROVAL_TARGET
 from orchestrator.binding_address import ResolvedRoutingIdentity
@@ -19,11 +20,45 @@ from orchestrator.steward_interactions import StewardConversation
 class ApprovalRuntime(Protocol):
     def approval_event(self, name: str, **fields: Any) -> None: ...
     def approval_register_human(self, approval: ApprovalInteraction) -> None: ...
-    def approval_notify(self, access_point: AccessPointKey, text: str) -> None: ...
-    def approval_submit_source(self, approval: ApprovalInteraction, decision: str) -> None: ...
+    def approval_notify(
+        self,
+        access_point: AccessPointKey,
+        text: str,
+        *,
+        on_sent: Callable[[], None] | None = None,
+    ) -> None: ...
+    def approval_target_interrupt_notice_sent(self, approval: ApprovalInteraction) -> None: ...
+    def approval_target_started(
+        self,
+        approval: ApprovalInteraction,
+        source_label: str,
+        *,
+        on_sent: Callable[[], None] | None = None,
+    ) -> None: ...
+    def approval_submit_source(
+        self,
+        approval: ApprovalInteraction,
+        decision: str,
+    ) -> ApprovalDecisionResult: ...
     def approval_cancel_target(self, approval: ApprovalInteraction) -> None: ...
-    def approval_decline_target_request(self, approval: ApprovalInteraction, request: ApprovalRequest) -> None: ...
-    def approval_human_decision(self, approval: ApprovalInteraction, decision: str, via: str) -> None: ...
+    def approval_decline_target_request(
+        self,
+        approval: ApprovalInteraction,
+        request: AgentApprovalRequest,
+    ) -> None: ...
+    def approval_human_decision(
+        self,
+        approval: ApprovalInteraction,
+        decision: str,
+        via: str,
+    ) -> ApprovalDeliveryReceipt: ...
+    def approval_human_submission_completed(
+        self,
+        approval: ApprovalInteraction,
+        decision: str,
+        via: str,
+        result: ApprovalDecisionResult,
+    ) -> bool: ...
     def approval_invalid_human_input(self, approval: ApprovalInteraction) -> None: ...
     def approval_human_delivery_failed(self, approval: ApprovalInteraction, exc: Exception) -> None: ...
     def approval_target(self, approval: ApprovalInteraction) -> str: ...
@@ -41,7 +76,7 @@ class ApprovalRuntime(Protocol):
 class ApprovalInteraction:
     MAX_TARGET_RETRIES: ClassVar[int] = 1
     parent: AgentConversation | StewardConversation
-    request: ApprovalRequest
+    request: AgentApprovalRequest
     human_prompt: Any | None = None
     approval_id: str = ""
     source_address: str = ""
@@ -54,6 +89,14 @@ class ApprovalInteraction:
     target_cancel_requested: bool = False
     last_deferred_reason: str = ""
     deferred_notice_sent: bool = False
+    defer_target_notice_until_start: bool = False
+    defer_target_notice_before_start: bool = False
+    target_notice_pending: bool = False
+    target_notice_queued: bool = False
+    target_notice_source_label: str = ""
+    human_submission: ApprovalDeliveryReceipt | None = None
+    human_decision: str = ""
+    human_decision_via: str = ""
 
     @property
     def source_access_point(self) -> AccessPointKey:
@@ -70,9 +113,13 @@ class ApprovalInteraction:
     def belongs_to(
         self,
         parent: AgentConversation | StewardConversation,
-        request: ApprovalRequest | None,
+        request: AgentApprovalRequest | None,
     ) -> bool:
-        return self.parent is parent and self.request is request
+        return (
+            self.parent is parent
+            and request is not None
+            and self.request.approval_ref == request.approval_ref
+        )
 
     @property
     def waiting_target(self) -> str:
@@ -82,9 +129,14 @@ class ApprovalInteraction:
 
     @property
     def pending(self) -> bool:
-        return self.phase in {"target_starting", "target_waiting", "human", "delegated"}
+        return self.phase in {
+            "target_starting", "target_waiting", "human", "human_submitting", "delegated",
+        }
 
     def ask_human(self, runtime: ApprovalRuntime) -> None:
+        self.human_submission = None
+        self.human_decision = ""
+        self.human_decision_via = ""
         self.phase = "human"
         runtime.approval_register_human(self)
 
@@ -119,7 +171,7 @@ class ApprovalInteraction:
         thread = self.source_access_point.thread_id
         self.approval_id = (
             f"approval:{self.source_access_point.type}:{self.source_access_point.chat_id}:"
-            f"{thread if thread is not None else 'main'}:{self.request.req_id}"
+            f"{thread if thread is not None else 'main'}:{self.request.approval_ref.value}"
         )
         if reason == "target_not_running" and target is not None:
             start_decision = runtime.approval_request_runtime_start(self)
@@ -146,6 +198,14 @@ class ApprovalInteraction:
 
     def _defer_for_target(self, runtime: ApprovalRuntime, reason: str) -> None:
         self.phase = "target_waiting"
+        if (
+            reason == "target_delegation_busy"
+            and self.target_access_point is not None
+        ):
+            if self.target_access_point.type == "telegram":
+                self.defer_target_notice_until_start = True
+            elif self.target_access_point.type == "slack":
+                self.defer_target_notice_before_start = True
         if self.last_deferred_reason != reason:
             self.last_deferred_reason = reason
             runtime.approval_event(
@@ -177,6 +237,11 @@ class ApprovalInteraction:
     def _submit_to_target(self, runtime: ApprovalRuntime) -> None:
         source_label = self.source_address or "unaddressed agent"
         prompt = self._delegation_prompt()
+        self.target_notice_pending = (
+            self.defer_target_notice_until_start
+            or self.defer_target_notice_before_start
+        )
+        self.target_notice_source_label = source_label
         try:
             runtime.approval_submit_target(self, prompt)
         except Exception as exc:
@@ -194,11 +259,34 @@ class ApprovalInteraction:
         self.phase = "delegated"
         runtime.approval_started(self, source_label)
 
+    def on_target_turn_started(self, runtime: ApprovalRuntime) -> None:
+        if not self.target_notice_pending or self.defer_target_notice_before_start:
+            return
+        self.target_notice_pending = False
+        runtime.approval_target_started(self, self.target_notice_source_label)
+
+    def target_turn_wait_reason(self, runtime: ApprovalRuntime) -> str:
+        if not self.target_notice_pending or not self.defer_target_notice_before_start:
+            return ""
+        if not self.target_notice_queued:
+            self.target_notice_queued = True
+            runtime.approval_target_started(
+                self,
+                self.target_notice_source_label,
+                on_sent=self._target_notice_sent,
+            )
+        return "approval_target_notice_pending"
+
+    def _target_notice_sent(self) -> None:
+        self.target_notice_pending = False
+
     def on_human_decision(self, runtime: ApprovalRuntime, decision: str, via: str) -> None:
         if self.phase != "human":
             return
-        runtime.approval_human_decision(self, decision, via)
-        self.finish()
+        self.human_submission = runtime.approval_human_decision(self, decision, via)
+        self.human_decision = decision
+        self.human_decision_via = via
+        self.phase = "human_submitting"
 
     def on_invalid_human_input(self, runtime: ApprovalRuntime) -> None:
         if self.phase == "human":
@@ -210,7 +298,11 @@ class ApprovalInteraction:
         runtime.approval_human_delivery_failed(self, exc)
         self.finish()
 
-    def on_target_approval(self, runtime: ApprovalRuntime, request: ApprovalRequest) -> None:
+    def on_target_approval(
+        self,
+        runtime: ApprovalRuntime,
+        request: AgentApprovalRequest,
+    ) -> None:
         runtime.approval_decline_target_request(self, request)
         if self.source_cancelled:
             runtime.approval_event(
@@ -248,22 +340,39 @@ class ApprovalInteraction:
             source_address=self.source_address, target_address=self.target_address,
             decision=parsed.decision,
         )
-        try:
-            runtime.approval_submit_source(self, parsed.decision)
-        except Exception as exc:
+        resolution = runtime.approval_submit_source(self, parsed.decision)
+        if resolution.fatal_delivery_failure:
             runtime.approval_event(
                 "approval_source_decision_submit_failed", approval_id=self.approval_id,
                 decision=parsed.decision, source_address=self.source_address,
-                target_address=self.target_address, error=str(exc), error_type=type(exc).__name__,
+                target_address=self.target_address, error=resolution.result.error,
+                error_type=resolution.result.outcome.value,
             )
             runtime.approval_notify(
                 self.target_access_point,
                 "approval decision delivery to "
-                f"{self.source_address or 'unaddressed agent'} failed; source is asking human.",
+                f"{self.source_address or 'unaddressed agent'} failed; source session stopped.",
+            )
+            self.finish()
+            return
+        if not resolution.delivery_attempted:
+            runtime.approval_event(
+                "approval_source_decision_preflight_rejected",
+                approval_id=self.approval_id,
+                decision=parsed.decision,
+                source_address=self.source_address,
+                target_address=self.target_address,
+                error=resolution.result.error,
+                outcome=resolution.result.outcome.value,
+            )
+            runtime.approval_notify(
+                self.target_access_point,
+                "approval decision could not be applied to "
+                f"{self.source_address or 'unaddressed agent'}; source is asking human.",
             )
             runtime.approval_notify(
                 self.source_access_point,
-                "approval decision could not be submitted to the source turn; asking human.",
+                "approval decision is no longer valid for the source turn; asking human.",
             )
             self.ask_human(runtime)
             return
@@ -334,6 +443,20 @@ class ApprovalInteraction:
         else:
             self.fallback(runtime, "target_interrupted")
 
+    def on_target_failed(self, runtime: ApprovalRuntime, error: str) -> None:
+        failure = str(error).strip() or "target turn failed"
+        if self.source_cancelled:
+            runtime.approval_event(
+                "approval_delegation_cancelled_target_failed",
+                approval_id=self.approval_id,
+                source_address=self.source_address,
+                target_address=self.target_address,
+                error=failure,
+            )
+            self.finish()
+        else:
+            self.fallback(runtime, "target_failed", error=failure)
+
     def cancel_source(self, runtime: ApprovalRuntime, reason: str) -> None:
         if self.source_cancelled or self.phase == "done":
             return
@@ -353,29 +476,54 @@ class ApprovalInteraction:
         )
         runtime.approval_cancel_target(self)
 
-    def fallback(self, runtime: ApprovalRuntime, reason: str) -> None:
+    def fallback(self, runtime: ApprovalRuntime, reason: str, *, error: str = "") -> None:
+        details = str(error).strip()
+        diagnostic_fields = {"error": details} if details else {}
         runtime.approval_event(
             "approval_delegation_fallback", approval_id=self.approval_id,
             source_address=self.source_address, target_address=self.target_address,
-            reason=reason, fallback_target="human",
+            reason=reason, fallback_target="human", **diagnostic_fields,
         )
+        def _target_notice_finished() -> None:
+            if reason == "target_interrupted":
+                runtime.approval_target_interrupt_notice_sent(self)
+
+        displayed_reason = f"{reason}: {details}" if details else reason
         runtime.approval_notify(
             self.target_access_point,
             "approval delegation from "
             f"{self.source_address or 'unaddressed agent'} cancelled "
-            f"({reason}); source is asking human.",
+            f"({displayed_reason}); source is asking human.",
+            on_sent=_target_notice_finished,
         )
         runtime.approval_notify(
             self.source_access_point,
-            f"approval delegation to {self.target_address} unavailable ({reason}); asking human.",
+            f"approval delegation to {self.target_address} unavailable "
+            f"({displayed_reason}); asking human.",
         )
         self.ask_human(runtime)
 
     def finish(self) -> None:
-        if self.parent.pending_approval_request is self.request:
+        if (
+            self.parent.pending_approval_request is not None
+            and self.parent.pending_approval_request.approval_ref
+            == self.request.approval_ref
+        ):
             self.parent.pending_approval_request = None
+        self.human_submission = None
+        self.human_decision = ""
+        self.human_decision_via = ""
         self.phase = "done"
         self.human_prompt = None
+
+    def reserve(self, context: InteractionTickContext) -> None:
+        target = self.target_access_point
+        if target is None:
+            return
+        if self.phase == "delegated":
+            context.active_target_owners.setdefault(target, self)
+        elif self.phase in {"target_starting", "target_waiting"}:
+            context.fifo_target_owners.setdefault(target, self)
 
     def _target_identity_is_current(self, runtime: ApprovalRuntime) -> bool:
         target_identity = runtime.approval_resolve_target(self.approval_target)
@@ -386,6 +534,29 @@ class ApprovalInteraction:
         )
 
     def tick(self, context: InteractionTickContext) -> str | None:
+        if self.phase == "human_submitting":
+            submission = self.human_submission
+            if submission is None:
+                raise AssertionError("human approval submit phase requires a receipt")
+            result = submission.result
+            if result is not None:
+                completed = context.runtime.approval_human_submission_completed(
+                    self,
+                    self.human_decision,
+                    self.human_decision_via,
+                    result,
+                )
+                self.human_submission = None
+                self.human_decision = ""
+                self.human_decision_via = ""
+                if completed:
+                    self.finish()
+                else:
+                    self.phase = "human"
+                context.progressed = True
+        if self.phase == "delegated" and self.target_access_point is not None:
+            context.blocked_targets.add(self.target_access_point)
+            context.active_target_owners[self.target_access_point] = self
         if self.phase in {"target_starting", "target_waiting"}:
             if not self._target_identity_is_current(context.runtime):
                 context.runtime.approval_unavailable(self, "target_unresolved")
@@ -394,13 +565,22 @@ class ApprovalInteraction:
                 state = context.runtime.approval_target_runtime_state(
                     self.target_access_point
                 )
+                fifo_owner = context.fifo_target_owners.get(
+                    self.target_access_point
+                )
+                active_owner = context.active_target_owners.get(
+                    self.target_access_point
+                )
                 if (
                     self.phase == "target_starting"
                     and state not in {"STARTING", "RUNNING"}
                 ):
                     context.runtime.approval_unavailable(self, "target_startup_failed")
                     self.ask_human(context.runtime)
-                elif self.target_access_point in context.blocked_targets:
+                elif (
+                    (active_owner is not None and active_owner is not self)
+                    or (fifo_owner is not None and fifo_owner is not self)
+                ):
                     waiting_for_startup = self.phase == "target_starting"
                     self._defer_for_target(context.runtime, "target_fifo_wait")
                     if waiting_for_startup:
@@ -417,6 +597,8 @@ class ApprovalInteraction:
                     self._dispatch_or_wait(context.runtime)
             if self.phase in {"target_starting", "target_waiting", "delegated"}:
                 context.blocked_targets.add(self.target_access_point)
+                if self.phase == "delegated":
+                    context.active_target_owners[self.target_access_point] = self
         if (
             self.source_cancelled
             and self.phase == "delegated"

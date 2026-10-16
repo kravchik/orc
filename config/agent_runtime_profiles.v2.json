@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 2,
+  "profiles": [
+    {
+      "provider": "claude",
+      "profile": "claude-acp",
+      "default": false,
+      "adapter": "acp-v1",
+      "command": ["claude-agent-acp"],
+      "hostLifetime": "shared-process",
+      "environmentPolicy": {
+        "inheritParent": true,
+        "credentialOwnership": "runtime-local",
+        "secretSources": []
+      },
+      "launchConfiguration": {
+        "argsMode": "immutable",
+        "providerApprovalPolicyValues": [],
+        "sandboxValues": []
+      },
+      "runtime": {
+        "displayName": "Claude Agent ACP",
+        "name": "claude-agent-acp"
+      },
+      "backend": {
+        "name": "anthropic",
+        "version": "unknown"
+      },
+      "protocol": {
+        "version": 1,
+        "authMethods": []
+      },
+      "limits": {
+        "edgeQueueCapacity": 256,
+        "portEventCapacity": 256,
+        "turnOutputMaxChars": 1048576,
+        "frameMaxBytes": 262144,
+        "processOutputMaxBytes": 8192,
+        "stopTimeoutSec": 20.0
+      },
+      "capabilities": [
+        "start_turn",
+        "resume_session",
+        "list_sessions",
+        "session_store",
+        "turn_input_correlation",
+        "text_stream",
+        "interrupt_turn",
+        "structured_user_input"
+      ]
+    },
+    {
+      "provider": "opencode",
+      "profile": "opencode-acp",
+      "default": false,
+      "adapter": "acp-v1",
+      "command": ["opencode", "acp"],
+      "hostLifetime": "shared-process",
+      "environmentPolicy": {
+        "inheritParent": true,
+        "credentialOwnership": "runtime-local",
+        "secretSources": []
+      },
+      "launchConfiguration": {
+        "argsMode": "immutable",
+        "providerApprovalPolicyValues": [],
+        "sandboxValues": []
+      },
+      "runtime": {
+        "displayName": "OpenCode",
+        "name": "opencode"
+      },
+      "backend": {
+        "name": "unknown",
+        "version": "unknown"
+      },
+      "protocol": {
+        "version": 1,
+        "authMethods": ["opencode-login"]
+      },
+      "limits": {
+        "edgeQueueCapacity": 256,
+        "portEventCapacity": 256,
+        "turnOutputMaxChars": 1048576,
+        "frameMaxBytes": 262144,
+        "processOutputMaxBytes": 8192,
+        "stopTimeoutSec": 20.0
+      },
+      "capabilities": [
+        "start_turn",
+        "resume_session",
+        "list_sessions",
+        "session_store",
+        "turn_input_correlation",
+        "text_stream",
+        "interrupt_turn",
+        "structured_user_input",
+        "form_elicitation",
+        "list_models",
+        "set_model",
+        "read_effort",
+        "set_effort",
+        "context_usage"
+      ]
+    }
+  ]
+}

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from orchestrator.codex_sessions import find_latest_codex_cli_session_id
 from orchestrator.processes import LifecycleLogger
 
 
@@ -50,25 +49,7 @@ def exclude_turns_unsupported_error(error: object) -> RuntimeError:
 class ThreadStartResumeResult:
     thread_id: str
     model: str
-
-
-def resolve_resume_thread_id(
-    *,
-    resume: bool,
-    project_cwd: str,
-    sessions_root: str | None,
-) -> str | None:
-    if not resume:
-        return None
-    thread_id = find_latest_codex_cli_session_id(
-        project_cwd=project_cwd,
-        sessions_root=sessions_root,
-    )
-    if not thread_id:
-        raise RuntimeError(
-            "resume requested but no Codex CLI session found in ~/.codex/sessions for current cwd"
-        )
-    return thread_id
+    backend: str = ""
 
 
 def request_thread_start_or_resume(
@@ -88,6 +69,7 @@ def request_thread_start_or_resume(
                 result = resumed.get("result") or {}
                 thread_id = str((result.get("thread") or {}).get("id") or "")
                 model = str(result.get("model") or "").strip()
+                backend = str((result.get("thread") or {}).get("modelProvider") or "").strip()
                 if not thread_id:
                     raise RuntimeError("thread/resume response did not contain thread id")
                 if not model:
@@ -98,7 +80,7 @@ def request_thread_start_or_resume(
                     requested_thread_id=resume_thread_id,
                     model=model,
                 )
-                return ThreadStartResumeResult(thread_id=thread_id, model=model)
+                return ThreadStartResumeResult(thread_id=thread_id, model=model, backend=backend)
             except Exception as exc:
                 resume_error = exc
                 if is_exclude_turns_unsupported(exc):
@@ -114,9 +96,10 @@ def request_thread_start_or_resume(
     result = started.get("result") or {}
     thread_id = str((result.get("thread") or {}).get("id") or "")
     model = str(result.get("model") or "").strip()
+    backend = str((result.get("thread") or {}).get("modelProvider") or "").strip()
     if not thread_id:
         raise RuntimeError("thread/start response did not contain thread id")
     if not model:
         raise RuntimeError("thread/start response did not contain model")
     logger.event(f"{role_label}_thread_started", thread_id=thread_id, model=model)
-    return ThreadStartResumeResult(thread_id=thread_id, model=model)
+    return ThreadStartResumeResult(thread_id=thread_id, model=model, backend=backend)
