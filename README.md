@@ -5,7 +5,7 @@
 </p>
 
 Orc Master is a chat control plane and a network router for local agent sessions.
-
+Currently supports: Telegram, Slack, Codex, Claude Code, OpenCode and general ACP.
 ## Chat control plane
 Do all the work via the chats, not only alerts and statuses. Talk to an agent, review approvals, see the reasoning process, control binding via commands, or via talking to a Steward session, upload images, set up regex auto-approvals, etc.
 
