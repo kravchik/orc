@@ -29,6 +29,17 @@ When another message arrives during an active turn, Orc Master normally steers
 it into that turn as additional guidance. If the agent is waiting for approval,
 resolve or interrupt the approval first.
 
+## Agent Networks
+
+Assign addresses to agent sessions and they can pass tasks and results directly
+to one another. A lead can coordinate workers through a long plan, an agent can
+consult a specialist, or one session can ask another to review a plan or diff.
+Orc Master does not impose a network layout: the addresses and the agents'
+prompts define how the network works.
+
+See [Setting Up An Agent Network](#setting-up-an-agent-network) for the routing
+roles and a minimal lead/worker example.
+
 ## Agent Providers
 
 Orc Master supports Codex, Claude, and OpenCode through named runtime profiles.
@@ -142,7 +153,7 @@ Several agents may share one approver; requests wait and are handled one at a
 time. Self-approval and approval cycles are rejected. Use
 `/approver assign human` to return future approvals to the chat user.
 
-## Agent Networks
+## Setting Up An Agent Network
 
 Independent chats require no routing setup. Add addresses only when you want
 agents to pass tasks to one another.
